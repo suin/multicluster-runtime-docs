@@ -1,0 +1,327 @@
+---
+title: Kind Provider
+---
+
+**Kind Provider** は、ローカル環境で動作する [Kind](https://kind.sigs.k8s.io/) クラスターを自動検出し、`multicluster-runtime` からそれらをフリートとして扱えるようにするプロバイダーです。  
+開発・テスト・デモ用途向けに最適化されており、1 つのコントローラープロセスから複数の Kind クラスターへ同時に接続できます。
+
+この章では次の内容を説明します。
+
+- **Kind Provider の用途とユースケース**
+- **ディスカバリとライフサイクル管理の仕組み**
+- **`kind.Options` による設定方法**
+- 具体的な **コード例** と **トラブルシューティング**
+
+---
+
+### どんなときに Kind Provider を使うか
+
+Kind Provider は、次のようなケースに向いています。
+
+- **ローカル開発**
+  - 手元のマシンで複数の Kind クラスターを立ち上げ、マルチクラスターコントローラーの挙動を素早く確認したいとき。
+  - クラスターを自由に作成・削除でき、本番環境に影響を与えたくないとき。
+- **マルチクラスター処理のテスト**
+  - Reconciler を本番のインベントリ（Cluster API / ClusterProfile / kubeconfig Secret など）に接続する前に、ローカルの Kind フリートで挙動を検証したいとき。
+  - CI ジョブ内で、スクリプトから再現性のあるクラスター群を作りたいとき。
+- **multicluster-runtime の学習**
+  - 「クイックスタート」やコントローラーパターンの章を試す際に、シンプルなフリートソースとして使いたいとき。
+
+逆に、次のような場合には Kind Provider は適しません。
+
+- 本番運用中の大規模フリートを扱う場合
+- クラスターがローカルコンテナランタイム外に存在する場合（マネージド Kubernetes など）
+- すでに **Cluster API** や **Cluster Inventory API** など、より強力なインベントリのソース・オブ・トゥルースが存在する場合
+
+そのようなケースでは、**Cluster API Provider** や **Cluster Inventory API Provider**、**Kubeconfig Provider**、**File Provider** などの利用を検討してください。
+
+---
+
+### Kind Provider がクラスターを検出する仕組み
+
+Kind Provider の実装は `sigs.k8s.io/multicluster-runtime/providers/kind` にあり、次の 2 つのインターフェースを実装しています。
+
+- `multicluster.Provider`
+- `multicluster.ProviderRunnable`
+
+実行時の振る舞いはおおよそ次のとおりです。
+
+- **ディスカバリループ**
+  - Kind の Go ライブラリ（`"sigs.k8s.io/kind/pkg/cluster"`）を用いて、`kind.List()` を定期的に実行します。
+  - このループは数秒ごとの間隔で繰り返され、トップレベルの `context.Context` がキャンセルされるまで継続します（例: Manager の停止時）。
+  - 各ループでは、前回の状態と比較して:
+    - 新たに現れた Kind クラスター
+    - すでに削除された Kind クラスター
+    を検出します。
+
+- **`Prefix` による名前フィルタリング**
+  - 検出される Kind クラスター名は、たとえば `fleet-alpha` や `dev-cluster` のような任意の文字列です。
+  - Kind Provider は `kind.Options` の `Prefix` フィールドによって、扱うクラスター名をフィルタリングします。
+    - `Prefix` が空文字列 (`""`) の場合: そのホスト上の **すべての Kind クラスター** をフリートに含めます。
+    - `Prefix` が指定されている場合: そのプレフィックスで始まるクラスターのみをフリートに含めます（例: `"fleet-"`）。
+  - これにより、同じマシン上で他の Kind クラスターを動かしつつ、自分のコントローラーが管理すべきクラスターだけを対象にすることができます。
+
+- **`cluster.Cluster` の構築**
+  - フィルタに合致した各クラスター名に対して、Kind Provider は次を行います。
+    - `provider.KubeConfig(clusterName, false)` で kubeconfig を取得する。
+    - kubeconfig から `*rest.Config` を生成する。
+    - 必要であればカスタムな **REST オプション**（QPS, Burst, Impersonation など）を適用する。
+    - `cluster.New(restConfig, options...)` を用いて `cluster.Cluster` を生成する。
+    - これまでに登録された **Field Index** を、そのクラスターの Cache に適用する。
+    - クラスターごとのコンテキストを作成し、その中で Cache を起動して同期完了を待つ。
+    - 準備が整ったら、Multi-Cluster Manager に対して **Engage** を呼び出す。
+
+- **クラスターの削除検知**
+  - `kind.List()` の結果からクラスター名が消えた場合、そのクラスターは「削除された」とみなされます。
+    - Kind Provider はそのクラスター専用のコンテキストをキャンセルし、Cache と Informer を停止します。
+    - 内部マップからクラスターを削除します。
+    - 以降、その名前に対する `Get` は `multicluster.ErrClusterNotFound` を返します。
+  - 多くのコントローラーでは、`ClusterNotFound` ラッパーを有効にしておくことで、このようなリクエストを「正常終了」として扱い、再キューしないようにします。
+
+まとめると、Kind Provider は「**いまローカルに存在している Kind クラスター一覧**」を `multicluster-runtime` のフリートとして見せる役割を担います。
+
+---
+
+### 設定: `kind.Options`
+
+Kind Provider は、次のような `Options` 構造体で初期化します。
+
+```go
+type Options struct {
+	// Prefix is an optional prefix applied to filter kind clusters by name.
+	Prefix string
+	// ClusterOptions is the list of options to pass to the cluster object.
+	ClusterOptions []cluster.Option
+	// RESTOptions is the list of options to pass to the rest client.
+	RESTOptions []func(cfg *rest.Config) error
+}
+```
+
+- **`Prefix`**
+  - フリートに含める Kind クラスター名をフィルタリングするためのプレフィックスです。
+  - 実際のプロジェクトでは、他の Kind クラスターを誤って拾わないよう、多くの場合で設定しておくことが推奨されます。
+  - 例:
+    - `Prefix: "fleet-"` → `fleet-alpha` や `fleet-beta` などが対象。
+    - `Prefix: ""` → ホスト上の **すべての** Kind クラスターが対象。
+
+- **`ClusterOptions`**
+  - controller-runtime の `cluster.New` に渡されるオプションです。
+  - 用途の例:
+    - 追加の API Scheme の登録
+    - Cache の挙動やレートリミットの調整
+    - ヘルスチェックなどクラスターレベルのオプションの設定
+  - シンプルなサンプルでは空のままにし、デフォルトに任せることも多いです。
+
+- **`RESTOptions`**
+  - 生成された `*rest.Config` に対して、任意の変更を行うための関数群です。
+  - 用途の例:
+    - 重いテスト負荷に対応するための `QPS` / `Burst` の調整
+    - メトリクスやトレースのための User-Agent 設定
+    - カスタマイズされた Kind 環境向けの TLS 設定
+
+3 つのフィールドはいずれもオプションであり、最初は最小構成から始め、必要に応じて徐々に高度な設定を追加していくとよいでしょう。
+
+---
+
+### Multi-Cluster Manager への組み込み
+
+コード上では、Kind Provider の利用は次のような流れになります。
+
+1. **Provider を作成** する（`Options` で挙動を指定）。
+2. **Multi-Cluster Manager を作成** する（`mcmanager.New` に Provider を渡す）。
+3. **コントローラーを登録** する（`mcbuilder.ControllerManagedBy` を利用）。
+4. **Manager を起動** する（Kind Provider も自動的に起動される）。
+
+以下は、クイックスタートとほぼ同等の最小例です。この例では:
+
+- 名前が `fleet-` で始まる Kind クラスターを検出し、
+- すべてのクラスターで `ConfigMap` を監視し、
+- 検出した `ConfigMap` に対してイベントを発行・ログ出力します。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	"sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	log := ctrllog.Log.WithName("kind-example")
+	ctx := signals.SetupSignalHandler()
+
+	// 1. "fleet-" で始まる Kind クラスターを検出する Provider を作成。
+	provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+	// 2. Kind Provider を利用する Multi-Cluster Manager を作成。
+	mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+	if err != nil {
+		log.Error(err, "unable to create manager")
+		os.Exit(1)
+	}
+
+	// 3. すべてのクラスターで ConfigMap を監視するコントローラーを登録。
+	if err := mcbuilder.ControllerManagedBy(mgr).
+		Named("multicluster-configmaps").
+		For(&corev1.ConfigMap{}).
+		Complete(mcreconcile.Func(
+			func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+				log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+				log.Info("Reconciling ConfigMap")
+
+				cl, err := mgr.GetCluster(ctx, req.ClusterName)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+
+				cm := &corev1.ConfigMap{}
+				if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+					if apierrors.IsNotFound(err) {
+						return ctrl.Result{}, nil
+					}
+					return ctrl.Result{}, err
+				}
+
+				cl.GetEventRecorderFor("kind-multicluster-configmaps").Event(
+					cm,
+					corev1.EventTypeNormal,
+					"ConfigMapFound",
+					"ConfigMap found in cluster "+req.ClusterName,
+				)
+
+				log.Info("ConfigMap found",
+					"namespace", cm.Namespace,
+					"name", cm.Name,
+					"cluster", req.ClusterName,
+				)
+
+				return ctrl.Result{}, nil
+			},
+		)); err != nil {
+		log.Error(err, "unable to create controller")
+		os.Exit(1)
+	}
+
+	// 4. Manager（および内部で Kind Provider）を起動。
+	if err := mgr.Start(ctx); ignoreCanceled(err) != nil {
+		log.Error(err, "manager exited with error")
+		os.Exit(1)
+	}
+}
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+```
+
+ポイント:
+
+- Kind Provider は `multicluster.ProviderRunnable` を実装しているため、**ユーザーコードから `Start` を直接呼び出す必要はありません**。  
+  `mcmanager.New` で作成した Manager を `mgr.Start(ctx)` すると、自動的に Provider も起動されます。
+- Reconciler は `mcreconcile.Request` を受け取り、その中の `ClusterName` と内部の `reconcile.Request` を利用します。
+- `mgr.GetCluster(ctx, req.ClusterName)` は、対象クラスターに対応する `cluster.Cluster` を返し、そのクラスター固有の Client / Cache を通して操作を行えます。
+
+この例を 1 ステップずつ体験したい場合は、**クイックスタート** 章を参照してください。
+
+---
+
+### 実行時の挙動とライフサイクルの詳細
+
+運用時に把握しておくと役立つ Kind Provider の挙動をいくつか挙げます。
+
+- **ポーリング間隔**
+  - Kind Provider は固定の間隔（数秒程度）で `kind.List()` を呼び出します。
+  - クラスターを作成・削除した場合でも、次のポーリングまで待てば検出されます。
+
+- **並行性とスレッドセーフティ**
+  - 内部のクラスターとキャンセル関数のマップは、Read/Write ミューテックスで保護されています。
+  - `Get` は複数の Reconciler から同時に呼び出しても安全です。
+
+- **Field Index の適用**
+  - `mgr.GetFieldIndexer().IndexField(...)` を呼び出すと、Multi-Cluster Manager はその定義を Provider に委譲します。
+  - Kind Provider は、インデックス定義をメモリに保持し、次のように適用します。
+    - すでに存在するすべてのクラスター（`cluster.Cluster`）に対して即座に適用。
+    - あとから検出された新規クラスターに対しても、生成時に同じインデックスを適用。
+  - これにより、クラスターの追加・削除に関わらず、一貫したインデックス動作が保証されます。
+
+- **クラスター名**
+  - `mcreconcile.Request.ClusterName` には、Kind クラスター名（例: `"fleet-alpha"`）がそのまま入ります。
+  - Provider は、`Options.Prefix` 以外の独自のプレフィックスや変換を行いません。
+  - Reconciler 側では、`ClusterName` を基本的に「不透明な文字列」として扱い、Kind 固有の前提を埋め込まないようにするのが望ましいです。
+
+---
+
+### 前提条件と実行環境
+
+Kind Provider はローカルのコンテナランタイムと kubeconfig に直接アクセスするため、次の前提があります。
+
+- コントローラープロセスが動作する環境において:
+  - **Kind CLI (`kind`)** がインストールされ、`PATH` に含まれていること。
+  - 基盤となるコンテナランタイム（多くの場合 Docker）にアクセスできること。
+
+一般的には次のような形で利用されます。
+
+- **開発マシン上でバイナリとして実行**
+  - 例: `go run ./...` でローカルから実行。
+- **CI ジョブ内で Docker-in-Docker などを使って実行**
+  - Job コンテナから Docker デーモンへ接続し、Kind クラスターを作成・管理する。
+
+Kind Provider を Kubernetes クラスター内の Pod として実行することも技術的には可能ですが、その場合は:
+
+- コンテナイメージ内に `kind` CLI を含める必要があり、
+- ノードから Kind クラスターが動作する Docker デーモンへ到達できる必要があります。
+
+多くのユースケースでは、まず **ローカルバイナリとして実行する** ところから始めるのが簡単です。
+
+---
+
+### トラブルシューティング
+
+- **起動時に「failed to list kind clusters」のようなエラーが出る**
+  - Kind Provider はポーリングループに入る前に、一度 `List` を実行して疎通確認を行います。
+  - 次の点を確認してください。
+    - `kind` コマンドがインストールされており、`PATH` から実行できるか。
+    - プロセスがコンテナランタイム（Docker など）へアクセスできるか。
+  - 同じ環境で `kind get clusters` を実行し、正常にクラスター一覧が取得できるかどうかも有効なチェックです。
+
+- **新しく作成した Kind クラスターが検出されない**
+  - クラスター名が `Options.Prefix` の条件を満たしているかを確認してください。
+  - クラスター作成後、少なくとも 1 回分のポーリング間隔が経過するまで待ってください。
+  - コントローラーのログに `"Added new cluster"` のようなメッセージが出ているか、`kind get clusters` の結果と突き合わせて確認すると原因を絞り込みやすくなります。
+
+- **Reconciler が `ErrClusterNotFound` を受け取る**
+  - 主な原因は次のいずれかです。
+    - Kind クラスターが削除されたあとに、そのクラスターへ対応するイベントがキューに残っていた。
+    - そもそもクラスター名が Provider の `Prefix` と一致しておらず、フリートに含まれていなかった。
+  - 既定では、`mcbuilder` で作られたコントローラーは `ClusterNotFound` ラッパーを利用し、
+    - このエラーを「非致命的」とみなし、
+    - リクエストを再キューしないように処理します。
+  - 独自のメトリクスやログを記録したい場合は、このラッパーを無効にし、自分で `ErrClusterNotFound` を検出・処理することもできます。
+
+- **多数の Kind クラスターで負荷テストしたい**
+  - Kind クラスターは比較的ヘビーであり、大量に並行起動するとローカル CPU やメモリを簡単に使い切ってしまいます。
+  - 次のような方針を検討してください。
+    - ローカル開発ではフリート規模を小さく保つ（数個〜十数個程度）。
+    - 大規模なシミュレーションには、より軽量な **Namespace Provider** などを利用する。
+    - より現実的なスケールテストには、Cluster API や Cluster Inventory API ベースの Provider へ移行する。
+
+これらの前提・挙動・注意点を踏まえることで、Kind Provider は `multicluster-runtime` の導入やマルチクラスターコントローラー設計の検証を、ローカル環境で安全かつ高速に行うための強力なツールとなります。

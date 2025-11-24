@@ -1,0 +1,531 @@
+---
+title: Event Handling
+---
+
+This chapter looks at **how events flow in a multi-cluster controller**, from
+Kubernetes informers all the way to a `mcreconcile.Request` on your Reconciler.
+If you already know controller-runtime’s event model (`Source` → `EventHandler`
+→ workqueue → `Reconcile`), `multicluster-runtime` keeps that mental model but
+adds a **cluster dimension** and a few helpers for cross-cluster scenarios.
+
+We will cover:
+
+- how multi-cluster **Sources** fan in events from many clusters,
+- how **handlers** attach the correct `ClusterName` to each work item,
+- how to use **`EnqueueRequestForObject`** and friends in a multi-cluster context,
+- how to design **mapping functions** for cross-cluster watches,
+- and how to keep event handling efficient and observable at fleet scale.
+
+This chapter builds on:
+
+- **The Reconcile Loop** (`03-core-concepts--the-reconcile-loop.md`),
+- **Uniform Reconcilers** and **Multi-Cluster-Aware Reconcilers**
+  (`04-controller-patterns--*.md`),
+- and the upstream KEPs for cluster identification and inventory:
+  `ClusterProperty` (KEP-2149), `ClusterProfile` (KEP-4322),
+  and credentials plugins for `ClusterProfile` (KEP-5339).
+
+---
+
+### Recap: event handling in controller-runtime
+
+In single-cluster controller-runtime, the pipeline looks like:
+
+- **Sources** (`source.Source` / `source.Kind`):
+  - wrap informers or external channels,
+  - convert raw events (Create / Update / Delete / Generic) into typed events.
+- **EventHandlers** (`handler.EventHandler`):
+  - decide **which keys** to enqueue (typically one or more `reconcile.Request`),
+  - push them onto a **rate-limiting workqueue**.
+- **Controllers**:
+  - pop `reconcile.Request` items from the queue,
+  - call `Reconcile(ctx, req)` on your Reconciler.
+
+`multicluster-runtime` **reuses this architecture**:
+
+- we still rely on controller-runtime’s cache, informers, and queues,
+- we still use familiar handlers like `EnqueueRequestForObject`,
+- but every work item is extended with a **cluster qualifier**.
+
+---
+
+### Multi-cluster requests and cluster-aware queues
+
+The central request type is `mcreconcile.Request` (`pkg/reconcile/request.go`):
+
+- **Fields**
+  - `ClusterName string` — logical name of the cluster this work item belongs to
+    (empty string `""` is the local / host cluster).
+  - `Request reconcile.Request` — inner request with `NamespacedName` of the
+    object *within that cluster*.
+
+Internally, multi-cluster controllers work with a small generic interface:
+
+- **`ClusterAware[request]`**
+  - any comparable type that:
+    - implements `fmt.Stringer`,
+    - exposes `Cluster() string` and `WithCluster(string) request`.
+
+`mcreconcile.Request` implements this interface, but other request types can be
+used if you need custom keys.
+
+On the queue side, multi-cluster handlers wrap controller-runtime’s
+`workqueue.RateLimitingInterface` in **cluster-aware queues**:
+
+- `handler.clusterQueue` (`pkg/handler/lift.go`) wraps a queue of
+  `mcreconcile.Request` and:
+  - injects `ClusterName` when adding an item,
+  - strips or rewrites cluster information when removing / finishing it.
+- `handler.clusterInjectingQueue` (`pkg/handler/inject.go`) does the same for
+  generic `ClusterAware` request types.
+
+As a result:
+
+- per-cluster Sources can keep using familiar controller-runtime handlers,
+- the queue always stores **cluster-qualified** requests,
+- your Reconciler always sees the right `ClusterName`.
+
+For a deeper introduction to `mcreconcile.Request`, see
+**“The Reconcile Loop”**.
+
+---
+
+### Multi-cluster Sources: watching many clusters at once
+
+Multi-cluster Sources live in `pkg/source` and mirror controller-runtime’s
+`source` package:
+
+- **`Source`** (`pkg/source/source.go`)
+  - type alias: `TypedSource[client.Object, mcreconcile.Request]`,
+  - represents “something that can produce `mcreconcile.Request` values”.
+- **`TypedSource[object, request]`**
+  - generic interface with:
+    - `ForCluster(name string, cl cluster.Cluster) (source.TypedSource[request], error)`.
+  - given a **cluster name** and a `cluster.Cluster`, it returns a
+    **cluster-scoped Source** that plugs into a controller-runtime controller.
+- **`SyncingSource` / `TypedSyncingSource`**
+  - extend `TypedSource` with `SyncingForCluster` and `WaitForSync`,
+  - allow controllers to wait for caches to be ready before starting workers.
+
+The main in-tree implementation is **`mcsource.Kind`** (`pkg/source/kind.go`):
+
+- it is created with:
+
+  ```go
+  src := mcsource.Kind(
+      &corev1.ConfigMap{},
+      mchandler.TypedEnqueueRequestForObject[*corev1.ConfigMap](),
+  )
+  ```
+
+- for each engaged cluster, the multi-cluster controller calls:
+
+  ```go
+  clusterSrc, err := src.ForCluster(clusterName, clusterInstance)
+  ```
+
+  which:
+
+  - resolves the correct informer from that cluster’s cache,
+  - attaches an event handler bound to `clusterName`,
+  - and returns a `source.TypedSource[mcreconcile.Request]` that can be watched.
+
+- when started, the cluster-specific source:
+  - listens to that cluster’s informer,
+  - runs predicates,
+  - and uses the multi-cluster handler to enqueue `mcreconcile.Request` for the
+    right `ClusterName`.
+
+You almost never need to call `ForCluster` manually—this is wired by the
+multi-cluster **Controller** and **Builder**—but understanding the split helps:
+
+- `Kind` knows how to watch a **Kubernetes type** in **one cluster**,
+- `Controller` knows how to instantiate it for **every engaged cluster**.
+
+#### Projections per cluster
+
+`mcsource.Kind` also supports **projections** via `WithProjection`:
+
+- `WithProjection(func(cluster.Cluster, object) (object, error))` lets you:
+  - vary the object type or fields **per cluster**,
+  - for example, to scope by namespace or to watch a CRD only in some clusters.
+
+This is a more advanced feature and is typically used by Providers or framework
+code rather than application reconcilers.
+
+---
+
+### Controllers that engage clusters dynamically
+
+Multi-cluster controllers are implemented by `mcController`
+(`pkg/controller/controller.go`), which wraps a normal typed controller:
+
+- it implements **`multicluster.Aware`**:
+  - `Engage(ctx, name string, cl cluster.Cluster)` is called by the Manager or
+    Provider when a new cluster appears,
+  - the controller stores `{clusterName → cluster.Cluster}` in an internal map.
+- it exposes **`MultiClusterWatch`**:
+  - registers a `mcsource.TypedSource` once,
+  - and replays it across **all currently engaged clusters**,
+  - then remembers that source for future clusters.
+
+When a Provider (for example, Kind, Kubeconfig, Cluster API, Cluster Inventory
+API, Namespace) discovers a new cluster and engages it:
+
+1. The controller creates a **child context** bound to that cluster.
+2. For every registered multi-cluster Source:
+   - it calls `ForCluster(name, cl)` to get a cluster-scoped Source,
+   - wires it into the underlying controller with a start function that
+     is bound to the cluster’s context.
+3. When the cluster goes away or the context is cancelled:
+   - the cluster’s context is cancelled,
+   - the Source stops,
+   - the controller prunes the entry from its `{clusterName → cluster}` map.
+
+From your perspective as a Reconciler author:
+
+- you still declare controllers using `mcbuilder.ControllerManagedBy(mgr)`,
+- you don’t need to think about **when** clusters appear or disappear,
+- you only handle `mcreconcile.Request` with a valid `ClusterName`
+  (or deal with `ErrClusterNotFound` if it disappears between queue and Reconcile).
+
+---
+
+### EnqueueRequestForObject in a multi-cluster context
+
+In controller-runtime, `handler.EnqueueRequestForObject` enqueues one
+`reconcile.Request` for the object that triggered the event.
+
+In `multicluster-runtime`, the equivalent is exposed via `pkg/handler`:
+
+- **`mchandler.EnqueueRequestForObject(clusterName string, cl cluster.Cluster)`**
+  - adapts `handler.EnqueueRequestForObject` to produce `mcreconcile.Request`,
+  - intended for framework or Provider code that wires handlers by hand.
+- **`mchandler.TypedEnqueueRequestForObject[object]()`**
+  - returns a `TypedEventHandlerFunc[object, mcreconcile.Request]`,
+  - you pass this into `mcsource.Kind` or custom `Watches`.
+
+For most application controllers, you don’t need to touch these directly:
+
+- when you call:
+
+  ```go
+  import mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+
+  err := mcbuilder.ControllerManagedBy(mgr).
+      Named("multicluster-configmaps").
+      For(&corev1.ConfigMap{}).
+      Complete(mcreconcile.Func(...))
+  ```
+
+  the Builder:
+
+  - creates a `mcsource.Kind` with the correct typed handler,
+  - ensures events from every engaged cluster enqueue a `mcreconcile.Request`
+    with the right `ClusterName`,
+  - without you having to reference `mchandler` manually.
+
+You only reach for `mchandler.TypedEnqueueRequestForObject` when you are wiring
+custom event relationships via `Watches`, or when you are building your own
+Sources.
+
+---
+
+### Owner-based handlers in a multi-cluster context
+
+Owner-based relationships (for example, `Deployment` owning `ReplicaSet`) are
+handled by the familiar `EnqueueRequestForOwner` handler.
+
+`multicluster-runtime` provides multi-cluster adapters:
+
+- **`mchandler.EnqueueRequestForOwner(ownerType client.Object, opts ...handler.OwnerOption)`**
+  - returns an `EventHandlerFunc` that:
+    - uses the **cluster-specific** scheme and REST mapper,
+    - enqueues `mcreconcile.Request` for the owner in the **same cluster**.
+- **`mchandler.TypedEnqueueRequestForOwner[object](ownerType client.Object, opts ...handler.OwnerOption)`**
+  - typed version for use with generic controllers.
+
+Again, the Builder uses these by default for `Owns`:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("workload-controller").
+    For(&appv1alpha1.Workload{}).
+    Owns(&appv1alpha1.WorkloadReplica{}). // multi-cluster-aware by default
+    Complete(reconciler)
+```
+
+Each time a `WorkloadReplica` event occurs in some cluster:
+
+- the multi-cluster Kind Source receives the event,
+- the multi-cluster owner handler resolves the corresponding `Workload`
+  **in the same cluster**,
+- and it enqueues a `mcreconcile.Request` keyed by:
+  - `ClusterName` = that cluster’s name,
+  - `Request.NamespacedName` = the owner’s name and namespace.
+
+You only need the explicit `mchandler.*EnqueueRequestForOwner` functions when:
+
+- you are constructing custom `Watches`,
+- or you need non-default owner options (for example, non-controller owners).
+
+---
+
+### Mapping-based handlers and cross-cluster watches
+
+Mapping handlers let you express **arbitrary relationships** from one object to
+one or more work queue keys. In controller-runtime this is done with
+`EnqueueRequestsFromMapFunc` and `TypedEnqueueRequestsFromMapFunc`.
+
+In `multicluster-runtime`, there are **two** flavours to choose from, depending
+on whether you want to inject or preserve the cluster name.
+
+#### Same-cluster mapping (cluster injection)
+
+When you want to enqueue work **in the same cluster as the source object**, use:
+
+- **`mchandler.EnqueueRequestsFromMapFunc(fn handler.MapFunc)`**
+- **`mchandler.TypedEnqueueRequestsFromMapFunc[object, request](fn handler.TypedMapFunc[object, request])`**
+
+These wrap controller-runtime’s mapping handlers with **cluster injection**:
+
+- the map function `fn` is *cluster-agnostic*:
+  - it usually returns requests with `ClusterName == ""`,
+  - or a request type that defers cluster selection to the handler.
+- the wrapper injects the **actual cluster name** of the event when it enqueues
+  items.
+
+Example: watch `ConfigMap`s and enqueue a `FleetConfig` Reconcile in the **same
+cluster**:
+
+```go
+import (
+    mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
+)
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-config").
+    For(&appv1alpha1.FleetConfig{}).
+    Watches(
+        &corev1.ConfigMap{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[*corev1.ConfigMap, mcreconcile.Request](
+            func(ctx context.Context, cm *corev1.ConfigMap) []mcreconcile.Request {
+                // Reconcile the FleetConfig in the same namespace as the ConfigMap.
+                key := types.NamespacedName{
+                    Namespace: cm.Namespace,
+                    Name:      "fleet-config",
+                }
+                return []mcreconcile.Request{{
+                    // ClusterName will be injected by the handler.
+                    Request: reconcile.Request{NamespacedName: key},
+                }}
+            },
+        ),
+    ).
+    Complete(reconciler)
+```
+
+Here:
+
+- the map function does **not** choose a cluster,
+- the handler injects the source cluster’s name for you.
+
+#### Cross-cluster mapping (cluster preservation)
+
+In more advanced setups, the source of an event and the **cluster you want to
+reconcile** are not the same:
+
+- you might watch resources in **member clusters** but reconcile a CRD in a
+  **hub cluster**,
+- or watch inventory in a hub cluster and enqueue work for **many** member
+  clusters based on that.
+
+In these cases, you want the map function to **fully control** the cluster
+dimension. For that, use:
+
+- **`mchandler.TypedEnqueueRequestsFromMapFuncWithClusterPreservation`**
+
+This version:
+
+- does **not** inject the source cluster name,
+- relies entirely on the `ClusterName` field that your map function sets.
+
+Example: watch per-cluster `ClusterStatus` objects and reconcile a
+`FleetSummary` object in the **hub cluster** (`ClusterName == ""`):
+
+```go
+import (
+    mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
+)
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-summary").
+    For(&appv1alpha1.FleetSummary{}).
+    Watches(
+        &appv1alpha1.ClusterStatus{},
+        mchandler.TypedEnqueueRequestsFromMapFuncWithClusterPreservation[
+            *appv1alpha1.ClusterStatus,
+            mcreconcile.Request,
+        ](func(ctx context.Context, cs *appv1alpha1.ClusterStatus) []mcreconcile.Request {
+            // Always reconcile the single FleetSummary in the hub cluster.
+            return []mcreconcile.Request{{
+                ClusterName: "",
+                Request: reconcile.Request{
+                    NamespacedName: types.NamespacedName{
+                        Namespace: "fleet-system",
+                        Name:      "summary",
+                    },
+                },
+            }}
+        }),
+    ).
+    Complete(reconciler)
+```
+
+Guidelines:
+
+- **use `TypedEnqueueRequestsFromMapFunc`** when the target cluster is
+  “same as the source” and you want the framework to inject it,
+- **use `TypedEnqueueRequestsFromMapFuncWithClusterPreservation`** when the
+  mapping decides the target cluster(s) explicitly.
+
+---
+
+### Choosing which clusters to watch
+
+Event handling is tightly coupled to **which clusters your controller watches**.
+You configure this via **Engage options** on the Builder
+(`pkg/builder/multicluster_options.go` and the “Uniform Reconcilers” chapter):
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - if `true`, the controller attaches Sources to the **host cluster** (cluster
+    name `""`),
+  - default:
+    - `false` when a Provider is configured (focus on the fleet),
+    - `true` when no Provider is configured (single-cluster mode).
+- **`WithEngageWithProviderClusters(bool)`**
+  - if `true`, the controller attaches Sources to **all clusters known to the
+    Provider**,
+  - has an effect only when a Provider is configured.
+
+You pass these options on `For`, `Owns`, and `Watches`:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("hub-and-fleet").
+    // Primary CRD only in the hub cluster.
+    For(
+        &appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    // Watch Deployments in all provider-managed clusters.
+    Watches(
+        &appsv1.Deployment{},
+        mchandler.TypedEnqueueRequestForOwner[*appsv1.Deployment](&appv1alpha1.FleetDeployment{}),
+        mcbuilder.WithEngageWithProviderClusters(true),
+        mcbuilder.WithEngageWithLocalCluster(false),
+    ).
+    Complete(reconciler)
+```
+
+Patterns:
+
+- **Host-only controllers**:
+  - `WithEngageWithLocalCluster(true)`, `WithEngageWithProviderClusters(false)`.
+- **Fleet-only controllers**:
+  - `WithEngageWithProviderClusters(true)`, `WithEngageWithLocalCluster(false)`.
+- **Hybrid controllers**:
+  - combine host-only and fleet-only Sources in the same controller, as in the
+    example above.
+
+These options influence where events are **originating** from; the Reconciler
+can still read and write to multiple clusters by calling `mgr.GetCluster`
+explicitly.
+
+---
+
+### Observability: relating events to ClusterIDs and inventories
+
+In multi-cluster environments, being able to **tie events back to stable
+cluster identities** is essential for debugging and SRE workflows.
+
+Two upstream APIs are particularly relevant:
+
+- **ClusterProperty** (KEP-2149, About API)
+  - `ClusterProperty` objects store per-cluster metadata,
+  - the well-known `cluster.clusterset.k8s.io` property provides a
+    **cluster ID** that is unique within a ClusterSet,
+  - the `clusterset.k8s.io` property identifies the **ClusterSet membership**.
+- **ClusterProfile** (KEP-4322, Cluster Inventory API) with credentials plugins
+  (KEP-5339)
+  - `ClusterProfile` objects represent clusters in an inventory,
+  - `status.properties` include both ClusterSet membership and arbitrary
+    metadata such as location or provider,
+  - `credentialProviders` and exec plugins (KEP-5339) describe how to obtain
+    credentials for each cluster.
+
+When designing event handling and logging:
+
+- **always include `req.ClusterName` in logs and metrics**:
+  - this lets you correlate controller events with ClusterProperty or
+    ClusterProfile entries,
+  - for example, by labelling metrics with a stable cluster ID from
+    `cluster.clusterset.k8s.io`.
+- when reconciling hub-side summaries or inventory entries:
+  - consider watching ClusterProfile or ClusterProperty objects directly,
+  - use mapping handlers to aggregate per-cluster state into higher-level views.
+
+This keeps your event flows aligned with the broader multi-cluster ecosystem and
+makes it easier to debug issues across Fleet managers, Multi-Cluster Services,
+and cluster inventories.
+
+---
+
+### Performance and fairness for multi-cluster event streams
+
+Because a single multi-cluster controller aggregates events from **many
+clusters into one queue**, it is particularly important to design event handling
+for fairness and scale (as discussed in the KubeCon EU 2025 talk).
+
+Recommendations:
+
+- **Keep per-event work small and idempotent**
+  - each `Reconcile` should perform a bounded amount of work per event,
+  - avoid long-lived network calls inside handlers or Sources; use the
+    Reconciler for that.
+- **Use concurrency settings wisely**
+  - leverage controller-runtime’s `MaxConcurrentReconciles` and per-group-kind
+    concurrency to balance throughput,
+  - remember that concurrency is shared across clusters.
+- **Avoid per-cluster global locks**
+  - don’t serialize all events for a cluster under a single global mutex,
+  - prefer per-object or per-namespace coordination, or explicit
+    hub-side CRDs for larger workflows.
+
+Future work in multicluster-runtime explores **fair queues** that balance
+throughput across clusters more explicitly, but the event-handling patterns
+described in this chapter are designed to work well with today’s queue
+implementation and future improvements.
+
+---
+
+### Summary
+
+In `multicluster-runtime`, event handling extends the familiar
+controller-runtime model with a **cluster-aware request type**, **multi-cluster
+Sources**, and **handlers that inject or preserve `ClusterName`**:
+
+- Providers and the Multi-Cluster Manager engage clusters and wire Sources,
+- multi-cluster Sources watch objects in each cluster and enqueue
+  `mcreconcile.Request` values,
+- handlers such as `EnqueueRequestForObject`, `EnqueueRequestForOwner`, and
+  mapping-based handlers have multi-cluster adapters,
+- your Reconcilers can focus on business logic, using `req.ClusterName` and
+  `mgr.GetCluster` to act on the right cluster(s).
+
+By understanding and using these building blocks carefully—especially around
+mapping functions and cluster engagement—you can build controllers that react
+reliably and efficiently to events across entire fleets of clusters.
+
+

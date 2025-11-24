@@ -1,0 +1,488 @@
+---
+title: Using the Builder
+---
+
+This chapter explains how to use the multi-cluster controller **builder** (`mcbuilder`)
+to wire reconcilers into a `multicluster-runtime` Manager.
+If you already know controller-runtime’s `builder.ControllerManagedBy`,
+`mcbuilder` is the multi-cluster equivalent: it configures what to watch,
+which clusters to engage, and how to construct controllers that work with
+`mcreconcile.Request`.
+
+We will cover:
+
+- what the multi-cluster Builder does and how it relates to controller-runtime’s builder,
+- how to register controllers with `ControllerManagedBy` and `Complete`,
+- how to choose **which clusters** a controller watches using `EngageOptions`,
+- how the **ClusterNotFoundWrapper** changes error handling,
+- and a few advanced options (`WithOptions`, `WithLogConstructor`, metadata-only watches).
+
+---
+
+### What the Multi-Cluster Builder Does
+
+The `pkg/builder` package is a thin layer on top of the other
+`multicluster-runtime` libraries:
+
+- it accepts a **multi-cluster Manager** (`mcmanager.Manager`) instead of a plain
+  controller-runtime `manager.Manager`,
+- it expects reconcilers that work with **cluster-aware requests**
+  (usually `mcreconcile.Request`),
+- it wires common `For`, `Owns`, and `Watches` calls to **multi-cluster Sources**
+  and **cluster-aware handlers**:
+  - internally it uses `mcsource.Kind` to watch Kubernetes objects in each
+    engaged cluster,
+  - it uses handlers from `pkg/handler` to attach the correct `ClusterName`
+    to each work item,
+- it wraps your reconciler with helpers such as **`ClusterNotFoundWrapper`**.
+
+Conceptually, it is **controller-runtime’s builder, but multi-cluster aware**:
+
+- the API surface is intentionally very close to the upstream builder,
+- the implementation fans watches out to **all engaged clusters**,
+- and it fans events into a single workqueue of `mcreconcile.Request`.
+
+If you are comfortable with controller-runtime’s builder, you already know
+most of `mcbuilder`—this chapter focuses on the multi-cluster-specific knobs.
+
+---
+
+### From controller-runtime Builder to `mcbuilder`
+
+Most projects that adopt `multicluster-runtime` start from an existing
+single-cluster `main.go` that looks roughly like this:
+
+```go
+// Single-cluster style (controller-runtime)
+mgr, err := manager.New(ctrl.GetConfigOrDie(), manager.Options{})
+if err != nil {
+    // ...
+}
+
+if err := builder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    Complete(reconciler); err != nil {
+    // ...
+}
+```
+
+The multi-cluster version keeps the overall structure and changes a few
+imports and types:
+
+```go
+import (
+    "context"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    mcbuilder  "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager  "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind" // or file/kubeconfig/cluster-api/...
+)
+
+func main() {
+    ctx := signals.SetupSignalHandler()
+
+    // 1. Choose and construct a Provider.
+    provider := kind.New()
+
+    // 2. Create a multi-cluster Manager.
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+    if err != nil {
+        // ...
+    }
+
+    // 3. Register a multi-cluster controller using mcbuilder.
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("multicluster-configmaps").
+        For(&corev1.ConfigMap{}).
+        Complete(mcreconcile.Func(
+            func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+                // Route to the correct cluster based on req.ClusterName.
+                cl, err := mgr.GetCluster(ctx, req.ClusterName)
+                if err != nil {
+                    return reconcile.Result{}, err
+                }
+
+                cm := &corev1.ConfigMap{}
+                if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                    if apierrors.IsNotFound(err) {
+                        // Object was deleted; nothing to do.
+                        return reconcile.Result{}, nil
+                    }
+                    return reconcile.Result{}, err
+                }
+
+                // Business logic goes here.
+                return ctrl.Result{}, nil
+            },
+        )); err != nil {
+        // ...
+    }
+
+    if err := mgr.Start(ctx); err != nil {
+        // ...
+    }
+}
+```
+
+The important differences are:
+
+- the Manager comes from `mcmanager.New` and is parameterised with a **Provider**,
+- reconcilers receive `mcreconcile.Request`, which carries:
+  - `ClusterName` (which cluster to talk to),
+  - `Request` (the inner `reconcile.Request` for that cluster),
+- controllers are registered via `mcbuilder.ControllerManagedBy(mgr)` instead of
+  the upstream builder.
+
+For a detailed, step-by-step migration story, see the **Uniform Reconcilers**
+chapter; this chapter focuses on the Builder-specific configuration.
+
+---
+
+### Declaring Controllers with `ControllerManagedBy`
+
+The main entry point is:
+
+```go
+mcbuilder.ControllerManagedBy(mgr) // returns *builder.Builder
+```
+
+You then chain methods just like with controller-runtime:
+
+- **`Named(string)`**:
+  - sets an explicit controller name (used in logs and metrics),
+  - must be unique per Manager.
+- **`For(object, ...ForOption)`**:
+  - declares the **primary type** this controller reconciles,
+  - configures default event handlers and Sources for that type.
+- **`Owns(object, ...OwnsOption)`**:
+  - declares **owned secondary types** that should enqueue the owner,
+  - internally uses multi-cluster `EnqueueRequestForOwner`.
+- **`Watches(object, handler, ...WatchesOption)`**:
+  - declares additional relationships driven by an explicit handler,
+  - useful for mapping functions and cross-resource relationships.
+- **`Complete(reconciler)`**:
+  - builds the controller and registers it with the Manager.
+
+For example, a controller that:
+
+- reconciles a `FleetConfig` CRD,
+- owns a per-cluster `ClusterConfig` CRD,
+- and watches `ConfigMap` changes in the same cluster as each `ClusterConfig`,
+
+could be wired as:
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-config").
+    For(&fleetv1alpha1.FleetConfig{}).
+    Owns(&fleetv1alpha1.ClusterConfig{}).
+    Watches(
+        &corev1.ConfigMap{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[
+            *corev1.ConfigMap,
+            mcreconcile.Request,
+        ](mapConfigMapToClusterConfig),
+    ).
+    Complete(reconciler)
+```
+
+Under the hood, the Builder will:
+
+- create appropriate **multi-cluster Sources** for each `For`, `Owns`, and
+  `Watches` call,
+- attach cluster-aware handlers that emit `mcreconcile.Request`,
+- and register the controller as a **cluster-aware** controller that will
+  engage with clusters as they appear.
+
+If you only need the common `For` / `Owns` / `Watches` patterns, you can rely on
+the Builder and never touch `pkg/source` or `pkg/handler` directly; those
+details are covered in **Advanced Topics — Event Handling**.
+
+---
+
+### Choosing Which Clusters to Watch with `EngageOptions`
+
+In a multi-cluster system, the important question is not just *what* you watch,
+but **where** you watch it:
+
+- only in the **host (local) cluster** where the controller runs,
+- only in **provider-managed clusters**, or
+- in **both**.
+
+`EngageOptions` in `pkg/builder/multicluster_options.go` control this for each
+`For`, `Owns`, or `Watches` call:
+
+- **`WithEngageWithLocalCluster(bool)`**:
+  - if `true`, the controller attaches its Sources to the **host cluster**
+    (cluster name `""`),
+  - default:
+    - `true` when **no Provider** is configured (single-cluster mode),
+    - `false` when a Provider *is* configured.
+- **`WithEngageWithProviderClusters(bool)`**:
+  - if `true`, the controller attaches Sources to **all clusters managed by the
+    Provider**,
+  - has an effect only when a Provider is configured,
+  - default:
+    - `true` when a Provider is configured,
+    - `false` when no Provider is configured.
+
+You pass these options to `For`, `Owns`, or `Watches` as needed.
+
+#### Host-only Controllers
+
+Controllers that should only see the host cluster (for example, controllers
+that manage CRDs which never leave the management cluster) can be wired as:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("host-only-controller").
+    For(
+        &platformv1alpha1.PlatformConfig{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    Complete(reconciler)
+```
+
+Even if a Provider is configured to manage remote clusters, this controller will
+**not** receive events from them.
+
+#### Fleet-only Controllers
+
+A **uniform fleet-wide** controller that ignores the host cluster and watches
+only provider-managed clusters might look like:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-configmaps").
+    For(
+        &corev1.ConfigMap{},
+        mcbuilder.WithEngageWithLocalCluster(false),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(reconciler)
+```
+
+This is a typical configuration for reconcilers that treat the host cluster
+purely as a control plane and only act on member clusters.
+
+#### Hybrid Controllers
+
+You can also mix host and fleet sources in the same controller. For example,
+a hub-driven fan-out controller that:
+
+- watches `FleetDeployment` CRDs only in the host cluster, and
+- also watches `Deployment` objects in all member clusters,
+
+can be declared as:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-deployer").
+    For(
+        &appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    Watches(
+        &appsv1.Deployment{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[
+            *appsv1.Deployment,
+            mcreconcile.Request,
+        ](mapDeploymentToFleetDeployment),
+        mcbuilder.WithEngageWithProviderClusters(true),
+        mcbuilder.WithEngageWithLocalCluster(false),
+    ).
+    Complete(reconciler)
+```
+
+Here:
+
+- the **primary CRD** lives only in the hub cluster,
+- but the controller also receives events from Deployments running in all
+  provider-managed clusters.
+
+Because `EngageOptions` are stored on each `For` / `Owns` / `Watches` input
+separately, you can precisely control where each watch runs.
+
+---
+
+### Error Handling with `ClusterNotFoundWrapper`
+
+In a dynamic fleet, clusters can disappear between the time an event is queued
+and the time your reconciler runs. In that case, calls like:
+
+```go
+cl, err := mgr.GetCluster(ctx, req.ClusterName)
+```
+
+may fail with `multicluster.ErrClusterNotFound`. Retrying those work items
+forever is wasteful: the cluster is gone, so there is nothing left to reconcile.
+
+To make this safe by default, `mcbuilder` wraps reconcilers in a
+**ClusterNotFoundWrapper** unless you opt out:
+
+- if your reconciler returns an error such that
+  `errors.Is(err, multicluster.ErrClusterNotFound)` is `true`,
+- the wrapper treats the reconcile as **successful** and **does not requeue**,
+- all other results and errors are passed through unchanged.
+
+You can control this behaviour using:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    WithClusterNotFoundWrapper(false). // disable the wrapper
+    For(&corev1.ConfigMap{}).
+    Complete(reconciler)
+```
+
+Most controllers should keep the default (`true`):
+
+- when a cluster permanently leaves the fleet, its queued items eventually drain,
+- you avoid noisy retries and log spam for work that can never succeed.
+
+If you need custom handling—such as incrementing metrics or emitting special
+events—you can disable the wrapper and handle `ErrClusterNotFound` explicitly
+in your reconciler. The **Uniform Reconcilers** chapter contains concrete
+patterns for doing this.
+
+---
+
+### Controller Options and Logging
+
+The Builder lets you pass through the usual controller-runtime
+**controller options**:
+
+```go
+opts := controller.TypedOptions[mcreconcile.Request]{
+    MaxConcurrentReconciles: 10,
+}
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    WithOptions(opts).
+    Complete(reconciler)
+```
+
+These options interact with the Manager’s global **group-kind concurrency**
+settings and cache sync timeouts; see the **Architecture** chapter and
+controller-runtime documentation for details.
+
+For logging, you can customise the **log constructor**:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    WithLogConstructor(func(req *mcreconcile.Request) logr.Logger {
+        // Start from the manager’s logger and enrich with controller + cluster.
+        log := mgr.GetLogger().WithValues(
+            "controller", "multicluster-configmaps",
+        )
+        if req != nil {
+            nn := req.Request.NamespacedName
+            log = log.WithValues(
+                "cluster", req.ClusterName,
+                "namespace", nn.Namespace,
+                "name", nn.Name,
+            )
+        }
+        return log
+    }).
+    Complete(reconciler)
+```
+
+By default, the Builder uses a logger that already annotates logs with the
+controller name and, when possible, the Kubernetes Group and Kind of the
+primary resource. Adding `ClusterName` and `NamespacedName` consistently is
+a good practice for multi-cluster observability.
+
+---
+
+### Metadata-only Watches and Advanced Sources
+
+For high-cardinality or very large objects, you may not need full structured
+objects in the cache. The Builder exposes **metadata-only** watches:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("metadata-only-pods").
+    WatchesMetadata(
+        &corev1.Pod{},
+        mchandler.TypedEnqueueRequestForObject[*metav1.PartialObjectMetadata](),
+    ).
+    Complete(reconciler)
+```
+
+When you use `WatchesMetadata`:
+
+- the underlying cache stores only `metav1.PartialObjectMetadata`,
+- your reconciler should Get/List using `PartialObjectMetadata` with an
+  explicit `GroupVersionKind`,
+- this avoids creating an additional full-typed cache on top of the metadata
+  cache.
+
+For very specialised scenarios, you can also use `WatchesRawSource` to attach
+custom `mcsource.TypedSource` instances directly. This is primarily useful for
+framework or Provider code; most application controllers should prefer
+`For` / `Owns` / `Watches` together with the helpers from
+**Advanced Topics — Event Handling**.
+
+---
+
+### Typed Builders and Custom Request Types
+
+The default Builder works with `mcreconcile.Request`, but the implementation is
+generic over **any** cluster-aware request type:
+
+```go
+type Builder = TypedBuilder[mcreconcile.Request]
+```
+
+and:
+
+```go
+func TypedControllerManagedBy[request mcreconcile.ClusterAware[request]](
+    m mcmanager.Manager,
+) *TypedBuilder[request]
+```
+
+This means advanced users can:
+
+- define their own request key type that implements `mcreconcile.ClusterAware`,
+- use `TypedControllerManagedBy[MyRequest](mgr)` to build controllers whose
+  queues carry that type.
+
+Most users will never need this; sticking to `mcreconcile.Request` keeps code
+consistent with the rest of the documentation and examples, and it works well
+with the testing and event-handling helpers described in later chapters.
+
+---
+
+### Summary
+
+The `mcbuilder` package brings the familiar **builder pattern** from
+controller-runtime into the multi-cluster world:
+
+- `ControllerManagedBy(mgr)` creates controllers that understand
+  `mcreconcile.Request` and talk to many clusters through `mcmanager.Manager`,
+- `For`, `Owns`, and `Watches` wire multi-cluster Sources and handlers for you,
+- `EngageOptions` let you decide whether each watch should see the host cluster,
+  provider-managed clusters, or both,
+- `ClusterNotFoundWrapper`, controller options, and logging hooks give you
+  safe defaults and room for tuning.
+
+By leaning on the Builder, you can focus on **business logic in your
+reconcilers**, while `multicluster-runtime` takes care of the multi-cluster
+plumbing, event routing, and error handling.
+
+
+

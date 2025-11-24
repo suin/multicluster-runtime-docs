@@ -1,0 +1,180 @@
+---
+title: 前提条件
+---
+
+この章では、`multicluster-runtime` を使ってコントローラーを開発・実行する前に準備しておくべき内容を説明します。  
+必要なスキル、ツールチェーン、Kubernetes 環境、そして各 Provider ごとの追加要件の概要をまとめます。
+
+---
+
+### 前提となる知識
+
+- **Kubernetes の基礎**  
+  - Pod / Deployment / Service / Namespace / RBAC / CRD などの基本概念を理解していること。  
+  - コントローラーを動かすクラスターに対して、CRD や RBAC を作成できる十分な権限（cluster-admin など）を持っていること。
+
+- **Go 言語と controller-runtime**  
+  - `controller-runtime` を用いたコントローラー開発（Manager / Reconciler / Builder / Source など）の基本的な流れを理解していること。  
+  - まだコントローラーを書いたことがない場合は、まずは upstream の controller-runtime ドキュメントやサンプルを一通り試してから本ドキュメントに戻ってくることを推奨します。
+
+- **マルチクラスターの基本概念（推奨）**  
+  - 特に次の SIG-Multicluster の概念を理解していると、Cluster API Provider や Cluster Inventory API Provider を利用するときに役立ちます。
+    - **ClusterSet / ClusterId**（クラスター識別子） — KEP‑2149  
+    - **ClusterProfile**（クラスターインベントリ） — KEP‑4322  
+    - **ClusterProfile における Credentials Plugin** — KEP‑5339  
+  - これらの KEP は、ClusterProfile / ClusterProperty を用いたインベントリ・クレデンシャル管理の標準的な土台を提供します。
+
+---
+
+### ツールとバージョン
+
+- **Go ツールチェーン**
+  - **Go 1.24 以上** を利用してください。これは `sigs.k8s.io/multicluster-runtime` の `go.mod` で指定されているバージョンと一致しており、本プロジェクトが利用する controller-runtime のジェネリクス対応に必要です。
+  - `go env GOPATH` やモジュールキャッシュが正しく設定されており、`go get` や `go test` が問題なく実行できることを確認してください。
+
+- **Kubernetes クライアントライブラリ**
+  - 本ドキュメントに対応する実装は、次のライブラリバージョンを前提としています。
+    - `k8s.io/client-go v0.34.0`  
+    - `sigs.k8s.io/controller-runtime v0.22.0`
+  - 利用する Kubernetes クラスターは、これらのクライアントライブラリと互換性のあるバージョンである必要があります（おおむね最新に近い Kubernetes リリースを想定しています）。
+
+- **CLI ツール**
+  - **`kubectl`**: インストール済みで、対象クラスターに対して操作できること（コンテキスト切り替えを含む）。
+  - **コンテナランタイム**: Kind などを利用するために Docker や containerd などの OCI 対応ランタイムが必要です。
+  - **Git**: Go モジュールや本ドキュメントのリポジトリを取得するために利用します。
+
+---
+
+### Kubernetes 環境
+
+`multicluster-runtime` は、コントローラープロセスが動作する **管理（ホスト）環境** と、実際にリソースを監視・操作する **メンバークラスター群** を前提としています。
+
+- **ホスト環境**
+  - コントローラーのバイナリを実行する場所です。
+    - 例: ローカルマシン上で `go run` する、管理クラスター上の Pod として実行する、など。
+  - 必要な条件:
+    - すべてのメンバークラスターの API サーバーにネットワーク的に到達できること。
+    - コントローラーをクラスター内部で動かす場合は、そのクラスター上で CRD や RBAC、コントローラーの Deployment を作成できる権限。
+
+- **メンバークラスター**
+  - `multicluster-runtime` を通じて監視・変更の対象となるクラスター群です。
+  - 具体例:
+    - ローカルの **Kind** クラスター（開発・クイックスタート用）。
+    - **Cluster API** によって管理されるクラスター。
+    - **ClusterProfile API** によってインベントリ登録されたクラスター。
+    - kubeconfig やその他の Provider を通じて到達可能な任意の Kubernetes クラスター。
+  - 各メンバークラスターは:
+    - ホスト環境から API サーバーへ到達可能であること。
+    - コントローラーが必要とする操作（読み取りのみ／読み書き）の RBAC 権限を持つクレデンシャルが存在すること。
+
+---
+
+### Provider ごとの外部要件（概要）
+
+どのようにクラスターを「検出・接続」するかは **Provider** によって定義されます。ここでは本体に同梱されている代表的な Provider について、外部要件の概要のみ整理します（詳細は Provider リファレンスで扱います）。
+
+- **Kind Provider (`providers/kind`)**
+  - 必要なツール:
+    - `kind` CLI がインストールされていること。
+    - Docker などのコンテナランタイムがローカルで動作していること。
+  - Kind クラスターを作成・削除できること（例: `kind create cluster --name fleet-alpha`）。
+  - 主な用途:
+    - ローカル開発および本ドキュメントのクイックスタート。
+
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+  - **管理クラスター**（コントローラーが動作し、kubeconfig Secret を保持するクラスター）が 1 つ必要です。
+  - 各メンバークラスターについて:
+    - 必要な権限（例: ConfigMap の読み取り、Deployment の作成など）を持つ ServiceAccount。
+    - その ServiceAccount のトークンから生成した kubeconfig を、管理クラスター上の Secret に保存。
+  - 補助スクリプト（任意だが推奨）:
+    - `examples/kubeconfig/scripts/create-kubeconfig-secret.sh` が、次を自動化します。
+      - `scripts/rules.yaml` に基づいた RBAC（Role / ClusterRole と Binding）の作成。
+      - リモートクラスター上の ServiceAccount から kubeconfig を生成し、管理クラスター上の Secret に格納。
+  - 追加ツール:
+    - スクリプト内で RBAC ルールの加工に **`yq`** を利用します。
+
+- **File Provider (`providers/file`)**
+  - ローカルファイルシステム上の kubeconfig ファイルが 1 つ以上必要です。
+    - 既定の探索パス:
+      - 環境変数 `$KUBECONFIG` に有効なパスが設定されていればそれを利用。
+      - それ以外の場合は `~/.kube/config` を優先。
+      - さらに必要に応じてカレントディレクトリ以下から一般的な kubeconfig ファイル名パターンで探索。
+  - コントローラーを実行するユーザーが、これらのファイルを読み取れること。
+  - 特別な CRD や追加コンポーネントは不要で、kubeconfig 経由で通常どおり API にアクセスできればよいです。
+
+- **Cluster API Provider (`providers/cluster-api`)**
+  - **Cluster API**（`cluster.x-k8s.io`）がインストールされている管理クラスター。
+  - 対象となるメンバークラスターごとに CAPI の `Cluster` オブジェクトが存在し、適切な名前空間に配置されていること。
+  - 各 `Cluster` に対して:
+    - ワークロードクラスターに接続するための kubeconfig を含む Secret（既定では `sigs.k8s.io/cluster-api/util/kubeconfig` から取得）。
+  - RBAC:
+    - Provider を動かすコントローラーは、CAPI `Cluster` リソースの `get` / `list` / `watch` と、それに紐づく Secret の読み取り権限を持つ必要があります。
+
+- **Cluster Inventory API Provider (`providers/cluster-inventory-api`)**
+  - **ハブクラスター** に次の CRD がインストールされていること:
+    - **ClusterProfile API** (`multicluster.x-k8s.io/v1alpha1`) — KEP‑4322 で定義されるクラスターインベントリ。
+    - **About API / ClusterProperty** (`about.k8s.io`) — KEP‑2149 で定義される `cluster.clusterset.k8s.io` / `clusterset.k8s.io` などのプロパティ。
+  - クラスターマネージャーが、各メンバークラスターについて `ClusterProfile` を作成し、少なくとも次を更新していること:
+    - `status.version`, `status.properties`, `status.conditions`（例: `ControlPlaneHealthy`, `Joined`）。
+    - `status.credentialProviders`（KEP‑5339 準拠）。ここに記述された情報をもとに、外部クレデンシャルプラグインが `rest.Config` を構築します。
+  - クレデンシャルプラグイン:
+    - kubeconfig の exec プロバイダーと同様のプロトコルに従う外部プロセスやバイナリを、コントローラーの近傍に配置する必要があります。
+  - RBAC:
+    - Provider を動かすコントローラーは、`ClusterProfile` と、利用する kubeconfig 取得戦略（Secrets など）が参照するリソースを `get` / `list` / `watch` できる必要があります。
+
+- **Namespace Provider (`providers/namespace`)**
+  - **1 つの物理クラスター**があればよく、そのクラスター内の各 **Namespace を仮想クラスターとして扱う** Provider です。
+  - 追加の CRD や外部システムは不要です。
+  - 用途:
+    - 実際に多数のクラスターを作成せずに、マルチクラスター挙動を高速にローカルで検証したい場合に有効です（ただし、すべて同じ API サーバーを共有している点に注意）。
+
+- **Multi Provider (`providers/multi`)**
+  - 複数の Provider をまとめて扱う **合成レイヤー** です。
+  - 外部要件自体は、内部で利用する各 Provider の要件に依存します。
+  - Provider 名のプレフィックス設計（例: `kind#dev`, `capi#prod-eu` など）と、プレフィックス付きクラスター名が一意になるよう注意が必要です。
+
+- **Clusters Provider (`providers/clusters`)**
+  - `pkg/clusters` ヘルパーを利用した小さな Provider で、**リファレンス実装・テスト用途** を主目的としています。
+  - 利用者が自前で `cluster.Cluster` インスタンスを構築して渡す前提であり、特定のインベントリシステムへの依存はありません。
+
+- **Single Provider (`providers/single`)**
+  - あらかじめ構築済みの `cluster.Cluster` を 1 つ、指定した名前のクラスターとしてエンゲージする Provider です。
+  - シングルクラスターしかないが、`multicluster-runtime` の型やヘルパーを活用したい場合などに便利です。
+
+- **Nop Provider (`providers/nop`)**
+  - どのクラスター名に対してもクラスターを返さない Provider です。
+  - 「フリートが常に空」の環境をテストしたいときや、単なるプレースホルダーとして利用されます。
+
+---
+
+### プロジェクトのステータスと安定性
+
+- `multicluster-runtime` は **SIG-Multicluster 傘下の実験的プロジェクト** です。
+  - KubeCon EU 2025 のセッション「Dynamic Multi-Cluster Controllers with controller-runtime」でも述べられているとおり、まだ「一般利用向けに安定したプロダクト」としては位置づけられていません。
+  - API や Provider 実装、推奨パターンは今後も積極的に変化する可能性があります。
+- 現時点では次のような利用スタイルを推奨します。
+  - **開発・検証・PoC・プラットフォームの初期設計段階** での利用を主眼とし、ミッションクリティカルな本番環境で採用する際は十分な検証を行うこと。
+  - ライブラリをアップグレードする際には、`go.mod` のバージョンとマイグレーションノートを必ず確認すること。
+
+---
+
+### クイックスタート（Kind Provider）に必要な最小構成
+
+次章の **インストール** および **クイックスタート**（Kind Provider 利用）をスムーズに進めるために、最低限次の環境を用意してください。
+
+- **ローカル開発環境**
+  - Go **1.24 以上** がインストールされていること。
+  - Linux または macOS などの Unix 系 OS 上でターミナルとエディタ／IDE を利用できること。
+  - `git` がインストールされており、`go mod` ベースのプロジェクトに慣れていること。
+
+- **Kubernetes 関連ツール**
+  - `kubectl` がインストールされ、`PATH` に通っていること。
+  - Docker などのコンテナランタイムが起動しており、コンテナを起動できること。
+  - **Kind** (`kind` CLI) がインストールされ、`PATH` に通っていること。
+
+- **クラスター数とリソース**
+  - ローカルマシン上で、次を同時に動作させられるだけの CPU / メモリがあること。
+    - コントローラーバイナリ（`go run` など）。
+    - 2 つ以上の Kind クラスター（例: `fleet-alpha`, `fleet-beta`）。
+
+上記の前提条件を満たしていれば、次の **インストール** 章、および Kind Provider を用いた **クイックスタート** へ進む準備が整っています。

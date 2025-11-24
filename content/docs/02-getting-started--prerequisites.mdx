@@ -1,0 +1,180 @@
+---
+title: Prerequisites
+---
+
+This chapter describes what you need in place before you can build and run controllers with `multicluster-runtime`: required skills, tooling, Kubernetes environments, and the extra components needed for each provider.
+
+---
+
+### Required background
+
+- **Kubernetes fundamentals**:  
+  - You should be comfortable with Pods, Deployments, Services, Namespaces, RBAC, and CRDs.  
+  - You should have cluster-admin (or equivalent) permissions on the clusters where you will run controllers and install CRDs.
+- **Go and controller-runtime**:  
+  - You should already know how to build a controller with `controller-runtime` (Managers, Reconcilers, Builders, Sources).  
+  - If you have never written a controller before, start with the upstream controller-runtime documentation and sample controllers, then return here.
+- **Multi-cluster basics (recommended)**:  
+  - Understanding of the SIG-Multicluster concepts of **ClusterSet**, **ClusterID**, and **ClusterProfile** will help, especially if you plan to use the Cluster API or Cluster Inventory API providers.  
+  - See:
+    - Cluster identity: KEP‑2149 (ClusterId for ClusterSet identification)  
+    - Cluster inventory: KEP‑4322 (ClusterProfile API)  
+    - Credentials: KEP‑5339 (Plugin for Credentials in ClusterProfile)
+
+---
+
+### Tooling and versions
+
+- **Go toolchain**
+  - Use **Go 1.24 or newer**. This matches the version declared in `sigs.k8s.io/multicluster-runtime`’s `go.mod` and is required for the controller-runtime generics used by this project.
+  - Ensure `go env GOPATH` and your module cache are set up correctly so `go get` / `go test` work as expected.
+
+- **Kubernetes client libraries**
+  - The reference implementation in this documentation is built against:
+    - `k8s.io/client-go v0.34.0`
+    - `sigs.k8s.io/controller-runtime v0.22.0`
+  - Your clusters must be compatible with these client libraries. In practice, this means running a reasonably recent Kubernetes release on both management and member clusters.
+
+- **CLI tools**
+  - **`kubectl`**: Installed and configured; you should be able to talk to your clusters and switch contexts.
+  - **Container runtime**: Docker, containerd, or another OCI-compatible runtime, required for Kind-based examples.
+  - **Git**: To clone and work with Go modules and this documentation repository.
+
+---
+
+### Kubernetes environments
+
+`multicluster-runtime` assumes a **management (host) environment** where your controller process runs, plus **member clusters** that form your fleet:
+
+- **Host environment**
+  - Where you run your controller binary (for example, `go run` from your laptop, or a Deployment in a management cluster).
+  - Needs:
+    - Network reachability to all member clusters (directly or via gateways).
+    - Permissions to create CRDs, RBAC objects, and controller Deployments if you run the manager **inside** a Kubernetes cluster.
+
+- **Member clusters**
+  - The clusters that your controllers will observe and/or modify through `multicluster-runtime`.
+  - They can be:
+    - Local **Kind** clusters (for development and the Quickstart).
+    - Clusters managed by **Cluster API**.
+    - Clusters registered in a **ClusterProfile** inventory.
+    - Any Kubernetes clusters reachable through kubeconfig or other providers.
+  - Each member cluster must expose a Kubernetes API server reachable from the host environment, and you must have credentials with the appropriate RBAC to perform whatever actions your controllers need (read-only vs. read/write).
+
+---
+
+### Provider-specific external prerequisites (overview)
+
+You will choose one or more **providers** to define how `multicluster-runtime` discovers and reaches clusters. The sections below summarise the external prerequisites for each built-in provider; full details live in the Providers Reference.
+
+- **Kind Provider (`providers/kind`)**
+  - Tools:
+    - `kind` CLI installed.
+    - Docker (or another supported container runtime) running locally.
+  - You should be able to create and delete Kind clusters (for example, `kind create cluster --name fleet-alpha`).
+  - Recommended for:
+    - Local development and the Getting Started Quickstart.
+
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+  - A **management cluster** where:
+    - The controller runs.
+    - Secrets containing kubeconfig files are stored (one secret per member cluster).
+  - For each member cluster:
+    - A ServiceAccount with RBAC permissions appropriate for your controllers (for example, read ConfigMaps, or manage Deployments).
+    - A kubeconfig generated from that ServiceAccount and stored in a Secret in the management cluster.
+  - Helper script (optional but recommended):
+    - `examples/kubeconfig/scripts/create-kubeconfig-secret.sh` automates:
+      - Creating RBAC (Role / ClusterRole, bindings) according to `rules.yaml`.
+      - Generating a kubeconfig and writing it into a Secret.
+  - Additional tools:
+    - `yq` (YAML processor) if you use the helper script.
+
+- **File Provider (`providers/file`)**
+  - One or more kubeconfig files on disk:
+    - Default search paths:
+      - `$KUBECONFIG` (if set and points to a valid file).
+      - `~/.kube/config`.
+      - The current working directory, using common kubeconfig filename patterns.
+  - The user running the controller must be able to read those files, and the kubeconfig contexts must point to the clusters you intend to manage.
+  - No Kubernetes-side components are required beyond normal API access per kubeconfig.
+
+- **Cluster API Provider (`providers/cluster-api`)**
+  - A management cluster with **Cluster API** (`cluster.x-k8s.io`) installed.
+  - Cluster API `Cluster` objects representing the member clusters, in any namespace.
+  - For each Cluster:
+    - A kubeconfig Secret containing credentials for the workload cluster (by default, discovered via `sigs.k8s.io/cluster-api/util/kubeconfig` and `clientcmd`).
+  - RBAC:
+    - The controller running the provider must be able to `get`, `list`, `watch` CAPI `Cluster` resources and read their kubeconfig Secrets.
+
+- **Cluster Inventory API Provider (`providers/cluster-inventory-api`)**
+  - A **hub cluster** with:
+    - The **ClusterProfile API** CRD installed (`multicluster.x-k8s.io/v1alpha1`, from the `cluster-inventory-api` project; see KEP‑4322).
+    - The **About API / ClusterProperty** CRD installed (`about.k8s.io`, from KEP‑2149) so properties like `cluster.clusterset.k8s.io` and `clusterset.k8s.io` can be used.
+  - Cluster managers that populate `ClusterProfile` objects, including:
+    - `status.version`, `status.properties`, and `status.conditions` (for example, `ControlPlaneHealthy`, `Joined`).
+    - `status.credentialProviders`, following KEP‑5339, so that external credential plugins can obtain a `rest.Config` for each member cluster.
+  - Credential plugins:
+    - Executables or services that implement the external credential provider protocol (reusing kubeconfig exec semantics), deployed alongside or reachable from your controllers.
+  - RBAC:
+    - The controller must be able to `get`, `list`, and `watch` `ClusterProfile` objects and any additional resources required by your kubeconfig strategy (for example, referenced Secrets).
+
+- **Namespace Provider (`providers/namespace`)**
+  - A single Kubernetes cluster where each **Namespace is treated as a virtual cluster**.
+  - No additional CRDs or external systems are required.
+  - Useful for:
+    - Fast local testing of multi-cluster behaviour without actually creating many clusters.
+  - You must understand that all “clusters” share the same physical API server and backing resources.
+
+- **Multi Provider (`providers/multi`)**
+  - A composition layer over other providers.
+  - Prerequisites are those of the **underlying providers** you register.
+  - You need to choose provider name prefixes and ensure that cluster names are unique once prefixed (for example, `kind#dev`, `capi#prod-eu`).
+
+- **Clusters Provider (`providers/clusters`)**
+  - A small provider built on the `pkg/clusters` helper.
+  - Intended primarily as a **reference implementation and test utility**.
+  - You must construct and pass `cluster.Cluster` instances yourself; no external inventory system is assumed.
+
+- **Single Provider (`providers/single`)**
+  - Wraps a single pre-constructed `cluster.Cluster` under a fixed name.
+  - Useful when you want to reuse `multicluster-runtime`’s types and helpers but only have one cluster.
+
+- **Nop Provider (`providers/nop`)**
+  - A provider that never returns clusters.
+  - Used for testing or as a placeholder when you want a strictly single-cluster setup while reusing multi-cluster-aware code paths.
+
+---
+
+### Project status and stability
+
+- `multicluster-runtime` is an **experimental** SIG‑Multicluster project.
+  - As highlighted in the KubeCon EU 2025 talk “Dynamic Multi-Cluster Controllers with controller-runtime”, the project is not yet considered “generally consumable”.
+  - APIs, provider implementations, and best practices may evolve rapidly.
+- For now, you should:
+  - Prefer using it in **development, experimentation, and early-stage platform work**, not in mission-critical production systems without careful evaluation.
+  - Expect to revisit version constraints (`go.mod`) and migration notes when upgrading.
+
+---
+
+### Minimum setup for the Quickstart (Kind provider)
+
+The **Quickstart** in the next chapter assumes the following minimum environment:
+
+- **Local development environment**
+  - Go **1.24+** installed.
+  - A Unix-like OS (Linux or macOS) with access to a terminal and your preferred editor/IDE.
+  - `git` and basic familiarity with `go mod`–based projects.
+
+- **Kubernetes tooling**
+  - `kubectl` installed and on your `PATH`.
+  - **Docker** (or another container runtime supported by Kind) running and able to start containers.
+  - **Kind** installed (`kind` CLI on your `PATH`).
+
+- **Cluster capacity**
+  - Enough local CPU and memory to run:
+    - The controller process.
+    - Two or more Kind clusters at the same time (for example, `fleet-alpha`, `fleet-beta`).
+
+If you have all of the above in place, you are ready to move on to **Installation** and then to the **Quickstart** using the Kind provider.
+
+

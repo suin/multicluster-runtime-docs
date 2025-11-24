@@ -1,0 +1,303 @@
+---
+title: Providers
+---
+
+This chapter dives deeper into **Providers**, the components that tell `multicluster-runtime` *which clusters exist* and *how to connect to them*.  
+Where the **Architecture**, **Key Concepts**, and **Multi-Cluster Manager** chapters introduced Providers at a high level, this chapter focuses on:
+
+- the `multicluster.Provider` and `ProviderRunnable` interfaces,
+- how Providers discover clusters and **engage** them with the Multi-Cluster Manager,
+- how the built-in Providers map to real-world inventory and identity systems,
+- what to keep in mind when writing your own Provider.
+
+---
+
+### What a Provider is responsible for
+
+Conceptually, a **Provider** answers two questions for the Multi-Cluster Manager:
+
+- **Discovery**: *Which clusters are part of my fleet right now?*  
+  - Add clusters when they appear, remove them when they go away.
+  - React to changes in cluster health, inventory, or credentials.
+- **Connectivity**: *How do I talk to each cluster?*  
+  - Construct a `cluster.Cluster` (client, cache, indexer) for each member.
+  - Keep per-cluster caches running and in sync.
+
+The separation of concerns is:
+
+- The **Multi-Cluster Manager** (`mcmanager.Manager`) owns:
+  - the host cluster manager and global controller pipeline,
+  - the list of multi-cluster–aware components that must be notified when new clusters appear.
+- The **Provider** owns:
+  - the **source of truth** for the fleet (Cluster API, ClusterProfile, kubeconfig, Kind, files, namespaces, …),
+  - the **lifecycle** of per-cluster `cluster.Cluster` objects,
+  - fan-out of **field indexes** across all engaged clusters.
+
+Providers do **not** implement business logic; they are infrastructure that other controllers build on.
+
+---
+
+### The `multicluster.Provider` interface
+
+At the core of `multicluster-runtime` is a small interface in `pkg/multicluster/multicluster.go`:
+
+```go
+type Provider interface {
+	// Get returns a cluster for the given name, or ErrClusterNotFound if unknown.
+	Get(ctx context.Context, clusterName string) (cluster.Cluster, error)
+
+	// IndexField registers a field index on all engaged clusters, current and future.
+	IndexField(ctx context.Context, obj client.Object, field string, extract client.IndexerFunc) error
+}
+```
+
+Key points:
+
+- **`Get`**
+  - Returns an existing `cluster.Cluster` if the Provider has already created or engaged it.
+  - May lazily create a new `cluster.Cluster` (for example, from a kubeconfig or API call) and start its cache.
+  - Returns `multicluster.ErrClusterNotFound` when the name is not known; reconcilers and helpers like `ClusterNotFoundWrapper` treat this as a signal that the cluster has left the fleet.
+  - The **cluster name** is a logical identifier (string) and should be **stable** over time; it often aligns with:
+    - the `ClusterProperty`-based Cluster ID from **KEP‑2149**,
+    - or a `ClusterProfile` name / property from **KEP‑4322**.
+
+- **`IndexField`**
+  - Registers a field index on **all clusters now and in the future**.
+  - The Multi-Cluster Manager’s `GetFieldIndexer()` stores definitions and delegates to `Provider.IndexField`, so controller authors can keep using:
+    - `mgr.GetFieldIndexer().IndexField(ctx, &MyType{}, "spec.foo", extractFoo)`
+    - without worrying about new clusters that appear later.
+  - Concrete Providers typically:
+    - store the index definitions internally,
+    - apply them to any existing `cluster.Cluster` instances immediately,
+    - re-apply them to new clusters as they are created.
+
+Because the interface is so small, it is straightforward to implement custom Providers that integrate with any inventory system, cluster registry, or bespoke source of truth.
+
+---
+
+### `ProviderRunnable`: driving discovery loops
+
+Many Providers need to run a **watch loop** or background process to discover and track clusters over time.  
+For that, `multicluster-runtime` defines an optional interface:
+
+```go
+type ProviderRunnable interface {
+	// Start is a long-running discovery loop.
+	// It must block until the Provider should shut down.
+	Start(ctx context.Context, aware multicluster.Aware) error
+}
+```
+
+Responsibilities of `Start`:
+
+- **Observe the source of truth**:
+  - watch CAPI `Cluster` objects,
+  - watch `ClusterProfile` objects,
+  - poll Kind clusters or scan kubeconfig files,
+  - watch Namespaces, Secrets, or other resources.
+- **Create and manage per-cluster `cluster.Cluster` instances**:
+  - build `*rest.Config` and `cluster.Cluster` objects,
+  - call `cl.Start(clusterCtx)` and wait for `cl.GetCache().WaitForCacheSync(...)`,
+  - cancel per-cluster contexts when clusters are removed.
+- **Engage clusters with the Manager**:
+  - call `aware.Engage(clusterCtx, name, cl)` once a cluster is ready,
+  - ensure `Engage` is **non-blocking** from the Provider’s perspective (the Manager takes care of wiring multi-cluster Sources and controllers).
+
+When you construct a Multi-Cluster Manager via `mcmanager.New(config, provider, opts)`:
+
+- if `provider` implements `ProviderRunnable`, the Manager will **start it automatically** on `mgr.Start(ctx)`;
+- you should not call `Start` on such providers manually.
+
+This pattern mirrors controller-runtime’s `manager.Runnable` but is specific to **cluster discovery and engagement**.
+
+---
+
+### How Providers discover and engage clusters
+
+Although Providers share a common interface, they fall into a few discovery patterns.
+
+- **Pre-constructed clusters**
+  - Example: `providers/single`, `providers/clusters`.
+  - You create `cluster.Cluster` instances yourself (for example in tests), then:
+    - feed them into the Provider,
+    - or wrap a single cluster under a chosen name.
+  - Useful in unit tests or when you want to reuse `multicluster-runtime` types in a mostly single-cluster setting.
+
+- **Polling-based discovery**
+  - Example: **Kind Provider**.
+  - Periodically lists all Kind clusters using the Kind CLI library.
+  - For each matching cluster name:
+    - builds a kubeconfig and `cluster.Cluster`,
+    - starts its cache,
+    - calls `Engage(ctx, clusterName, cl)` on the Manager.
+  - When a Kind cluster disappears, the Provider cancels its context and drops it from its internal map.
+
+- **File- and kubeconfig-based discovery**
+  - Example: **File Provider**, **Kubeconfig Provider**.
+  - File Provider:
+    - scans known kubeconfig files and directories (with glob patterns),
+    - watches them with `fsnotify`,
+    - creates/updates/removes clusters as files or contexts appear and disappear.
+  - Kubeconfig Provider:
+    - runs as a controller in the host cluster,
+    - watches Secrets in a namespace with a specific label,
+    - whenever a Secret with kubeconfig data appears or changes:
+      - parses the kubeconfig into a `rest.Config`,
+      - constructs / updates a `cluster.Cluster`,
+      - engages it with the Multi-Cluster Manager.
+
+- **Kubernetes API–driven discovery**
+  - Example: **Cluster API Provider**, **Cluster Inventory API Provider**, **Namespace Provider**.
+  - Cluster API Provider:
+    - runs a controller that watches CAPI `Cluster` objects,
+    - when a `Cluster` is provisioned, fetches its kubeconfig Secret,
+    - constructs a `cluster.Cluster` and engages it.
+  - Cluster Inventory API Provider:
+    - watches `ClusterProfile` objects (KEP‑4322) on a hub cluster,
+    - uses a pluggable **kubeconfig strategy** to obtain a `rest.Config`:
+      - often implemented via the credential plugins defined in **KEP‑5339**,
+      - for example, calling an external binary that uses Workload Identity Federation.
+    - creates/updates a `cluster.Cluster` and engages it when the profile is healthy.
+  - Namespace Provider:
+    - watches `Namespace` objects in a single cluster,
+    - treats each namespace as a **virtual cluster** backed by a shared `cluster.Cluster`,
+    - engages a `NamespacedCluster` wrapper per namespace, mapping all operations into that namespace.
+
+Across all of these, the **engagement contract** is the same:
+
+- Providers are free to choose *how* and *when* clusters appear and disappear.
+- Once they call `Engage(ctx, name, cl)`:
+  - the Manager and multi-cluster Sources take over wiring,
+  - controllers begin to receive `mcreconcile.Request{ClusterName: name, ...}` for that cluster.
+
+---
+
+### Built-in Providers at a glance
+
+`multicluster-runtime` ships several Providers that cover common environments:
+
+- **Kind Provider (`providers/kind`)**
+  - Discovers local Kind clusters, optionally filtered by a name prefix.
+  - Ideal for development, testing, and the Quickstart.
+
+- **File Provider (`providers/file`)**
+  - Discovers clusters from kubeconfig files on disk (paths and directories, with globs).
+  - Watches files and directories and updates the fleet when kubeconfigs change.
+
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+  - Runs in a management cluster and watches Secrets labelled as containing kubeconfigs.
+  - Each Secret corresponds to a member cluster; the Provider builds a `cluster.Cluster` from the kubeconfig and engages it.
+  - Pairs well with scripts or controllers that generate kubeconfig Secrets (for example, the example `create-kubeconfig-secret.sh` script).
+
+- **Cluster API Provider (`providers/cluster-api`)**
+  - Integrates with **Cluster API** (`cluster.x-k8s.io`).
+  - Watches CAPI `Cluster` resources, obtains their kubeconfig from Secrets, and creates clusters when they reach the *Provisioned* phase.
+  - Suitable when CAPI is already your source of truth for workload clusters.
+
+- **Cluster Inventory API Provider (`providers/cluster-inventory-api`)**
+  - Integrates with the **ClusterProfile API** from **KEP‑4322**.
+  - Watches `ClusterProfile` resources on a hub cluster and:
+    - uses `status.conditions` (for example `ControlPlaneHealthy`, `Joined`) to decide when a cluster is ready,
+    - uses `status.properties` (including `cluster.clusterset.k8s.io` and `clusterset.k8s.io` from **KEP‑2149**) for identity and ClusterSet membership,
+    - uses `status.credentialProviders` and plugins (per **KEP‑5339**) to obtain credentials.
+  - This makes it a natural fit for platforms that expose a standardized cluster inventory.
+
+- **Namespace Provider (`providers/namespace`)**
+  - Treats each Namespace as a virtual cluster backed by a shared API server.
+  - Useful for simulating multi-cluster behaviour on a single physical cluster.
+
+- **Composition and utility Providers**
+  - **Multi Provider (`providers/multi`)**:
+    - Allows you to register multiple Providers under name prefixes (for example, `kind#dev-cluster`, `capi#prod-eu1`).
+    - Splits `ClusterName` into `providerPrefix` + `innerClusterName` and forwards calls appropriately.
+  - **Clusters Provider (`providers/clusters`)**:
+    - Example Provider built on `pkg/clusters.Clusters`, used mainly for tests and demonstrations.
+  - **Single Provider (`providers/single`)**:
+    - Wraps a single pre-constructed `cluster.Cluster` under a fixed name.
+  - **Nop Provider (`providers/nop`)**:
+    - Implements the interface but never returns clusters; useful for tests or for explicitly single-cluster setups that still use multi-cluster types.
+
+Details for each Provider (configuration flags, RBAC, and deployment patterns) are covered in the **Providers Reference** chapters.
+
+---
+
+### Cluster identity, inventory, and credentials (KEPs 2149, 4322, 5339)
+
+Providers are where `multicluster-runtime` connects to the broader SIG‑Multicluster ecosystem:
+
+- **Cluster identity — KEP‑2149 (ClusterId for ClusterSet identification)**
+  - Defines `ClusterProperty` CRDs and well-known properties:
+    - `cluster.clusterset.k8s.io`: a stable, unique cluster ID within a ClusterSet.
+    - `clusterset.k8s.io`: identifies the ClusterSet membership.
+  - Providers that integrate with ClusterSets (for example via ClusterProfile) should:
+    - use these properties to derive stable `ClusterName` values,
+    - treat them as the canonical identity across tools.
+
+- **Cluster inventory — KEP‑4322 (ClusterProfile API)**
+  - Defines the `ClusterProfile` resource as a portable representation of clusters in an inventory.
+  - The Cluster Inventory API Provider reads:
+    - `status.version` for Kubernetes versions,
+    - `status.properties` for attributes like location and ClusterSet,
+    - `status.conditions` (health, joined-ness),
+    - `status.credentialProviders` for how to obtain credentials.
+  - This lets multi-cluster controllers work across different inventory implementations (OCM, Clusternet, Fleet, Karmada, …) through a single API.
+
+- **Credentials — KEP‑5339 (Plugin for Credentials in ClusterProfile)**
+  - Introduces a **plugin-based mechanism** to turn a `ClusterProfile` into a `rest.Config`:
+    - `credentialProviders` in the ClusterProfile’s status describe what credential types a cluster accepts (for example `"google"` for GKE).
+    - Controllers use a library that:
+      - calls an external binary (plugin) per credentials type,
+      - reuses the `exec` protocol from client-go’s external credential providers,
+      - returns a `rest.Config` to the Provider.
+  - The Cluster Inventory API Provider is designed to plug into this model: it delegates all credential retrieval to the credential plugins and focuses on wiring the resulting `rest.Config` into `cluster.Cluster` instances.
+
+By aligning Providers with these KEPs, `multicluster-runtime` makes cluster identity, inventory, and authentication **pluggable and standardized**, instead of baking cloud- or vendor-specific logic into each controller.
+
+---
+
+### Writing your own Provider
+
+Implementing a custom Provider usually follows these steps:
+
+- **1. Choose a cluster naming scheme**
+  - Decide how to map your inventory’s notion of “cluster” to a **stable, unique string**.
+  - Prefer IDs that:
+    - are unique within the fleet (and ideally within a ClusterSet),
+    - are stable across restarts and over the lifetime of the cluster,
+    - can be mapped back to whatever ClusterProperty / ClusterProfile you use.
+
+- **2. Decide how you will obtain `rest.Config` and credentials**
+  - For strongly-typed APIs like ClusterProfile, reuse the **credential plugin** mechanisms from KEP‑5339.
+  - For simpler setups, you can:
+    - read kubeconfigs from files, Secrets, or other CRDs,
+    - or construct `rest.Config` programmatically (for example, for in-cluster or sidecar scenarios).
+
+- **3. Construct `cluster.Cluster` instances**
+  - Use `cluster.New(restConfig, options...)` from controller-runtime.
+  - Apply options as needed (for example, custom schemes, rate limits, health checks).
+  - Start each cluster with its own `clusterCtx`:
+    - `go cl.Start(clusterCtx)`
+    - wait for `cl.GetCache().WaitForCacheSync(clusterCtx)` before calling `Engage`.
+
+- **4. Implement the Provider interfaces**
+  - Implement `Get` and `IndexField` directly, **or** embed the reusable `clusters.Clusters[T]` helper to handle:
+    - storing clusters in a map,
+    - starting them in goroutines,
+    - re-applying indexes to new clusters.
+  - If you have a long-running discovery loop, also implement `ProviderRunnable.Start(ctx, aware)`:
+    - watch or poll your source of truth,
+    - create/update/remove `cluster.Cluster` instances as needed,
+    - call `aware.Engage(clusterCtx, name, cl)` for new or updated clusters.
+
+- **5. Integrate with the Multi-Cluster Manager**
+  - Pass your Provider to `mcmanager.New(config, provider, opts)` (or `WithMultiCluster`).
+  - Use `mcbuilder.ControllerManagedBy(mgr)` to register controllers; they will automatically start receiving `mcreconcile.Request`s for your clusters.
+
+For more advanced scenarios:
+
+- Use the **Multi Provider** to combine multiple cluster sources under different prefixes.
+- Use the **Clusters** helper or **Single/Nop Providers** for tests and experimental setups.
+
+With these pieces, you can evolve from simple, static fleets to rich, KEP-aligned multi-cluster inventories without changing your controller business logic.
+
+

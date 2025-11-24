@@ -1,0 +1,249 @@
+---
+title: アーキテクチャ
+---
+
+このセクションでは、`multicluster-runtime` の内部アーキテクチャ、つまり 1 つのコントローラープロセスで多くのクラスターを効率的に watch してリコンサイルする **「One Pod, Many Clusters」** モデルについて説明します。  
+controller-runtime にすでに慣れている読者は、Manager / Controller / Reconciler / Source / Workqueue といったおなじみの構成要素に、マルチクラスター対応・フリート検出・クラスター単位のキャッシュを拡張したものだと考えると理解しやすいでしょう。
+
+設計ゴールは次のとおりです:
+- **controller-runtime のメンタルモデルを再利用する**（新しいフレームワークを発明しない）。
+- **フリートを動的に扱えるようにする**: クラスターがランタイム中に出現・変更・消滅しても対応できる。
+- **シングルクラスターとの互換性を保つ**: 既存コントローラーを最小限の差分で移行できる。
+- **SIG-Multicluster の標準に統合する**（KEP-2149 / 4322 / 5339 の ClusterID / ClusterSet / ClusterProfile など）。
+
+この章の残りでは、上位のコンポーネント（Manager / Provider）から、イベント配信や Reconcile の詳細といった低レベルの仕組みまで、アーキテクチャを段階的に掘り下げていきます。
+
+---
+
+### One Pod, Many Clusters（1 つの Pod で複数クラスター）
+
+典型的なシングルクラスター構成では、各コントローラープロセスは 1 つの API サーバー構成に強く結び付いています。これをそのままマルチクラスターにスケールさせようとすると、プラットフォームチームはしばしば次のようなパターンに行き着きます。
+- **クラスターごとのコントローラー**: クラスターごとに 1 デプロイメント。運用オーバーヘッドが雪だるま式に増える。
+- **1 プロセス内に複数の Manager**: 1 つの Pod 内に複数の `manager.Manager` インスタンスを立ち上げる方式。キャッシュやワークキューがクラスター数に比例して増える。
+- **外部プロセスマネージャー**: クラスターごとに別バイナリのコントローラーを起動・停止するスーパーバイザープロセスを用意する方式。
+
+`multicluster-runtime` はこれとは異なるアプローチを取ります。**マルチクラスター対応の Manager が 1 つだけ存在し、それがフリート全体を調停する** というモデルです。概念的には次のようになります:
+- **「ホスト」マネージャーが 1 つだけ存在**し、これは通常の controller-runtime の `manager.Manager` であり、依然として 1 Pod の内部で動作します。
+- その上に **マルチクラスター Manager ラッパー `mcmanager.Manager`** が載り、クラスターやマルチクラスター Provider の知識を追加します。
+- **Provider** がクラスターを発見し、そのライフサイクル（Engage / Disengage）を駆動します。
+- Engage された各クラスターごとに **クラスター専用の cache + informer スタック** が作られ、**すべてのイベントは 1 つの論理的なコントローラーパイプラインに流し込まれます**。
+
+Reconciler の視点から見た主な違いは、各 Reconcile リクエストが次の 2 つの情報を運ぶようになることです。
+- **`ClusterName`**: メンバークラスターを識別する名前。
+- **`Request`**: そのクラスター内での Kubernetes オブジェクトの `NamespacedName`。
+
+これにより、単一の Reconciler 実装で多くのクラスターを独立に処理することも、複数クラスターをまたいだオーケストレーションを行うことも可能になります。
+
+---
+
+### マルチクラスター Manager
+
+中核となるのは `mcmanager.Manager`（`pkg/manager/manager.go`）で、これは **通常の controller-runtime の Manager をラップし、マルチクラスター対応にしたもの**です。
+
+- **埋め込み構造**:
+  - `mcManager` は controller-runtime の `manager.Manager` を埋め込みます。
+  - さらに **`multicluster.Provider` への参照**と、マルチクラスター対応の Runnable 群を保持します。
+- **クラスターアクセス**:
+  - **`GetCluster(ctx, clusterName)`** は、指定された名前の `cluster.Cluster` インスタンスを返します。
+    - **空文字列 (`""`) はローカル / ホストクラスター**（`LocalCluster`）専用と予約されています。
+    - 非空の名前の場合、Manager は設定された Provider に処理を委譲します。
+  - **`GetManager(ctx, clusterName)`** は、メンバークラスター専用にスコープされた `manager.Manager` を返します。  
+    通常の Manager インターフェースを期待しているコンポーネントを、特定クラスター向けにだけ動かしたい場合に便利です。
+  - **`ClusterFromContext(ctx)`** は、`context.Context` にクラスターが注入されている場合に、そこからデフォルトのクラスターを解決します。
+- **Provider との統合**:
+  - **`GetProvider()`** は、背後で使用している `multicluster.Provider`（存在すれば）を公開します。
+  - **`GetFieldIndexer()`** は、Provider（メンバークラスター用）とローカルマネージャーの両方に対してフィールドインデックスを委譲するインデクサーを返します。
+- **ライフサイクル**:
+  - `mcManager` は `multicluster.Aware` を実装し、`Engage(ctx, name, cl)` を通じて、新しいクラスターがアクティブになったことを登録済みコンポーネントに通知します。
+  - `Start(ctx)` 時、Provider が `multicluster.ProviderRunnable` も実装していれば、Manager は自動的に Provider を起動し、自身を `Aware` シンクとして渡します。
+
+アーキテクチャ的には、`mcmanager.Manager` を次のように捉えられます。
+- **Provider を通じたフリートの権威的なビューを保持する**コンポーネント。
+- **ホストクラスターと Engage 済みすべてのメンバークラスター間で、イベントとインデックスを多重化するハブ**。
+- **下流コンポーネントに対して、クラスターごとの「サブマネージャー」を提供するゲートウェイ**。
+
+---
+
+### Provider とクラスターライフサイクル
+
+**Provider** は、「どのクラスターが存在し」「どう到達するか」を知っているコンポーネントです。中心的なインターフェースは `pkg/multicluster/multicluster.go` に定義されています。
+
+- **`multicluster.Provider`**:
+  - `Get(ctx, clusterName) (cluster.Cluster, error)`  
+    与えられた識別子に対応する `cluster.Cluster` インスタンスを（遅延生成または既存のものから）返します。未知のクラスター名であれば `ErrClusterNotFound` を返します。
+  - `IndexField(ctx, obj, field, extractValue)`  
+    **Engage 済みのすべてのクラスター**に対してフィールドインデックスを適用し、將来新たに発見されるクラスターにも同様のインデックスを自動適用します。
+- **`multicluster.ProviderRunnable`**:
+  - `Start(ctx, aware multicluster.Aware) error`  
+    長時間稼働する検出ループで、次のような外部システムを監視します。
+    - CAPI の `Cluster` リソース
+    - `ClusterProfile` インベントリ（KEP-4322）
+    - 静的ファイルや Kind クラスター
+    - その他の任意のソース
+  - クラスターを検出・更新するときに:
+    - 必要な `cluster.Cluster` インスタンスを生成または更新し、
+    - クラスターがアクティブになったタイミングで **`aware.Engage(ctx, name, cluster)`** を呼び出します。
+    - クラスターが削除された場合は、そのクラスター専用コンテキストをキャンセルします。
+
+Provider 実装を簡潔かつ一貫したものにするため、`pkg/clusters/clusters.go` には再利用可能なヘルパーが用意されています。
+
+- **`clusters.Clusters[T cluster.Cluster]`**:
+  - `{clusterName → cluster.Cluster}` のインメモリマップと、クラスターごとの cancel 関数を管理します。
+  - **`Add` / `AddOrReplace` / `Remove` / `Get`** といったヘルパーで、クラスター名の一意性とライフサイクル管理を行います。
+  - 新しいクラスターが追加されると、`cluster.Start(ctx)` をゴルーチンで自動起動し、任意指定の `ErrorHandler` 経由でエラーを伝播します。
+  - これまでに登録されたインデックスを記録しておき、新たに Engage されたクラスターにも自動で再適用します。
+
+`providers/` 以下の多くの Provider 実装は、この `clusters.Clusters` を埋め込みつつ、独自の検出ロジックを実装します。代表例は次のとおりです。
+- **Cluster API Provider**: CAPI の `Cluster` リソースからクラスターを検出。
+- **Cluster Inventory API Provider**: `ClusterProfile`（KEP-4322）オブジェクトからクラスターインベントリを読み取り、KEP-5339 のクレデンシャルプラグインを使ってアクセス情報を取得。
+- **Kind / Kubeconfig / File / Namespace Provider**: ローカル Kind クラスター、kubeconfig のエントリ、JSON/YAML ファイル、Namespace-as-Cluster などからクラスターを検出。
+- **Multi Provider（`providers/multi`）**: 名前プレフィックスで複数 Provider を合成し、名前衝突を避けます。
+
+この Provider 抽象は、`multicluster-runtime` と SIG-Multicluster の各種概念を結び付ける接点です。
+- **クラスターアイデンティティ**（KEP-2149）は、`mcreconcile.Request.ClusterName` で用いる安定した `clusterName` として表現されます。
+- **クラスターインベントリ**（KEP-4322）は、ハブクラスター上の `ClusterProfile` を読む Provider と自然に対応します。
+- **クレデンシャルプラグイン**（KEP-5339）は、各メンバークラスター向けの `rest.Config` を構築する仕組みを提供します。
+
+---
+
+### クラスター単位の Manager / Cache / Source
+
+Provider がクラスターを検出して `Engage` を呼び出すと、Manager や Source は **クラスター単位の配線** をセットアップし、各コントローラーが「そのクラスター専用の cache / informer スタック」があるかのように振る舞えるようにします。
+
+主な要素は次のとおりです。
+
+- **Cluster オブジェクト**:
+  - controller-runtime の `cluster.Cluster` を、クラスター単位の抽象として利用します。
+  - 各 `cluster.Cluster` は次を持ちます。
+    - **Client**（CRUD 操作用）
+    - **Cache** と **Informer**
+    - **Field indexer**
+- **スコープされた Manager**:
+  - `mcManager.GetManager(ctx, clusterName)` は `scopedManager` を返します。これは:
+    - Runnable を実行するなどのグローバルな責務はホスト Manager に委譲しつつ、
+    - データアクセスやインデックスにおいては、そのクラスター専用の `cluster.Cluster` の cache / client を使用します。
+  - これにより、既存の controller-runtime 互換コンポーネントを、ほとんど変更なしにマルチクラスター環境へ持ち込むことができます。
+- **マルチクラスター Source**:
+  - `pkg/source` には、**クラスター**と**リクエスト型**でパラメータ化された汎用 Source が定義されています。
+    - **`Source`** は `TypedSource[client.Object, mcreconcile.Request]` のエイリアスです。
+    - **`TypedSource[object, request]`** は `ForCluster(string, cluster.Cluster)` をサポートします。
+    - **`TypedSyncingSource`** は `SyncingForCluster` や `WithProjection` をサポートします。
+  - マルチクラスター版の `Kind` Source（`source/kind.go`）は次のように動作します。
+    - Engage 済みクラスターごとに `clusterKind` を生成し、そのクラスターの cache / informer にイベントハンドラーを登録する。
+    - Predicate をクラスターごとに適用する。
+    - ハンドラーの登録と削除が、クラスターライフサイクルおよびコンテキストキャンセルに追従するように保証する。
+
+結果として、**各クラスターはそれぞれ独立した cache / informer グラフを持ちますが、コントローラーから見ると「クラスター名がタグ付けされた単一の Reconcile リクエストストリーム」として扱える**ようになります。
+
+---
+
+### リコンサイルモデルと Request
+
+リコンサイル側では、`multicluster-runtime` はおなじみの `reconcile.Request` にクラスターアイデンティティを拡張しただけです。
+
+- **`mcreconcile.Request`**（`pkg/reconcile/request.go`）:
+  - 次のフィールドを持ちます。
+    - `ClusterName string`: メンバークラスターの識別子。
+    - `Request reconcile.Request`: 対象オブジェクトの標準的な `NamespacedName` キー。
+  - マルチクラスター Reconciler で利用する標準的なリクエスト型です。
+- **Reconciler から Manager を利用する方法**:
+  - Reconciler は `mcreconcile.Request` を受け取り、次のようにして対象クラスターを取得できます。
+    - `cl, err := mgr.GetCluster(ctx, req.ClusterName)`
+    - その後、`cl.GetClient()` や `cl.GetCache()` を通常どおり利用します。
+  - クロスカッティングなロジックでは、次のヘルパーも利用できます。
+    - `mgr.ClusterFromContext(ctx)`（コンテキストに注入されたクラスターを取得）。
+    - `context.ReconcilerWithClusterInContext`（標準 Reconciler をマルチクラスター向けに適応させる）。
+- **エラー処理**:
+  - `ClusterNotFoundWrapper`（`pkg/reconcile/wrapper.go`）は `reconcile.TypedReconciler` をラップし、**`multicluster.ErrClusterNotFound` を握りつぶします**。
+    - これは、クラスターがすでに削除された後でも、そのクラスター由来の Work Item がキューに残っている場合に有用です。  
+      こうしたリクエストを永遠に再キューするのではなく、安全に破棄できます。
+
+これらの型とヘルパーのおかげで、**シングルクラスターからマルチクラスターへ移行する際も、ビジネスロジックの大部分はそのまま**で済みます。
+- 依然として `Reconcile(ctx, req)` メソッドを実装します。
+- 依然として client / cache / workqueue を利用します。
+- 追加されるのは、「正しい `cluster.Cluster` を解決する」ことと、そのライフサイクルに備えるという最小限のクラスタ認識だけです。
+
+---
+
+### Controller Builder と Engage オプション
+
+`mcbuilder` パッケージ（`pkg/builder`）は、**controller-runtime の builder のドロップイン代替**として設計されており、マルチクラスター運用に対応しています。
+
+- **Builder の役割**:
+  - `ControllerManagedBy(mgr)` とメソッドチェインを提供し、次のような宣言的な構成を行います。
+    - `For`（プライマリリソース）
+    - `Owns`（セカンダリリソース）
+    - `Watches`（任意の Source）
+  - 内部的にはマルチクラスター対応の Source と Request 型を利用します。
+- **Engage オプション**:
+  - `multicluster-runtime` は **`EngageOptions`**（`multicluster_options.go`）を導入し、**コントローラーをどのクラスターにアタッチするか**を制御できるようにします。
+    - **`WithEngageWithLocalCluster(bool)`**:
+      - `true` の場合、ホストクラスター（クラスター名 `""`）も watch 対象に含めます。
+      - デフォルトは次のとおりです。
+        - Provider が設定されている場合は `false`（フリートのみを対象）。
+        - Provider がない場合は `true`（純粋なシングルクラスターモード）。
+    - **`WithEngageWithProviderClusters(bool)`**:
+      - `true` の場合、Provider が管理するすべてのクラスターを watch します。
+      - Provider が設定されていない場合は無視されます。
+  - これらのオプションは、次のすべてに対して一貫した形で適用されます。
+    - `ForInput`（プライマリリソースの Engage）
+    - `OwnsInput`
+    - `WatchesInput`
+
+この柔軟な構成により、次のような **ハイブリッドコントローラー** を実現できます。
+- 管理クラスター（ローカル）上の CRD を監視し、その結果をリモートクラスターへ反映するコントローラー。
+- フリート全体をポリシー監査・適用するが、ホストクラスターは無視するコントローラー。
+
+---
+
+### Provider エコシステムと SIG-Multicluster との整合性
+
+`multicluster-runtime` 自体は **Provider 非依存**に設計されていますが、SIG-Multicluster の標準とどのように統合できるかを示すために、いくつかの **リファレンス Provider** を同梱しています。
+
+- **Cluster API Provider**:
+  - CAPI の `Cluster` リソースを、クラスターの存在と基本構成のソース・オブ・トゥルースとして利用します。
+  - すでに CAPI がワークロードクラスターのライフサイクルを管理している環境に自然にフィットします。
+- **Cluster Inventory API Provider**:
+  - KEP-4322 で定義された `ClusterProfile` オブジェクトを、標準化された **クラスターインベントリ** として消費します。
+  - たとえば次のような情報を利用します。
+    - `cluster.clusterset.k8s.io` や `clusterset.k8s.io`（KEP-2149）によるアイデンティティと ClusterSet メンバーシップ。
+    - `properties` や `conditions` によるロケーション・ヘルス・ケイパビリティの把握。
+  - KEP-5339 で定義された **クレデンシャルプラグイン** に処理を委譲します。
+    - Provider は `ClusterProfile.Status` の `credentialProviders` 情報を読み取り、
+    - kubeconfig の `exec` Provider に似た仕組みで外部プラグインを呼び出してトークンやクライアント証明書を取得し、
+    - それをもとに各クラスター用の `rest.Config` を構築します。
+- **Kind / Kubeconfig / File Provider**:
+  - Kind クラスター、kubeconfig、静的ファイルなどからクラスターを検出し、ローカル開発や簡単なデモに適しています。
+- **Namespace Provider**:
+  - Namespaces を「仮想クラスター」として扱い、単一の物理クラスター上でマルチクラスター的な挙動をシミュレートします。高速なローカルテストに有用です。
+- **Multi / Clusters / Single / Nop Provider**:
+  - ユーティリティ的・合成的な Provider 群です。
+    - `multi` は複数 Provider を名前プレフィックスつきで統合します。
+    - `clusters` はインメモリのクラスターリストだけから成る最小限の Provider を提供します。
+    - `single` や `nop` はシンプルなビルディングブロックやテストユーティリティとして利用できます。
+
+KEP-2149 / 4322 / 5339 との整合性により、`multicluster-runtime` は次のことを保証しやすくなります。
+- **クラスターアイデンティティがツール間で安定かつポータブルであること**。
+- **インベントリが標準化されていること**により、スケジューラーや管理プレーンとの統合が容易であること。
+- **クレデンシャルフローがプラガブルであること**により、クラウドネイティブなアイデンティティシステムから従来型シークレットベースの仕組みまで柔軟に対応できること。
+
+---
+
+### すべてをつなぎ合わせる
+
+ここまでを通して見ると、`multicluster-runtime` のアーキテクチャは次のように動作します。
+
+1. **Provider がクラスターを検出**します。  
+   ソース・オブ・トゥルースとして、Cluster API、ClusterProfile、kubeconfig、Kind、ファイル、Namespaces などを利用できます。
+2. 各クラスターについて:
+   - Provider は、そのクラスター専用の client / cache / indexer を備えた `cluster.Cluster` を構築します。
+   - Provider は `mcmanager.Engage(ctx, clusterName, cluster)` を呼び出し、Manager とコントローラーに対して、そのクラスター向けの Source / ハンドラーを登録させます。
+3. 各クラスター上の **Source** が Kubernetes オブジェクトを監視し、適切な `ClusterName` をタグとして付与した Reconcile リクエストを、コントローラーのワークキューに流し込みます。
+4. **Reconciler** は `mcreconcile.Request` を消費し、対応する `cluster.Cluster` を Manager から取得してビジネスロジックを実行します。
+   - 各クラスター内で完結する処理（Uniform パターン）
+   - 複数クラスターをまたぐ調整やファンアウト処理（Multi-Cluster-Aware パターン）
+5. クラスターが削除されると、Provider はそのクラスター専用コンテキストをキャンセルし、cache / Source / Reconciler はそのクラスターの監視を停止します。  
+   その後に残った Work Item に対しては、`ClusterNotFound` エラーが安全に無視されます。
+
+このアーキテクチャにより、**スケーラブルで動的なマルチクラスターコントローラー**を、controller-runtime のおなじみのエコシステムから大きく逸脱することなく構築できます。  
+続く章では、マルチクラスター Manager、Provider、Reconcile ループをさらに詳しく掘り下げ、その上に構築された具体的なパターンやサンプルを紹介します。

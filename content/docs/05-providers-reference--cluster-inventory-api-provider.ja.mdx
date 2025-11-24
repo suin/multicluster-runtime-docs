@@ -1,0 +1,377 @@
+---
+title: Cluster Inventory API Provider
+---
+
+**Cluster Inventory API Provider** は、ハブクラスター上にデプロイされた [ClusterProfile API](https://github.com/kubernetes-sigs/cluster-inventory-api)（KEP‑4322）の情報から、`multicluster-runtime` が扱える **フリート（cluster.Cluster 群）** を構築するためのプロバイダーです。
+アプリケーションやコントローラーは個々のクラスターの接続方法を意識する代わりに、標準化された `ClusterProfile` インベントリを読むだけで済み、このプロバイダーがそれを実際の Kubernetes クラスターへの接続に変換します。
+
+このプロバイダーは次のことを行います。
+
+- ハブクラスター上の **`ClusterProfile` オブジェクトを watch** する
+- `ControlPlaneHealthy` などの **ステータス条件を見て「利用可能か」を判定** する（デフォルト）
+- 各クラスターの **エンドポイントと認証情報を取得** する
+  - 推奨: **ClusterProfile の Credential Plugin モデル**（KEP‑5339）を利用
+  - 代替: **kubeconfig を含む Secret** を読む（シンプルだが本番利用は非推奨）
+- 各 `ClusterProfile` から **`cluster.Cluster` を生成・起動** する
+- Multi-Cluster Manager に対して、`<namespace>/<name>` という名前（例: `default/member`）でクラスターを **Engage** する
+
+---
+
+#### どんなときに使うか
+
+Cluster Inventory API Provider の利用が適しているのは、次のようなケースです。
+
+- ハブクラスター上に **ClusterProfile API（cluster-inventory-api）** を導入している、あるいは導入する予定がある
+- OCM / Clusternet / Fleet / Karmada など、**既存のマルチクラスター管理プロジェクトが ClusterProfile を発行** している
+- マルチクラスターコントローラーを、特定プロジェクトの実装詳細から切り離し、**標準的なインベントリ API だけを前提にしたい**
+
+一方で、次のような場合には他のプロバイダーも検討してください。
+
+- **Cluster API の `Cluster` リソース** がインベントリのソースであれば、`Cluster API Provider` が自然な選択です。
+- 小規模で静的なフリートで、単に kubeconfig を列挙したいだけであれば、`Kubeconfig Provider` や `File Provider` が簡単です。
+- ローカル開発やテストであれば、`Kind Provider` や `Namespace Provider` が軽量です。
+
+---
+
+#### SIG‑Multicluster の KEP との関係
+
+Cluster Inventory API Provider は、次の 3 つの KEP との整合性を意識して設計されています。
+
+- **KEP‑4322 — ClusterProfile API（クラスターインベントリ）**  
+  ハブクラスターは、管理対象クラスターごとに 1 つの `ClusterProfile` を持ちます。  
+  プロバイダーはこれらのリソースを watch し、主に次の情報を利用します。
+  - `status.conditions`: 特に `ControlPlaneHealthy` や `Joined` などの条件を見て「利用可能か」を判断
+  - `status.properties`: ロケーションや ClusterSet などのメタデータ（コントローラー側のロジックで利用可能）
+  - `status.credentialProviders`: Credential Plugin 戦略を使うときに、どのプラグインをどう呼び出すかを記述
+
+- **KEP‑5339 — Plugin for Credentials in ClusterProfile（認証情報）**  
+  推奨される戦略は、`ClusterProfile` のステータスに「**どのように認証情報を取得するか**」を書き込み、それをプラグインで解決する方式です。
+  - `status.credentialProviders[*].name`: 認証方式（Credential Type）の名前（例: `google` など）
+  - `status.credentialProviders[*].cluster`: 対象クラスターのエンドポイントや CA 設定
+  プロバイダーは `cluster-inventory-api` の `credentials` ライブラリに処理を委譲し、このライブラリが:
+  - 対応するプラグインバイナリを `exec` で起動し（client-go の External Credential Provider と同じプロトコル）
+  - トークンやクライアント証明書を受け取り
+  - `rest.Config` を構築します。
+
+- **KEP‑2149 — ClusterId for ClusterSet identification（クラスター ID）**  
+  多くの ClusterProfile 実装は、`status.properties` に次の `ClusterProperty` 名を含みます。
+  - `cluster.clusterset.k8s.io`: ClusterSet 内で一意なクラスター ID
+  - `clusterset.k8s.io`: ClusterSet 自体の ID
+  プロバイダー自身はこれらの値を直接解釈しませんが、コントローラー側から見ると、**安定した Kubernetes ネイティブなクラスター ID** として活用できます。
+
+---
+
+### 検出（Discovery）と Engage の流れ
+
+ハブクラスター上で、このプロバイダーは次のようなコントローラーとして動作します。
+
+1. **`ClusterProfile` の監視**
+
+   対象 Namespace 内の `ClusterProfile` ごとに Reconcile が実行され、  
+   そのクラスター名は常に:
+
+   - `clusterName = "<namespace>/<name>"`  
+     例: `default/member`
+
+   という文字列として Multi-Cluster Manager に登録されます。
+
+2. **利用可能性（Readiness）の判定**
+
+   デフォルト実装では、次の条件を満たすときにクラスターを「利用可能」とみなします。
+
+   - `status.conditions` に `type: ControlPlaneHealthy` の条件が存在し
+   - その `status` が `True`
+
+   この判定ロジックは、`Options.IsReady` に関数を渡すことで自由に差し替えられます。  
+   例えば `Joined` 条件や独自の条件を組み合わせることも可能です。
+
+3. **kubeconfig（`rest.Config`）の取得**
+
+   プロバイダーは **kubeconfig 戦略（kubeconfig strategy）** を呼び出して、メンバークラスターへの `rest.Config` を取得します。
+
+   - **Credentials Provider 戦略（推奨）**  
+     ClusterProfile の Credential Plugin モデル（KEP‑5339）と `credentials` ライブラリを利用します。
+   - **Secret 戦略**  
+     ラベル付き Secret に保存された kubeconfig（`data["Config"]`）を読み取ります。
+
+   いずれかの戦略で取得に失敗した場合、その Reconcile はエラーとしてリトライされ、  
+   その `ClusterProfile` に対応するクラスターは Engage されません。
+
+4. **`cluster.Cluster` の生成・更新**
+
+   kubeconfig が取得でき、かつ `IsReady` が `true` を返したら、プロバイダーは:
+
+   - `cluster.New(restConfig, opts.ClusterOptions...)` を用いて `cluster.Cluster` を作成し
+   - すでに登録されている Field Index をそのクラスターの Cache に適用し
+   - 専用のコンテキストで `cl.Start(clusterCtx)` を実行し、`WaitForCacheSync` で同期完了を待ちます。
+
+   同じ `ClusterProfile` に対応するクラスターがすでに存在する場合:
+
+   - 新旧 kubeconfig が同一であれば、そのクラスターを再利用します。
+   - kubeconfig が変更されていれば（例: 認証情報のローテーション）、**古いクラスターを停止して新しいクラスターに差し替え** ます。
+
+5. **Multi-Cluster Manager への Engage**
+
+   Cache 同期が完了すると、プロバイダーは:
+
+   - `mcMgr.Engage(clusterCtx, clusterName, cl)`  
+     を呼び出してクラスターを Engage します。
+
+   これにより Multi-Cluster Manager は:
+
+   - 登録済みの Field Index をすべて適用し
+   - マルチクラスター対応の `Kind` Source を各クラスターに配線し
+   - コントローラーに対して `ClusterName` を含む `mcreconcile.Request` を配信できるようにします。
+
+6. **削除時の挙動**
+
+   `ClusterProfile` が削除された場合、プロバイダーは:
+
+   - 内部マップから該当クラスターを削除し
+   - そのクラスター専用コンテキストをキャンセルして Cache を停止し
+   - フリートからそのクラスターを取り除きます。
+
+---
+
+### kubeconfig 戦略の選択
+
+`ClusterProfile` から `rest.Config` を構築する方法として、このプロバイダーは 2 つの戦略をサポートします（**同時に使うことはできません**）。
+
+#### Credentials Provider 戦略（推奨）
+
+この戦略は **KEP‑5339** に基づき、`cluster-inventory-api` の `credentials` ライブラリと外部プラグインを利用します。
+
+- **構成イメージ**
+  - 各環境に応じた Credential プラグインバイナリ（例: Workload Identity Federation 経由でトークンを取得するバイナリ）を用意する。
+  - プラグインの一覧（`name` と `exec` 設定）を JSON 等の設定ファイルに記述する。
+  - `ClusterProfile.Status.CredentialProviders` で:
+    - どの `name` のプロバイダーを使うか
+    - どのエンドポイント / TLS 設定を渡すか
+    を指定する。
+
+- **プロバイダー側の配線（Go コード）**
+
+  典型的には、`main.go` で次のように記述します。
+
+```go
+credsProvider, err := credentials.NewFromFile("clusterprofile-provider-file.json")
+if err != nil {
+    // handle error
+}
+
+provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+    KubeconfigStrategyOption: kubeconfigstrategy.Option{
+        CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+            Provider: credsProvider,
+        },
+    },
+})
+```
+
+リポジトリ内の `examples/cluster-inventory-api` ディレクトリに、実際に動作するサンプルコードと設定ファイル例があります。
+
+- **この戦略を選ぶべき状況**
+  - Secret に長期的なクレデンシャルを保存したくない
+  - Workload Identity / 外部認証フローをすでに使っている、または今後使いたい
+  - 異なるコントローラー間で同じプラグインを再利用したい
+
+#### Secret 戦略（シンプルだが本番利用は非推奨）
+
+Secret 戦略は、ClusterProfile KEP で言及されている「Secret にクレデンシャルを書き出す」方式に対応しますが、主にシンプルな検証環境向けです。
+
+- **動作の概要**
+  - ClusterInventory Consumer（このコントローラープロセス）に任意の名前（例: `cluster-inventory-api-consumer`）を付ける。
+  - クラスターマネージャーは、各メンバークラスターに対してハブクラスター上に Secret を作成し、次の要件を満たすようにします。
+    - Secret は、ラベル  
+      `x-k8s.io/cluster-inventory-consumer=<consumerName>`  
+      を持つ Namespace 内に作成される。
+    - Secret 自体にも、次の 2 つのラベルを付与する。
+      - `x-k8s.io/cluster-inventory-consumer: <consumerName>`
+      - `x-k8s.io/cluster-profile: <ClusterProfile名>`
+    - Secret の `data["Config"]` に kubeconfig を格納する。
+  - プロバイダーの Secret 戦略は:
+    - 上記ラベルを持つ Secret を watch し、対応する `ClusterProfile` に対して Reconcile を発火させ
+    - その `ClusterProfile` に紐づく Secret を 1 つだけ選んで kubeconfig をパースし、`rest.Config` を作成します。
+
+- **制約・注意点**
+  - kubeconfig（クレデンシャル）が Base64 でそのまま Secret に保存されるため、セキュリティ要件によっては不十分な場合があります。
+  - クラスターマネージャー側で Secret のライフサイクルとラベルの整合性を厳密に管理する必要があります。
+  - `(consumerName, ClusterProfile)` の組ごとに Secret は **1 つだけ** であることが前提であり、複数マッチするとエラーになります。
+
+---
+
+### 基本的な利用例
+
+以下は、Cluster Inventory API Provider と Multi-Cluster Manager、単純なマルチクラスターコントローラーを組み合わせた最小構成の例です（エラーハンドリングなどは簡略化しています）。
+
+```go
+package main
+
+import (
+    "context"
+    "os"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+    "k8s.io/client-go/kubernetes/scheme"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/log/zap"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    clusterinventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
+    "sigs.k8s.io/cluster-inventory-api/pkg/credentials"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    clusterinventoryapi "sigs.k8s.io/multicluster-runtime/providers/cluster-inventory-api"
+    "sigs.k8s.io/multicluster-runtime/providers/cluster-inventory-api/kubeconfigstrategy"
+)
+
+func main() {
+    // ClusterProfile 型をスキーマに登録
+    _ = clusterinventoryv1alpha1.AddToScheme(scheme.Scheme)
+
+    ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+    ctx := signals.SetupSignalHandler()
+
+    // ClusterProfile 用の Credential Provider 設定を読み込み
+    creds, err := credentials.NewFromFile("clusterprofile-provider-file.json")
+    if err != nil {
+        panic(err)
+    }
+
+    // Cluster Inventory API Provider を作成
+    provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+        KubeconfigStrategyOption: kubeconfigstrategy.Option{
+            CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+                Provider: creds,
+            },
+        },
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // ハブクラスターの kubeconfig を使って Multi-Cluster Manager を作成
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+    if err != nil {
+        panic(err)
+    }
+
+    // Provider 側のコントローラーを Manager に登録
+    if err := provider.SetupWithManager(mgr); err != nil {
+        panic(err)
+    }
+
+    // 単純なマルチクラスター ConfigMap コントローラーを登録
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("fleet-configmaps").
+        For(&corev1.ConfigMap{}).
+        Complete(mcreconcile.Func(func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            cl, err := mgr.GetCluster(ctx, req.ClusterName)
+            if err != nil {
+                return reconcile.Result{}, err
+            }
+
+            cm := &corev1.ConfigMap{}
+            if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                if apierrors.IsNotFound(err) {
+                    return ctrl.Result{}, nil
+                }
+                return ctrl.Result{}, err
+            }
+
+            // ここにビジネスロジックを書く（例: ログ出力や他リソースの更新など）
+            return ctrl.Result{}, nil
+        })); err != nil {
+        panic(err)
+    }
+
+    // Manager（および Provider とコントローラー）を起動
+    if err := mgr.Start(ctx); err != nil {
+        os.Exit(1)
+    }
+}
+```
+
+完全な動作例（envtest を使ったテストやインデックスの設定を含む）は、上流リポジトリの `examples/cluster-inventory-api` を参照してください。
+
+---
+
+### Options リファレンス
+
+Cluster Inventory API Provider は次のように構築します。
+
+```go
+provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{ /* ... */ })
+```
+
+`Options` で指定できる主なフィールドは次のとおりです。
+
+- **`KubeconfigStrategyOption kubeconfigstrategy.Option`（必須）**  
+  各 `ClusterProfile` から `rest.Config` を取得する方法を選択します。  
+  次のうち **どちらか一方だけ** を設定します。
+  - `Secret *SecretStrategyOption`
+  - `CredentialsProvider *CredentialsProviderOption`
+
+  例:
+
+  ```go
+  // 推奨: Credential Plugin 戦略
+  KubeconfigStrategyOption: kubeconfigstrategy.Option{
+      CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+          Provider: credsProvider,
+      },
+  }
+
+  // 代替: Secret 戦略
+  KubeconfigStrategyOption: kubeconfigstrategy.Option{
+      Secret: &kubeconfigstrategy.SecretStrategyOption{
+          ConsumerName: "my-consumer-name",
+      },
+  }
+  ```
+
+- **`ClusterOptions []cluster.Option`（任意）**  
+  各メンバークラスターの `cluster.New` に渡すオプションです。  
+  Cache の設定や Rate Limit、追加の Scheme など、より細かいチューニングが必要な場合に利用します。
+
+- **`NewCluster func(ctx context.Context, clp *clusterinventoryv1alpha1.ClusterProfile, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)`（任意）**  
+  `cluster.Cluster` の生成処理を完全に差し替えたいときに使います。  
+  未指定の場合は `cluster.New(cfg, opts...)` が呼ばれます。
+
+- **`IsReady func(ctx context.Context, clp *clusterinventoryv1alpha1.ClusterProfile) bool`（任意）**  
+  その `ClusterProfile` に対応するクラスターを Engage してよいかどうかを判定する関数です。  
+  デフォルト実装は「`ControlPlaneHealthy` 条件が存在し、かつ `True` であるときのみ `true` を返す」という挙動です。  
+  独自の条件に基づいてゲーティングしたい場合や、テストではヘルスチェックを無効化したい場合にオーバーライドできます。
+
+---
+
+### 運用上の注意点
+
+- **クラスター名**
+  - コントローラーから見える `ClusterName` は、常に対応する `ClusterProfile` の `"<namespace>/<name>"` です（例: `default/member`）。
+  - ログやメトリクスではこの文字列をそのまま使い、フォーマットへの依存は避けるとよいでしょう。
+
+- **kubeconfig のローテーション**
+  - 対応する Secret や Credential Plugin の設定が変わり、kubeconfig が更新されると、プロバイダーは:
+    - 既存の `cluster.Cluster` を停止し
+    - 新しい `rest.Config` で `cluster.Cluster` を再生成し
+    - すべての Field Index を再適用します。
+  - これにより、マネージャープロセスを再起動せずに安全にクレデンシャルをローテーションできます。
+
+- **Field Index**
+  - コントローラー側では、従来どおり `mgr.GetFieldIndexer().IndexField(...)` を呼び出すだけで構いません。
+  - Multi-Cluster Manager はこの呼び出しを Provider に委譲し、Provider は:
+    - 定義されたインデックスを記録し
+    - 既存のすべてのクラスターに適用し
+    - 新しく Engage されたクラスターにも同じインデックスを適用します。
+
+- **エラーハンドリング**
+  - `mgr.GetCluster` が `multicluster.ErrClusterNotFound` を返す場合（対応する `ClusterProfile` が削除された等）は、デフォルトのラッパーにより **非致命的な完了** とみなされ、再キューは行われません。
+  - kubeconfig 取得の失敗やヘルス条件未満足などで Reconcile が失敗した場合は、通常の controller-runtime と同様にエクスポネンシャルバックオフ付きでリトライされます。プロファイルと認証情報が有効になるまで、そのクラスターは Engage されません。
+
+このプロバイダーを導入することで、`ClusterProfile` オブジェクトとして記述されたクラスター群を、`multicluster-runtime` ベースの任意のコントローラーから **1 つの動的なターゲット** として扱えるようになり、クラスターのプロビジョニング方法や認証の仕組みに依存しないマルチクラスターアプリケーションを構築できます。

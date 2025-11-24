@@ -1,0 +1,434 @@
+---
+title: Uniform Reconciler（均一なリコンサイラー）
+---
+
+この章では、すべてのクラスターに対して **同じ Reconcile ロジックを独立に適用する**  
+**Uniform Reconciler（均一なリコンサイラー）** パターンを解説します。  
+`multicluster-runtime` では最もシンプルで汎用的なパターンであり、多くの既存コントローラーを
+比較的少ない変更でマルチクラスター対応にできます。
+
+ここでは次のトピックを扱います。
+
+- Uniform Reconciler とは何か、Multi-Cluster-Aware Reconciler とどう違うか
+- よくあるユースケースとトポロジ
+- `mcreconcile.Request` と Multi-Cluster Manager を使った実装方法
+- 既存の controller-runtime コントローラーからの移行ステップ
+- どのクラスターを対象にするか（EngageOptions）を制御する方法
+- ベストプラクティスと注意点
+
+---
+
+### Uniform Reconciler とは？
+
+**Uniform（均一）** パターンでは、フリートに属する各クラスターを  
+**「同じ問題を解く、独立したコピー」** として扱います。
+
+- Reconciler は **クラスター A から読み取り、クラスター A に書き戻す**
+- 同じ Reconciler が **クラスター B から読み取り、クラスター B に書き戻す**
+- 同様に **クラスター C, D, …** に対しても同じロジックを実行
+
+Reconcile の観点から見ると:
+
+- 各 Work Item は `mcreconcile.Request` によって **`ClusterName` 付き** でキューに入れられ、
+- Reconciler はその `ClusterName` に対応する `cluster.Cluster` を取得して処理を行います。
+
+一方、**Multi-Cluster-Aware Reconciler** は、クラスター間の関係性（ClusterSet 単位のロールアウトや、
+ハブクラスターからメンバークラスターへの証明書配布など）を前提にしたロジックを実装します。
+
+Uniform Reconciler の特徴:
+
+- **理解しやすい**: ロジックはほぼシングルクラスターコントローラーと同じ
+- **スケールしやすい**: あるクラスターの障害や遅延が他に波及しにくい
+- **移行の第一歩に最適**: 既存の controller-runtime コードを少しずつマルチクラスター化できる
+
+上流の `README.md` では、このパターンは次のように要約されています。
+
+- 「同じ Reconciler を多くのクラスターに対して実行する」
+  - クラスター A から読み取り、クラスター A に書き込む
+  - クラスター B から読み取り、クラスター B に書き込む
+  - クラスター C から読み取り、クラスター C に書き込む
+
+---
+
+### よくあるユースケース
+
+Uniform Reconciler は、「**各クラスターが同じベースライン状態に収束してほしい**」ような場面に適しています。
+
+- **コンプライアンス / ポリシーの強制**
+  - すべてのクラスターに対して、以下を揃える:
+    - 共通の `ConfigMap` / Secret
+    - 基本的な `NetworkPolicy` / PodSecurity 設定
+    - 必須の CRD や Admission Webhook
+- **アドオンコントローラー / オペレーター**
+  - Crossplane やログ / メトリクス収集エージェント、Ingress Controller などを
+    多数のワークロードクラスターに対して同じように動かしたいとき
+  - 実体のコントローラー Pod は 1 つで、対象クラスターだけを増やすことができる
+- **クラスターごとのヘルス / インベントリ収集**
+  - 各クラスターの状態を表す CRD を定期的に Reconcile し、Event やメトリクスとして公開
+  - ハブクラスターに集約する形でも、各メンバークラスター内で完結させる形でもよい
+- **Namespace Provider を使ったマルチテナンシー**
+  - Namespace を「仮想クラスター」とみなし、Namespace ごとに同じポリシーを適用する
+
+これらのユースケースに共通するのは:
+
+- **クラスター間で状態を共有する必要がない**
+- 望ましい状態が **「各クラスターごと」** に完結している
+
+という点です。
+
+---
+
+### Uniform Reconciler がフリート全体で動く仕組み
+
+Uniform Reconciler は、これまでの章で説明したコンポーネントの上に成り立っています。
+
+- **Provider**
+  - kubeconfig / Kind / Cluster API / ClusterProfile / Namespace などから、
+    フリートに属するクラスターを発見・管理します。
+  - クラスターが利用可能になると、Multi-Cluster Manager に対して `Engage` を呼び出します。
+- **Multi-Cluster Manager**
+  - Engage 済みの各クラスターに対して個別の `cluster.Cluster`（Client / Cache / Indexer）を保持し、
+  - マルチクラスタ対応の Source や Controller にその情報を伝えます。
+- **Source（mcsource.Kind など）**
+  - 各クラスターの Cache / Informer にハンドラーを登録し、
+  - イベントが発生するたびに `mcreconcile.Request` を生成してキューに enqueue します。
+    - `ClusterName`: イベント元のクラスター
+    - `Request.NamespacedName`: そのクラスター内のオブジェクトキー
+- **Controller / Reconciler**
+  - 共通の Workqueue から `mcreconcile.Request` を取り出し、
+  - `mgr.GetCluster(ctx, req.ClusterName)` で対象クラスターの `cluster.Cluster` を取得し、
+  - そのクラスターに対してシングルクラスターと同じノリで CRUD を行います。
+
+つまり、アプリケーションコードとしては **1 つのコントローラー** を書くだけで、
+内部的にはクラスター数分の Cache / Watch / イベントハンドラーが配線されます。
+
+---
+
+### シンプルな Uniform Reconciler の例
+
+次は、`refs/multicluster-runtime/examples/*/main.go` にあるサンプルを簡略化したものです。  
+Provider が見つけたすべてのクラスターに対して `ConfigMap` を監視し、存在をログ出力します。
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+    ctx := signals.SetupSignalHandler()
+
+    // 1. Provider を選択する（ここでは Kind クラスターを自動検出）。
+    provider := kind.New()
+
+    // 2. Provider を使って Multi-Cluster Manager を作成。
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+    if err != nil {
+        log.Fatal(err, "unable to create manager")
+    }
+
+    // 3. すべてのクラスターの ConfigMap を監視するコントローラーを登録。
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("multicluster-configmaps").
+        For(&corev1.ConfigMap{}). // フリート全体で監視する主対象
+        Complete(mcreconcile.Func(
+            func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+                // req.ClusterName が、このイベントが属するクラスター名。
+                cl, err := mgr.GetCluster(ctx, req.ClusterName)
+                if err != nil {
+                    return reconcile.Result{}, err
+                }
+
+                cm := &corev1.ConfigMap{}
+                if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                    if apierrors.IsNotFound(err) {
+                        // 既に削除済みなら何もしない。
+                        return reconcile.Result{}, nil
+                    }
+                    return reconcile.Result{}, err
+                }
+
+                log.Printf("ConfigMap %s/%s in cluster %q", cm.Namespace, cm.Name, req.ClusterName)
+                return ctrl.Result{}, nil
+            },
+        )); err != nil {
+        log.Fatal(err, "unable to create controller")
+    }
+
+    // 4. Manager を起動すると、Provider や各クラスターの Cache も合わせて起動される。
+    if err := mgr.Start(ctx); err != nil {
+        log.Fatal(err, "unable to run manager")
+    }
+}
+```
+
+このコントローラーは:
+
+- Provider が検出した **すべての Kind クラスター** の `ConfigMap` イベントを受け取り、
+- 各イベントに対して同じ Reconcile ロジックを実行し、
+- `req.ClusterName` に基づいて適切なクラスターへ読み書きします。
+
+Provider（Kind / File / Kubeconfig / Cluster API / Cluster Inventory API / Namespace など）を差し替えても、
+Reconciler 自体のビジネスロジックはそのまま再利用できます。
+
+---
+
+### 既存のシングルクラスターコントローラーからの移行
+
+多くのシングルクラスターコントローラーは、**比較的機械的な変更だけで Uniform Reconciler に移行** できます。
+
+#### 1. Manager / Builder を Multi-Cluster 版に切り替える
+
+`main.go` など、Manager とコントローラーを構築している箇所で:
+
+- `controller-runtime` の import を `multicluster-runtime` 版に置き換えます。
+
+```go
+import (
+    // ctrl "sigs.k8s.io/controller-runtime"
+    // "sigs.k8s.io/controller-runtime/pkg/manager"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    "sigs.k8s.io/multicluster-runtime/providers/kubeconfig" // または kind/file/cluster-api/...
+)
+```
+
+- Provider を用意して `mcmanager.New` を呼びます。
+
+```go
+provider := kubeconfig.New(kubeconfig.Options{/* ... */})
+
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+if err != nil {
+    // エラー処理
+}
+```
+
+- コントローラー登録には `mcbuilder.ControllerManagedBy(mgr)` を使います。
+
+まだマルチクラスター Provider を導入できない場合でも:
+
+- `mcmanager.New(config, nil, opts)` とすれば、内部的にはほぼシングルクラスター Manager として動きつつ、
+- コード上は `mcreconcile.Request` などマルチクラスター対応の型を先行導入できます。
+
+#### 2. Reconcile のシグネチャを `mcreconcile.Request` に変える
+
+従来は次のような Reconciler だったものを:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // r.Client や mgr.GetClient() を通じて「1 つのクラスター」に対してのみ話す
+}
+```
+
+次のように書き換えます。
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 取得した cl.GetClient() を利用する。
+    // オブジェクトキーは req.Request.NamespacedName を使う。
+}
+```
+
+ポイント:
+
+- **`req.ClusterName`** が対象クラスターを表します。
+- **`req.Request`** は、そのクラスター内での `reconcile.Request`（`NamespacedName`）です。
+- それ以外のロジックは、多くの場合シングルクラスター版から:
+  - `r.Client` / `mgr.GetClient()` → `cl.GetClient()`
+  - `req.NamespacedName` → `req.Request.NamespacedName`
+  に機械的に置き換えるだけで済みます。
+
+既存 Reconciler のシグネチャを今すぐ変えられない場合は、
+`context.ReconcilerWithClusterInContext` を使って段階的に移行することもできます
+（詳細は「Reconcile ループ」の章を参照してください）。
+
+#### 3. Watch 設定はそのまま、配線は Builder に任せる
+
+多くのコントローラーは、「`For` で主対象を指定し、必要に応じて `Owns` / `Watches` を追加する」という形になっています。
+Multi-Cluster 版でも、この API 自体はほぼそのまま使えます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("baseline-config").
+    For(&corev1.ConfigMap{}).
+    Owns(&myv1alpha1.BaselineConfig{}).
+    Complete(myReconciler)
+```
+
+内部ではマルチクラスター対応の Builder が:
+
+- `mcsource.Kind` によるクラスターごとの informer / handler を構築し、
+- 各イベントに `ClusterName` を付与してキューに積み、
+- すべての Engage 済みクラスターのイベントを 1 つのコントローラーに集約します。
+
+ユーザーコード側で「クラスターごとの Watch ロジック」を書く必要はありません。
+
+---
+
+### どのクラスターを対象にするかを制御する（EngageOptions）
+
+Uniform Reconciler は「フリートに属する全クラスター」を対象にすることが多いですが、
+次のようなバリエーションもよくあります。
+
+- ホスト（ローカル）クラスターだけを対象にするコントローラー
+- Provider が管理するメンバークラスターだけを対象にするコントローラー
+- ホストクラスターにある CRD を読み取り、メンバークラスターに適用するハイブリッドな構成
+
+これらは `pkg/builder/multicluster_options.go` の `EngageOptions` で制御します。
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - `true` の場合、**ホストクラスター（クラスター名 `""`）** に対しても Watch を行う。
+  - デフォルト値は次のとおり:
+    - Provider がある場合: `false`（主にフリートに集中）
+    - Provider がない場合: `true`（シングルクラスター互換モード）
+- **`WithEngageWithProviderClusters(bool)`**
+  - `true` の場合、Provider が管理する **すべてのクラスター** に対して Watch を行う。
+  - Provider が設定されていない場合は効果なし。
+
+これらは `For` / `Owns` / `Watches` のオプションとして指定します。
+
+```go
+// ホストクラスターは無視し、Provider 管理下のクラスターだけを見る例。
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("baseline-config").
+    For(
+        &corev1.ConfigMap{},
+        mcbuilder.WithEngageWithLocalCluster(false),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(myReconciler)
+```
+
+よくあるパターン:
+
+- **フリート全体を対象にした Uniform コントローラー**
+  - 「ホストクラスターはあくまで管理プレーン」として扱い、  
+    `WithEngageWithProviderClusters(true)` / `WithEngageWithLocalCluster(false)` を指定
+- **ホストクラスター専用のコントローラー**
+  - `WithEngageWithLocalCluster(true)` / `WithEngageWithProviderClusters(false)` を指定し、
+    フリートとは無関係なローカル専用ロジックを実装
+- **ハイブリッド構成**
+  - ホストクラスター上の CRD を読むコントローラーと、
+    その CRD を見てメンバークラスターに適用する Uniform Reconciler を分離して構築
+
+---
+
+### 複数の Provider / インベントリと組み合わせて使う
+
+Uniform Reconciler は、どの Provider の上でも同じように動作します。
+
+- **シンプルなフリート**
+  - Kind / File / Kubeconfig Provider などが、クラスターの一覧をそのまま提供。
+  - Uniform Reconciler は、その一覧全体に対して同じロジックを実行するだけです。
+- **Cluster API ベースのフリート**
+  - Cluster API Provider は CAPI の `Cluster` リソースと kubeconfig Secret からクラスターを構築。
+  - Reconciler は CAPI が管理するクラスター群に対して均一に動作します。
+- **Cluster Inventory API（KEP‑4322 / KEP‑2149 / KEP‑5339）ベースのフリート**
+  - Cluster Inventory API Provider は `ClusterProfile` を読み取り、
+    `status.properties` にある ClusterSet / Location / その他属性や、
+    `status.credentialProviders` を使って `rest.Config` を取得します。
+  - 同じ Uniform Reconciler で、異なるインベントリ実装（OCM, Clusternet, Fleet, Karmada など）を横断できます。
+
+**Multi Provider**（`providers/multi`）を使うと、複数の Provider を 1 つにまとめられます。
+
+- 例: `kind#dev-cluster-1`, `kind#dev-cluster-2`
+- 例: `capi#prod-eu-1`, `capi#prod-us-1`
+
+Uniform Reconciler 側では:
+
+- `req.ClusterName` はあくまで **不透明な文字列** として扱います（パースしない）。
+- ログやラベルとしては自由に利用できます。
+- 名前の安定性 / 一意性は Provider 側やインベントリ実装に委ねればよく、
+  Reconciler のビジネスロジックはそのまま再利用できます。
+
+---
+
+### エラーハンドリングとクラスター消滅
+
+動的なフリートでは、クラスター削除後もしばらくの間、  
+そのクラスター向けの Work Item がキューに残っていることがあります。  
+その場合、次のようなコードは `multicluster.ErrClusterNotFound` を返すことがあります。
+
+```go
+cl, err := mgr.GetCluster(ctx, req.ClusterName)
+```
+
+このケースをデフォルトで安全に扱うため、Multi-Cluster Builder は Reconciler を  
+**`ClusterNotFoundWrapper`** でラップします（明示的に無効化しない限り有効）。
+
+- ラッパーは、まず元の Reconciler を呼び出し、
+- 返ってきたエラーが（内包も含めて）`multicluster.ErrClusterNotFound` であれば:
+  - Reconcile を **成功扱い** として終了し、
+  - **再キューしません**。
+- それ以外のエラーや `ctrl.Result` は、そのまま呼び出し元に返します。
+
+Uniform Reconciler では、たいていこの挙動が望ましいです。
+
+- クラスターが削除済みであれば、そのクラスターに対する Reconcile はもはや意味がありません。
+- その Work Item を永遠にリトライし続けるのはリソースの無駄になります。
+
+もし独自の扱い（メトリクス記録や特定 Event 発行など）が必要であれば:
+
+- Builder 側で `WithClusterNotFoundWrapper(false)` を指定してラッパーを無効化し、
+- Reconciler 内で `multicluster.ErrClusterNotFound` を明示的に判定・処理する、という形も取れます。
+
+それ以外のエラーやリトライの意味は controller-runtime と同じです。
+
+- エラーを返すと RateLimitingQueue により再キューされる
+- `ctrl.Result{RequeueAfter: ...}` を返すと、指定時間後に再キューされる
+- `ctrl.Result{}` と `nil` を返すと、その Work Item は正常完了とみなされる
+
+---
+
+### Uniform Reconciler のベストプラクティス
+
+Uniform パターンを最大限に活かすために、以下の点を意識するとよいでしょう。
+
+- **クラスター単位での冪等性（Idempotency）**
+  - 同じクラスターに対して何度 Reconcile が走っても、常に同じ望ましい状態に収束するように設計する。
+  - Reconciler 内で、クラスターをまたいだグローバルな可変状態を持たないようにする。
+- **ログ・メトリクスには必ず `ClusterName` を入れる**
+  - ログフィールドやメトリクスラベルには `req.ClusterName` を含める。
+  - どのクラスターで何が起きているかを後からトレースしやすくなります。
+- **クラスター間副作用を避ける**
+  - あるクラスターから読み取り、別のクラスターに書き込むようなロジックが増えてきたら、
+    それはもはや「Uniform」ではなく Multi-Cluster-Aware パターンの領域です。
+  - 責務分割（Uniform Reconciler + 集約/配布用コントローラー）や、
+    Multi-Cluster-Aware 章で紹介するパターンを検討してください。
+- **`cluster.Cluster` は毎回 Reconcile 内で解決する**
+  - `mgr.GetCluster(ctx, req.ClusterName)` を Reconcile ごとに呼び出し、
+    長寿命のフィールドに `cluster.Cluster` をキャッシュしない。
+  - Provider / Manager 側で、認証情報ローテーションなどに伴い `cluster.Cluster` の実体が差し替わることがあるためです。
+- **スケールと公平性を意識する**
+  - 1 つのコントローラーが多くのクラスターからのイベントを処理する可能性があります。
+    - `MaxConcurrentReconciles` や GroupKind ごとの並列度設定でスループットを調整し、
+    - 1 回の Reconcile で処理する仕事量を適度に小さく保つとよいでしょう。
+  - 将来的にはクラスター単位の「Fair Queue」など高度なワークキュー戦略も検討されていますが、
+    Uniform Reconciler のロジックはそのまま恩恵を受けられます。
+
+ユースケースが「各クラスターで同じことをする」レベルを超え、  
+ClusterSet をまたぐロールアウトや、ハブへのデータ集約といった要件が出てきたら、
+次のステップとして **Multi-Cluster-Aware Reconciler** のパターンを検討してください。  
+Uniform Reconciler で整えた基盤の上に、それらを重ねていくことができます。

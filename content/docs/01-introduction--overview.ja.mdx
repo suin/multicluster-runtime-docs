@@ -1,0 +1,87 @@
+---
+title: 概要
+---
+
+multicluster-runtime は、Kubernetes の controller-runtime を拡張し、複数の Kubernetes クラスターを横断して動作するコントローラーを簡潔に実装できるようにする Go ライブラリです。おなじみの Manager / Builder / Reconciler のモデルを保ちつつ、「クラスターフリート（複数クラスターの集合）」という概念を加え、単一のコントローラーバイナリで複数クラスターの監視・リコンサイル・操作を可能にします。
+
+ひと目でわかるポイント:
+- **One Pod, Many Clusters**: 1つのコントローラープロセスで、動的に変化する複数クラスターに接続して動作。
+- **プロバイダー駆動の検出**: プラガブルなプロバイダーが、Cluster API、kubeconfig、Kind、インベントリ API などの多様なソースからクラスターを検出。
+- **controller-runtime 互換**: `mcreconcile.Request` などのマルチクラスター向け型を足すだけで、Manager/Controller/Reconciler の流儀はそのまま。
+- **2つのリコンサイルパターン**: 均一（Uniform）とマルチクラスター認識（Multi-Cluster-Aware）。
+
+### なぜマルチクラスターのコントローラーが必要か
+
+現代のプラットフォームは、分離・地理・スケール・テナンシー・規制対応などの理由から、複数クラスターで構成されるのが一般的です。これらを一貫して運用するには、次のことが求められます。
+- 変化し続けるフリートの検出と管理
+- クラスターごとのイベントへの反応
+- 必要に応じたクロスクラスターのオーケストレーション
+- そして何より、controller-runtime の開発体験を損なわないこと
+
+multicluster-runtime は、controller-runtime に最小限の概念追加でこれらを実現します。
+
+### controller-runtime との関係
+
+基本的なメンタルモデルは同じで、マルチクラスター向けの要素がいくつか加わります。
+- **Manager（マネージャー）**: コントローラーを起動・協調する中心。マルチクラスターではフリートを前提に、クラスターごとの Client/Cache/Recorder を提供可能。
+- **Provider（プロバイダー）**: クラスターとその認証情報を検出し、追加・削除・更新などのライフサイクルイベントを発行。Manager に現在のフリートを供給します。
+- **Cluster（クラスター）**: 個々のメンバークラスターを表現するオブジェクトで、Client/Cache/アイデンティティを公開。
+- **Reconciler と Request**: Reconciler は、対象クラスターの識別子とオブジェクトキーを含む `mcreconcile.Request` を受け取り、同一のロジックをクラスターごとに独立して実行できます。
+- **Builder**: `mcbuilder` により、controller-runtime の builder と同様の感覚でマルチクラスター対応コントローラーや watch を宣言的に構成できます。
+
+watch、predicate、event handler、ワークキューなどのおなじみの構成要素を、そのまま複数クラスターで活用できます。
+
+### リコンサイルパターン
+
+- **Uniform Reconcilers（均一）**: 各クラスターで同じロジックを独立に実行。ポリシーの徹底、ベースラインリソースの維持、ローカル状態の収集などに有効です。
+- **Multi-Cluster-Aware Reconcilers（認識型）**: あるクラスターでのイベントをもとに、別のクラスターへ書き込みを行うなど、クロスクラスターのオーケストレーション（ファンアウト配置、データ集約、調整ワークフロー）を可能にします。
+
+### プロバイダー（フリートの検出）
+
+プロバイダーは、フリートと認証情報を提供するシンプルなインターフェースを実装します。標準で次のエコシステムを備え、用途に応じて選べます。
+- **Kind Provider**: ローカル開発・テスト向けに Kind クラスターを検出。
+- **Kubeconfig Provider**: kubeconfig のエントリ群をフリートとして使用。
+- **Cluster API Provider**: CAPI の `Cluster` リソースからクラスターを動的に検出。
+- **Cluster Inventory API Provider**: `ClusterProfile`（KEP-4322）とクレデンシャルプラグイン（KEP-5339）によるインベントリを利用。
+- **File Provider**: デモやテスト向けのシンプルなファイルベース検出。
+- **Namespace Provider**: 1つのクラスター内で Namespaces をクラスターに見立てた高速ローカル検証。
+- **Multi / Clusters / Single / Nop**: 複合やユーティリティ用途、テスト向けの補助的なプロバイダー群。
+
+これらは一般的な情報源にマッピングされ、Reconciler のコードを変えずに検出戦略を差し替えやすくします。
+
+### アイデンティティとインベントリ（KEP）
+
+- **クラスター識別（KEP-2149）**: クラスター識別子と ClusterSet を標準化し、フリート全体で安定した一意参照を可能にします。
+- **クラスターインベントリ（KEP-4322）**: インベントリシステムでクラスターを記述する `ClusterProfile` API を定義します。
+- **クレデンシャル（KEP-5339）**: `ClusterProfile` におけるクレデンシャルプラグインを導入し、資格情報の取得方法をインベントリから疎結合にします。
+
+multicluster-runtime の各プロバイダーは、これらの概念を活用して、信頼性の高いクラスター識別とアクセス確立を行います。
+
+### 代表的なユースケース
+
+- フリート全体のポリシー適用と設定ドリフトの是正
+- 各クラスター横断のベースラインリソース（例: RBAC、Admission Policies）の維持
+- フェデレーテッドなアプリケーションのロールアウトとオーケストレーション
+- クロスクラスターのデータ収集とヘルス集約
+- Namespaces-as-Clusters による安全な実験とローカルテスト
+
+### 次に取り組むこと
+
+controller-runtime に慣れていれば、学ぶことは多くありません。以下を行うだけです。
+- 任意のプロバイダーを選んでマルチクラスターマネージャーを作成
+- `mcbuilder` でコントローラーや watch を登録
+- `mcreconcile.Request` を受け取る Reconciler を記述し、クラスターごとの Client で読み書き
+
+より深いアーキテクチャ解説（“One Pod, Many Clusters” モデル）は以下を参照してください。
+- Architecture: [01-introduction--architecture.md](01-introduction--architecture)
+- Why multicluster-runtime?: [01-introduction--why-multicluster-runtime.md](01-introduction--why-multicluster-runtime)
+- Key Concepts: [01-introduction--key-concepts.md](01-introduction--key-concepts)
+
+準備ができたら Getting Started へ進みましょう。
+- Prerequisites: [02-getting-started--prerequisites.md](02-getting-started--prerequisites)
+- Installation: [02-getting-started--installation.md](02-getting-started--installation)
+- Quickstart: [02-getting-started--quickstart.md](02-getting-started--quickstart)
+
+### プロジェクトのステータス
+
+本プロジェクトは活発に開発中で、controller-runtime ユーザーにとって直感的に感じられることを目標としています。アイデンティティやインベントリの標準化が進むのに合わせ、プロバイダー・API・開発者体験は継続的に改善されていきます。

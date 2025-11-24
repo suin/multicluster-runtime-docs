@@ -1,0 +1,465 @@
+---
+title: Cluster API Provider
+---
+
+This chapter documents the **Cluster API provider** (`providers/cluster-api`), which discovers clusters from [Cluster API](https://github.com/kubernetes-sigs/cluster-api) (CAPI) `Cluster` resources and engages them with the **Multi-Cluster Manager**.  
+If you already run CAPI as your source of truth for workload clusters, this provider is usually the most natural way to connect `multicluster-runtime` to your fleet.
+
+At a high level, the Cluster API provider:
+
+- watches CAPI `Cluster` objects in a **management cluster**,
+- waits until each `Cluster` is **provisioned** and has a usable kubeconfig,
+- builds a `cluster.Cluster` (client + cache + indexer) for each workload cluster,
+- **engages** those clusters with the Multi-Cluster Manager, so your controllers can reconcile across them.
+
+For a conceptual overview of Providers, see **Core Concepts — Providers** (`03-core-concepts--providers.md`).  
+This chapter focuses specifically on how the Cluster API provider is wired, configured, and used.
+
+---
+
+### When to use the Cluster API provider
+
+Use the Cluster API provider when:
+
+- **Cluster API is your lifecycle manager**:
+  - You already manage workload clusters via CAPI `Cluster` resources.
+  - You want multi-cluster controllers to target those same clusters.
+- You prefer **Kubernetes-native discovery**:
+  - The inventory of clusters lives in the Kubernetes API of the management cluster.
+  - You do not want to maintain separate kubeconfig lists or external registries for multicluster-runtime.
+- You want to **reuse existing CAPI tooling and practices**:
+  - standard CAPI labels/annotations and status fields,
+  - standard admin kubeconfig Secrets and RBAC policies.
+
+You might prefer other providers when:
+
+- you do not use CAPI at all (File, Kubeconfig, or Cluster Inventory API providers may be a better fit),
+- you have clusters that live **outside** CAPI’s management (for example, existing unmanaged clusters, or clusters owned by a different inventory system),
+- you want to operate entirely **within a single physical cluster** (Namespace provider).
+
+---
+
+### Topology: how the Cluster API provider fits into the system
+
+The typical deployment looks like this:
+
+- A **management cluster**:
+  - runs Cluster API and hosts `Cluster` resources for workload clusters,
+  - runs a standard `controller-runtime` `manager.Manager` (the **local manager**) watching those CAPI `Cluster`s.
+- A **Multi-Cluster Manager** (`mcmanager.Manager`):
+  - runs in the same management cluster,
+  - uses the Cluster API provider as its `multicluster.Provider`.
+- One or more **workload clusters**:
+  - created and managed by CAPI,
+  - accessed via kubeconfigs stored in Secrets in the management cluster.
+
+The Go example in `examples/cluster-api/main.go` wires these pieces together:
+
+- It creates a **local manager** that:
+  - talks to the management cluster,
+  - has CAPI types (`capiv1beta1.Cluster`) in its scheme,
+  - configures caching to treat `corev1.Secret` as *uncached* (to always read fresh kubeconfigs).
+- It passes that local manager into the Cluster API provider:
+
+  ```go
+  provider, err := capi.New(localMgr, capi.Options{})
+  ```
+
+- It then creates a **Multi-Cluster Manager** using the same REST config and the provider:
+
+  ```go
+  mcMgr, err := mcmanager.New(cfg, provider, mcmanager.Options{ /* ... */ })
+  ```
+
+- It starts **both** managers:
+  - the local manager drives the CAPI `Cluster` controller embedded in the provider,
+  - the Multi-Cluster Manager drives your multi-cluster controllers and sources.
+
+From the point of view of your reconcilers, this looks just like any other provider: you receive `mcreconcile.Request` values with a `ClusterName`, and you resolve the target cluster via `mcMgr.GetCluster(ctx, req.ClusterName)`.
+
+---
+
+### How discovery and engagement work
+
+The Cluster API provider is implemented in `providers/cluster-api/provider.go`. Conceptually, it is a **controller for CAPI `Cluster` objects** that also implements `multicluster.Provider` and `multicluster.ProviderRunnable`.
+
+#### Construction
+
+```go
+provider, err := capi.New(localMgr, capi.Options{})
+```
+
+`New`:
+
+- stores:
+  - the provided `Options`,
+  - a logger,
+  - the `client.Client` of the local manager,
+  - internal maps for `clusters`, cancel functions, and field indexers;
+- calls `setDefaults` to fill in missing fields in `Options`:
+  - `GetSecret`: uses CAPI’s `utilkubeconfig.FromSecret` helper to obtain a kubeconfig for a `Cluster` and turns it into a `*rest.Config`,
+  - `NewCluster`: creates a new `cluster.Cluster` from the `rest.Config` and `ClusterOptions`;
+- registers a controller on the **local manager**:
+
+  - `builder.ControllerManagedBy(localMgr).For(&capiv1beta1.Cluster{}).WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(p)`
+  - so the provider itself becomes the reconciler for CAPI `Cluster` resources.
+
+The provider also implements `multicluster.ProviderRunnable.Start`, which is automatically hooked into the Multi-Cluster Manager’s `Start` method. `Start` simply remembers the `multicluster.Aware` instance (the Multi-Cluster Manager) and waits for the context to be cancelled.
+
+#### Reconcile loop for CAPI Clusters
+
+For each reconcile of a `capiv1beta1.Cluster` (`Reconcile(ctx, req)`):
+
+1. **Load the CAPI `Cluster`**
+   - The provider uses the local manager’s client to `Get` the `Cluster` by `req.NamespacedName`.
+   - If the `Cluster` was deleted (`IsNotFound`):
+     - it removes the corresponding entry from its internal `clusters` map,
+     - cancels the per-cluster context (if any),
+     - returns without error.
+2. **Wait for the Multi-Cluster Manager**
+   - If `Start` has not yet run and `mcAware` is still `nil`, the provider returns `reconcile.Result{RequeueAfter: 2 * time.Second}`.
+   - This ensures that CAPI reconciliation does not try to engage clusters before the Multi-Cluster Manager is ready.
+3. **Skip unready clusters**
+   - The provider inspects `ccl.Status.GetTypedPhase()`.
+   - If the phase is **not** `capiv1beta1.ClusterPhaseProvisioned`, it logs that the cluster is not yet provisioned and returns success.
+   - It relies on future CAPI status updates to retrigger reconciliation when the phase changes.
+4. **Avoid double engagement**
+   - The provider uses the string key:
+
+     ```go
+     key := req.NamespacedName.String() // "<namespace>/<name>"
+     ```
+
+     as the **ClusterName** for this cluster.
+   - If `key` is already present in `p.clusters`, the provider logs “Cluster already engaged” and returns.
+5. **Obtain the kubeconfig**
+   - It calls `opts.GetSecret(ctx, ccl)` to obtain a `*rest.Config`:
+     - by default, this uses CAPI’s `utilkubeconfig` helper to read the admin kubeconfig Secret associated with the `Cluster`,
+     - you can override this function via `Options` to follow a different Secret naming convention or credential source.
+6. **Create and start the `cluster.Cluster`**
+   - It calls `opts.NewCluster(ctx, ccl, cfg, opts.ClusterOptions...)` to build a `cluster.Cluster` instance.
+   - It applies any previously registered field indexers to the new cluster’s cache.
+   - It creates a per-cluster context `clusterCtx` with `context.WithCancel(ctx)` and starts the cluster’s cache in a goroutine:
+
+     ```go
+     go cl.Start(clusterCtx)
+     if !cl.GetCache().WaitForCacheSync(ctx) {
+       cancel()
+       return error
+     }
+     ```
+
+   - Only once the cache is synced does the provider proceed to engagement.
+7. **Remember and engage the cluster**
+   - It records:
+     - `p.clusters[key] = cl`
+     - `p.cancelFns[key] = cancel`
+   - It calls `p.mcAware.Engage(clusterCtx, key, cl)`:
+     - this hands the ready `cluster.Cluster` to the Multi-Cluster Manager,
+     - the manager, in turn, wires multi-cluster Sources and controllers for this cluster.
+   - If engagement fails, the provider logs the error, removes the cluster from its maps, and returns an error.
+
+All state mutations on `clusters`, `cancelFns`, and `indexers` are protected by a `sync.Mutex`.  
+The CAPI controller is configured with `MaxConcurrentReconciles: 1` to avoid racy duplicate engagements.
+
+#### Disengagement on deletion
+
+When a CAPI `Cluster` is deleted:
+
+- the reconcile path with `IsNotFound(err)`:
+  - deletes the entry from `p.clusters`,
+  - calls the stored cancel function (if any),
+  - returns success.
+
+There is no explicit “disengage” callback on the Multi-Cluster Manager; instead:
+
+- the **per-cluster context** passed to `Engage` is cancelled,
+- multi-cluster Sources and caches that depend on that context will **stop**,
+- no further events from that cluster will reach your reconciler.
+
+Your reconcilers should handle:
+
+- `GetCluster(ctx, req.ClusterName)` failing with `multicluster.ErrClusterNotFound`, and
+- contexts being cancelled for long-running per-cluster operations.
+
+---
+
+### Cluster names and identity
+
+The Cluster API provider uses the **namespaced name** of the CAPI `Cluster` as the `ClusterName`:
+
+- `ClusterName = "<namespace>/<name>"`, for example:
+  - `capi-system/workload-eu-1`
+  - `prod-management/cluster-a`.
+
+Implications:
+
+- This is **unique** within the management cluster as long as each `Cluster` name is unique in its namespace.
+- It is **stable** for the lifetime of the CAPI `Cluster` object.
+
+Interaction with broader identity standards:
+
+- KEP‑2149 defines `ClusterProperty` resources and properties such as:
+  - `cluster.clusterset.k8s.io` (a stable per-cluster ID),
+  - `clusterset.k8s.io` (ClusterSet membership).
+- The Cluster API provider **does not derive `ClusterName` from these properties**; it uses `namespace/name`.
+- If you also deploy the About API / `ClusterProperty` CRDs, you can:
+  - treat `ClusterName` as a routing key into your multi-cluster controllers,
+  - and separately look up `ClusterProperty` resources in each workload cluster to obtain a stable cluster ID and ClusterSet coordinates.
+
+When composing providers (for example with `providers/multi`), you can prefix CAPI-based clusters:
+
+- e.g. `capi#capi-system/workload-eu-1`, `kind#dev-1`, etc.
+- This avoids name collisions and makes it obvious which provider is responsible for which cluster.
+
+Your reconcilers should treat `ClusterName` as an **opaque string**:
+
+- log it,
+- use it for metrics and routing,
+- but avoid parsing or relying on its exact format.
+
+---
+
+### Configuring the provider via `Options`
+
+The `Options` type in `providers/cluster-api/provider.go` lets you adapt the provider to your CAPI setup:
+
+```go
+type Options struct {
+  // Options passed to the cluster constructor.
+  ClusterOptions []cluster.Option
+
+  // Returns a *rest.Config for a CAPI Cluster by reading its kubeconfig.
+  GetSecret func(ctx context.Context, ccl *capiv1beta1.Cluster) (*rest.Config, error)
+
+  // Creates a new cluster.Cluster from a *rest.Config.
+  // The provider will start it and manage its lifecycle.
+  NewCluster func(ctx context.Context, ccl *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)
+}
+```
+
+By default:
+
+- **`GetSecret`**:
+  - uses `utilkubeconfig.FromSecret` with a `types.NamespacedName` derived from the CAPI `Cluster`,
+  - parses the kubeconfig bytes into a `*rest.Config` via `clientcmd.RESTConfigFromKubeConfig`.
+- **`NewCluster`**:
+  - calls `cluster.New(cfg, opts...)` to create a standard controller-runtime `cluster.Cluster`.
+
+You can override these functions to:
+
+- support non-default kubeconfig Secret naming or location,
+- integrate with custom credential flows,
+- customize cluster creation (for example, adding a specific scheme or rate limits).
+
+#### Example: customizing Secret lookup
+
+Suppose your CAPI environment stores admin kubeconfigs in Secrets named `<cluster-name>-admin` instead of the default.  
+You can wrap the default helper:
+
+```go
+provider, err := capi.New(localMgr, capi.Options{
+  GetSecret: func(ctx context.Context, c *capiv1beta1.Cluster) (*rest.Config, error) {
+    // Derive a different Secret name or location if needed, then delegate.
+    // For example, change the Name while keeping the same Namespace.
+    nn := types.NamespacedName{
+      Namespace: c.Namespace,
+      Name:      c.Name + "-admin",
+    }
+    bs, err := utilkubeconfig.FromSecret(ctx, localMgr.GetClient(), nn)
+    if err != nil {
+      return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
+    }
+    return clientcmd.RESTConfigFromKubeConfig(bs)
+  },
+})
+```
+
+#### Example: customizing `cluster.Cluster` construction
+
+You can also inject additional `cluster.Option`s or wrap cluster creation entirely:
+
+```go
+provider, err := capi.New(localMgr, capi.Options{
+  ClusterOptions: []cluster.Option{
+    // for example: a custom logger, metrics, or cache options
+  },
+  NewCluster: func(ctx context.Context, c *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error) {
+    // Add your own options or validations here.
+    return cluster.New(cfg, opts...)
+  },
+})
+```
+
+This is useful when:
+
+- your workload clusters expose additional CRDs and you need specific schemes or codecs,
+- you want to tweak caching behaviour or client configuration per workload cluster,
+- you need per-cluster observability hooks (for example, per-cluster metrics labels).
+
+---
+
+### Using the provider in a multi-cluster controller
+
+The `examples/cluster-api/main.go` program shows a full end-to-end wiring. In outline:
+
+1. **Register CAPI types** in the global scheme:
+
+   ```go
+   func init() {
+     runtime.Must(capiv1beta1.AddToScheme(scheme.Scheme))
+   }
+   ```
+
+2. **Create the local manager** against the management cluster:
+
+   - use `ctrl.GetConfig()` to get a `*rest.Config`,
+   - initialize `manager.New(cfg, manager.Options{ ... })`,
+   - configure caching so that `corev1.Secret` is fetched directly (no cache), which avoids stale kubeconfigs.
+
+3. **Create the Cluster API provider** against the local manager:
+
+   ```go
+   provider, err := capi.New(localMgr, capi.Options{})
+   ```
+
+4. **Create the Multi-Cluster Manager** with the provider:
+
+   ```go
+   mcMgr, err := mcmanager.New(cfg, provider, mcmanager.Options{
+     LeaderElection: false,
+     Metrics: metricsserver.Options{
+       BindAddress: "0", // disable metrics here; only one process may bind
+     },
+   })
+   ```
+
+5. **Register a multi-cluster controller** on `mcMgr`:
+
+   ```go
+   if err := mcbuilder.ControllerManagedBy(mcMgr).
+     Named("multicluster-configmaps").
+     For(&corev1.ConfigMap{}).
+     Complete(mcreconcile.Func(func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+       cl, err := mcMgr.GetCluster(ctx, req.ClusterName)
+       if err != nil {
+         return reconcile.Result{}, err
+       }
+       // use cl.GetClient() to read/write in the workload cluster
+       return ctrl.Result{}, nil
+     })); err != nil {
+     // handle setup error
+   }
+   ```
+
+6. **Start both managers** (using an `errgroup` for simplicity):
+
+   ```go
+   g, ctx := errgroup.WithContext(ctx)
+   g.Go(func() error { return ignoreCanceled(localMgr.Start(ctx)) })
+   g.Go(func() error { return ignoreCanceled(mcMgr.Start(ctx)) })
+   if err := g.Wait(); err != nil { /* ... */ }
+   ```
+
+At runtime:
+
+- the local manager’s CAPI controller reconciles `Cluster` objects and asks the provider to engage newly provisioned clusters,
+- the Multi-Cluster Manager receives those engagements and:
+  - wires `Kind` sources and caches for each workload cluster,
+  - starts your multi-cluster controllers,
+  - routes events into a unified work queue with `mcreconcile.Request{ClusterName: "<ns>/<name>", ...}`.
+
+From the reconciler’s perspective, there is no direct dependency on CAPI:
+
+- your code only sees `ClusterName` and cluster-scoped clients,
+- you can swap providers later (for example, to use the Cluster Inventory API provider) without changing the reconciler logic.
+
+---
+
+### Field indexing behaviour
+
+The Cluster API provider honours the `multicluster.Provider.IndexField` contract:
+
+- it stores each requested index definition in an internal `indexers` slice, and
+- it applies the index to:
+  - all **existing** clusters at the time of registration, and
+  - all **future** clusters as they are created and engaged.
+
+Concretely, when `mcMgr.GetFieldIndexer().IndexField(ctx, obj, fieldName, extractFunc)` is called:
+
+- the Multi-Cluster Manager forwards the call to `provider.IndexField`,
+- the provider:
+  - remembers the `(object, field, extractFunc)` tuple,
+  - iterates over `p.clusters` and applies the index via `cl.GetCache().IndexField(...)`.
+
+Later, during cluster engagement:
+
+- the provider replays all stored indexers on the newly created `cluster.Cluster` before starting its cache and calling `Engage`.
+
+This guarantees that:
+
+- multi-cluster controllers can register field indexes *once* at setup time,
+- every workload cluster — no matter when it appears — will have the same indexes available.
+
+---
+
+### RBAC and security considerations
+
+On the **management cluster**, the process running the local manager (and thus the provider) must be able to:
+
+- read CAPI `Cluster` objects:
+  - `get`, `list`, `watch` on `clusters.cluster.x-k8s.io`,
+- read the kubeconfig Secrets used by CAPI for workload clusters:
+  - at minimum, `get` on the relevant `secrets` in the namespaces where `Cluster`s live,
+  - if you adopt a different Secret layout in `GetSecret`, grant permissions accordingly.
+
+On **workload clusters**, the kubeconfig retrieved by `GetSecret` determines what your multi-cluster controllers can do:
+
+- CAPI often creates “admin” kubeconfigs with wide permissions; you may want to:
+  - rotate those credentials regularly,
+  - scope them down to only the resources needed by your controllers.
+
+Because the provider uses the local manager’s client to talk to the management cluster:
+
+- cache configuration and rate limits on the local manager directly affect how quickly:
+  - changes to CAPI `Cluster` status are noticed,
+  - kubeconfig Secrets updates propagate to the provider.
+
+If you override `GetSecret` to integrate with more complex credential flows (for example, Workload Identity Federation or external plugins as in KEP‑5339), keep in mind:
+
+- the provider expects a ready-to-use `*rest.Config`,
+- it does not cache credentials explicitly; caching or rotation policies live in your implementation of `GetSecret`.
+
+---
+
+### Failure modes and troubleshooting
+
+Some common operational behaviours and how to reason about them:
+
+- **Cluster never engages**
+  - Check that:
+    - the CAPI `Cluster` reaches the `Provisioned` phase,
+    - the kubeconfig Secret exists and is readable by the provider,
+    - `GetSecret` and `NewCluster` do not return errors (look at logs from the provider’s logger `cluster-api-cluster-provider`).
+- **Controller sees `ErrClusterNotFound`**
+  - This means:
+    - the CAPI `Cluster` no longer exists, or
+    - the provider has not yet engaged it (for example, still not `Provisioned` or kubeconfig missing).
+  - In reconcilers, treat this as “cluster left the fleet” and return success without requeue.
+- **Stale credentials or endpoint changes**
+  - The current implementation does not replace an already engaged `cluster.Cluster` when the kubeconfig Secret or CAPI `Cluster` status changes.
+  - As of now, you should:
+    - plan to rotate workload cluster credentials by restarting the controller deployment,
+    - or extend the provider to observe such changes and recreate the cluster clients.
+- **High cardinality fleets**
+  - Because the provider has `MaxConcurrentReconciles: 1` for CAPI `Cluster` objects, it will process engagements serially.
+  - For very large fleets, this trades simplicity for slightly longer ramp-up time; you may consider adjusting this if and when the provider evolves.
+
+---
+
+### Summary
+
+The Cluster API provider lets `multicluster-runtime` treat CAPI-managed clusters as a dynamic fleet: CAPI `Cluster` resources are the source of truth, kubeconfig Secrets provide connectivity, and the provider turns each provisioned cluster into a `cluster.Cluster` engaged with the Multi-Cluster Manager.  
+By wiring a local manager for CAPI, a Multi-Cluster Manager with the CAPI provider, and one or more multi-cluster controllers, you can build controllers that naturally follow your existing CAPI lifecycle — without embedding CAPI-specific logic into your reconcilers.
+
+

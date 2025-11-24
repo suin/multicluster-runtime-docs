@@ -1,0 +1,411 @@
+---
+title: Authentication
+---
+
+This chapter explains how **authentication and credentials** work in `multicluster-runtime`:  
+how the controller process authenticates to the **host cluster**, how Providers obtain
+credentials for **member clusters**, and how this ties into SIG‑Multicluster KEPs such as:
+
+- **KEP‑2149** — ClusterId for ClusterSet identification (cluster identity),
+- **KEP‑4322** — ClusterProfile API (cluster inventory),
+- **KEP‑5339** — Plugin for Credentials in ClusterProfile (credential plugins).
+
+The focus here is **control-plane–to–control-plane authentication** (controllers talking to
+Kubernetes API servers). End-user authentication and application-level authorization are out of scope.
+
+---
+
+### Authentication layers in a multi-cluster controller
+
+From a `multicluster-runtime` point of view, there are three main layers:
+
+- **Host cluster authentication**
+  - The process that runs `mcmanager.Manager` authenticates to one Kubernetes API server
+    (the **host** or **hub** cluster) using a normal `*rest.Config`:
+    - in-cluster configuration,
+    - `KUBECONFIG` / kubeconfig file,
+    - or any other `client-go` mechanism.
+  - This identity:
+    - drives controllers that work only on the host cluster,
+    - lets Providers read management objects such as CAPI `Cluster`s,
+      `ClusterProfile`s, or kubeconfig `Secret`s.
+
+- **Member cluster authentication**
+  - Each engaged member cluster has its own `*rest.Config` and `cluster.Cluster`.
+  - **Providers** are responsible for constructing these configs:
+    - by reading kubeconfig files or Secrets,
+    - by talking to external inventory APIs (ClusterProfile),
+    - or by executing credential plugins (KEP‑5339).
+  - Reconcilers never deal with raw tokens or certificates; they only call:
+
+```go
+cl, err := mgr.GetCluster(ctx, req.ClusterName)
+```
+
+- **Workload / end-user authentication (out of scope)**
+  - Inside each cluster, Pods and users authenticate/authorize exactly as in any other Kubernetes
+    deployment (ServiceAccounts, OIDC, cloud IAM, etc.).
+  - `multicluster-runtime` does not change this model.
+
+This separation lets you design and rotate credentials per cluster without touching reconciler code.
+
+---
+
+### Kubeconfig-based Providers and credentials
+
+Many Providers use **kubeconfig** as the basic representation of credentials and cluster endpoints.  
+Kubeconfig already supports client certificates, bearer tokens, OIDC, and `exec`-based external
+credential providers, so `multicluster-runtime` can simply reuse those mechanisms.
+
+The following Providers are kubeconfig-based:
+
+- **File Provider** (`providers/file`)
+- **Kind Provider** (`providers/kind`)
+- **Kubeconfig Provider** (`providers/kubeconfig`)
+- **Cluster API Provider** (`providers/cluster-api`)
+
+The high-level pattern is:
+
+1. Obtain kubeconfig bytes (from a file, Secret, or library).
+2. Turn them into a `*rest.Config` via `clientcmd.RESTConfigFromKubeConfig`.
+3. Optionally tweak the config (QPS, timeouts, impersonation, etc.).
+4. Create a `cluster.Cluster` from that config and engage it with the Multi-Cluster Manager.
+
+Below we look at each kubeconfig-based Provider from an authentication perspective.
+
+---
+
+### File Provider — kubeconfig files on disk
+
+The **File Provider** loads clusters from kubeconfig files or directories on disk.
+
+- **Credential source**
+  - Uses explicit `KubeconfigFiles` and `KubeconfigDirs`, or falls back to:
+    - `$KUBECONFIG` if it points to a file,
+    - `~/.kube/config` if it exists,
+    - otherwise the current working directory.
+  - For each matching file and context, the provider:
+    - parses the kubeconfig into a `*rest.Config`,
+    - creates a `cluster.Cluster` from it,
+    - and exposes it under a name derived from `<filePath><Separator><contextName>`.
+
+- **Security implications**
+  - Whatever credentials are embedded in those kubeconfigs (tokens, client certs, exec plugins)
+    become the authority by which your controllers act in the member clusters.
+  - For production, you should:
+    - limit which files are read,
+    - store kubeconfigs in directories with restricted access,
+    - and ensure their RBAC is scoped to what your controllers actually need.
+
+Because this provider lives entirely on the local filesystem, it is most commonly used for
+**development**, **CI**, and **simple static fleets**.
+
+---
+
+### Kind Provider — local Kind clusters
+
+The **Kind Provider** discovers local Kind clusters and builds kubeconfigs for them using the Kind Go library.
+
+- **Credential source**
+  - Calls `kind.NewProvider().KubeConfig(clusterName, false)` to obtain a kubeconfig string.
+  - Uses `clientcmd.RESTConfigFromKubeConfig` to get a `*rest.Config`.
+  - Applies any configured `RESTOptions` for fine-tuning (for example QPS/Burst or TLS tweaks).
+
+- **Lifecycle**
+  - Periodically lists Kind clusters, creates `cluster.Cluster` instances for new ones,
+    and tears them down when they disappear.
+
+- **Security implications**
+  - Credentials are whatever Kind generated for that cluster (typically client certificates).
+  - This is ideal for local experiments and tests; for real fleets you should pair your logic with
+    a production-grade Provider such as Cluster API or Cluster Inventory API.
+
+---
+
+### Kubeconfig Provider — Secrets containing kubeconfig
+
+The **Kubeconfig Provider** runs inside a Kubernetes cluster and treats labeled Secrets as the source
+of truth for member cluster kubeconfigs.
+
+- **Discovery**
+  - Using the host cluster’s local manager, it runs a controller that watches `corev1.Secret`
+    objects in a configured `Namespace` and with a specific label
+    (by default `sigs.k8s.io/multicluster-runtime-kubeconfig: "true"`).
+
+- **Credential source**
+  - For each matching Secret, reads `data[Options.KubeconfigSecretKey]`
+    (default: `"kubeconfig"`).
+  - Parses the bytes into a `*rest.Config` via `clientcmd.RESTConfigFromKubeConfig`.
+  - Applies `Options.RESTOptions` to mutate the `*rest.Config` (for example,
+    adjusting QPS, adding HTTP proxies, or customizing TLS settings).
+
+- **Rotation and cache invalidation**
+  - Computes a SHA256 hash of the kubeconfig and compares it to the last seen value.
+  - If unchanged, it reuses the existing `cluster.Cluster`.
+  - If changed:
+    - cancels the old per-cluster context,
+    - destroys the old `cluster.Cluster`,
+    - builds a new one from the updated kubeconfig,
+    - re-applies all registered field indexes,
+    - waits for the cache to sync,
+    - and re-engages the cluster with the Manager.
+
+- **Security considerations**
+  - The controller’s ServiceAccount must have `get/list/watch` on the kubeconfig Secrets,
+    but nothing more.
+  - Each kubeconfig should grant only the minimal RBAC required in the member cluster.
+    Avoid handing out cluster-admin credentials if you can scope access to specific namespaces
+    and API groups.
+
+This provider is a good fit when an external system (or operator) can reliably manage kubeconfig
+Secrets in a designated namespace.
+
+---
+
+### Cluster API Provider — kubeconfig from CAPI `Cluster`
+
+The **Cluster API Provider** integrates with [Cluster API](https://github.com/kubernetes-sigs/cluster-api)
+and uses CAPI’s own kubeconfig Secrets as the credential source.
+
+- **Credential source**
+  - By default, `Options.GetSecret`:
+    - uses `utilkubeconfig.FromSecret` with a `types.NamespacedName` derived from the CAPI `Cluster`,
+    - then parses the result into a `*rest.Config` with `clientcmd.RESTConfigFromKubeConfig`.
+  - You can override `GetSecret` to fetch kubeconfigs from differently named Secrets or
+    introduce custom flows (for example, a Secret populated by an external system).
+
+- **Lifecycle and rotation**
+  - When a CAPI `Cluster` reaches the `Provisioned` phase for the first time, the provider:
+    - builds a `cluster.Cluster`,
+    - applies all stored field indexes,
+    - starts the cache and waits for it to sync,
+    - and engages it with the Multi-Cluster Manager.
+  - The current implementation does **not** automatically replace an already engaged cluster when
+    its kubeconfig Secret changes. To pick up rotated credentials, you typically:
+    - restart the controller deployment, or
+    - extend the provider to detect relevant Secret updates.
+
+- **Security considerations**
+  - On the management cluster, the provider needs:
+    - `get/list/watch` on CAPI `Cluster`s,
+    - `get` on kubeconfig Secrets (admin kubeconfig by default).
+  - On workload clusters, those kubeconfigs often have very broad permissions; you should
+    consider:
+    - issuing dedicated credentials for your multi-cluster controllers with scoped RBAC,
+    - rotating those credentials regularly.
+
+For more operational details, see **Providers Reference — Cluster API Provider**.
+
+---
+
+### Cluster Inventory API Provider and credential plugins (KEP‑5339)
+
+The **Cluster Inventory API Provider** is designed for environments that expose the
+**ClusterProfile API** (KEP‑4322) on a hub cluster. It aligns with **KEP‑5339** to obtain
+credentials via external plugins.
+
+At a high level:
+
+- Each managed cluster is represented by a `ClusterProfile`.
+- `ClusterProfile.status.conditions` (for example `ControlPlaneHealthy`) decide when a cluster
+  is ready to be engaged.
+- `ClusterProfile.status.credentialProviders` tell the provider how to obtain credentials.
+- A `kubeconfigstrategy` implementation:
+  - executes an external plugin for the chosen credential type (for example `"google"`),
+  - receives tokens or client certificates,
+  - and wraps them into a `*rest.Config`.
+
+#### Credentials Provider strategy (recommended)
+
+The recommended approach is to use the **Credentials Provider strategy**, wired roughly as in
+the `examples/cluster-inventory-api` demo:
+
+```go
+credsProvider, err := credentials.NewFromFile("clusterprofile-provider-file.json")
+if err != nil {
+    // handle error
+}
+
+provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+    KubeconfigStrategyOption: kubeconfigstrategy.Option{
+        CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+            Provider: credsProvider,
+        },
+    },
+})
+```
+
+In this model:
+
+- A configuration file maps credential types (for example `"google"") to executable paths and
+  arguments.
+- The library:
+  - constructs a `Cluster` spec from `ClusterProfile.status.credentialProviders`,
+  - calls the chosen plugin using the same exec protocol as client-go’s external providers,
+  - and converts the plugin’s response into a `*rest.Config`.
+
+**Advantages:**
+
+- Credentials are not stored as long-lived kubeconfigs in Secrets.
+- You can reuse the same plugin binaries across different controllers and fleets.
+- Identity systems such as Workload Identity Federation are easy to integrate.
+
+#### Secret strategy (simple, but less secure)
+
+The alternative **Secret strategy** mirrors the “credentials in Secret” approach from the
+ClusterProfile KEP:
+
+- A cluster manager writes kubeconfig Secrets into namespaces labeled with
+  `x-k8s.io/cluster-inventory-consumer=<consumerName>`.
+- Each Secret is labeled to associate it with a `ClusterProfile`.
+- The strategy finds the Secret for a given `ClusterProfile`, reads `data["Config"]`,
+  and parses it as a kubeconfig.
+
+While useful for simple setups and demos, this strategy:
+
+- stores long-lived credentials in Secrets,
+- introduces additional lifecycle management for those Secrets,
+- is therefore **not recommended for security-sensitive production environments**.
+
+#### Rotation
+
+The Cluster Inventory API Provider tracks the last `*rest.Config` used per `ClusterProfile`:
+
+- If a new `rest.Config` compares equal to the previous one, it keeps the existing cluster.
+- If it differs, the provider:
+  - cancels the old per-cluster context,
+  - removes the old `cluster.Cluster`,
+  - creates a new `cluster.Cluster` with the updated config,
+  - reapplies all registered field indexes,
+  - waits for the cache to sync,
+  - and re-engages the cluster with the Manager.
+
+This allows safe rotation of credentials without restarting the process.
+
+---
+
+### Namespace Provider — virtual clusters over a single credential
+
+The **Namespace Provider** (`providers/namespace`) represents each `Namespace` in a single physical
+cluster as a **virtual cluster**.
+
+From an authentication perspective:
+
+- You supply one base `cluster.Cluster` when constructing the Provider.
+- The Provider wraps that cluster in `NamespacedCluster` objects, one per namespace.
+- All virtual clusters share the same underlying `*rest.Config` and credentials.
+
+This means:
+
+- There is no need to provision separate credentials per virtual cluster.
+- Authorization is still controlled by the base cluster’s RBAC rules.
+- This pattern is excellent for **local development** and **multi-tenant simulations**, but
+  should not be confused with strong isolation between clusters.
+
+---
+
+### Cluster identity vs authentication (KEP‑2149)
+
+It is important to distinguish between **who a cluster is** (identity) and **how you authenticate**
+to its API server.
+
+- **KEP‑2149** defines the `ClusterProperty` CRD and two well-known properties:
+  - `cluster.clusterset.k8s.io`: a stable, unique ID for a cluster within a ClusterSet.
+  - `clusterset.k8s.io`: an ID for the ClusterSet itself.
+- Providers that integrate with ClusterProfile or ClusterProperty can:
+  - use these properties as the canonical identity of a member cluster,
+  - expose that identity in `ClusterProfile.status.properties`,
+  - and let higher-level controllers or UIs correlate metrics and logs per cluster.
+
+By contrast, **`mcreconcile.Request.ClusterName`** is:
+
+- an opaque routing key chosen by each Provider (for example `"namespace/name"` or `"kind#dev-a"`),
+- not itself a credential or guarantee of identity.
+
+Recommended practice:
+
+- Treat `ClusterName` as an opaque string in your reconciler logic.
+- When you need a globally meaningful identifier, read ClusterProfile / ClusterProperty data and
+  propagate properties such as `cluster.clusterset.k8s.io` into your own CRDs, metrics, or logs.
+
+---
+
+### Security and RBAC best practices
+
+While `multicluster-runtime` does not enforce particular authentication mechanisms, secure
+configuration is critical.
+
+#### Host cluster RBAC
+
+On the host (management / hub) cluster:
+
+- Grant the controller’s ServiceAccount only the verbs it actually needs:
+  - For Cluster API Provider:
+    - `get/list/watch` on CAPI `Cluster` resources,
+    - `get` on kubeconfig Secrets.
+  - For Cluster Inventory API Provider:
+    - `get/list/watch` on `ClusterProfile` resources,
+    - `get` on any labeled Secret used by the Secret strategy (if enabled).
+  - For Kubeconfig Provider:
+    - `get/list/watch` on the namespace that stores kubeconfig Secrets.
+- Avoid blanket `*` verbs on core types unless absolutely necessary.
+
+#### Member cluster RBAC
+
+On each member cluster, credentials retrieved by Providers should:
+
+- be scoped down to the minimal needed permissions (namespaces, API groups, verbs),
+- be issued specifically for your multi-cluster controllers rather than reusing admin
+  kubeconfigs,
+- be rotated regularly, either via Secret updates (for kubeconfig-based Providers) or
+  rotation policies in your credential plugins.
+
+#### Plugin binaries and trust (KEP‑5339)
+
+When using credential plugins:
+
+- Plugins run with the same OS-level identity as the controller process and can see its
+  environment and filesystem.
+- You should therefore:
+  - ship plugins from trusted sources,
+  - secure their paths in the container image or volume mounts,
+  - and avoid exposing those paths to other Pods or processes.
+
+---
+
+### Handling authentication errors in reconcilers
+
+Most of the time, authentication failures surface in reconcilers as ordinary errors:
+
+- **Errors from `GetCluster`**
+  - `multicluster.ErrClusterNotFound`:
+    - indicates that the cluster has been removed from the fleet or has not yet been engaged;
+    - by default, the `ClusterNotFoundWrapper` treats this as a **terminal success** and does not
+      requeue.
+  - Other errors (network issues, context cancellations) should be logged and may justify a
+    short requeue, depending on your SLOs.
+
+- **Errors from member cluster API calls**
+  - `IsUnauthorized` / `IsForbidden` suggest misconfigured or insufficient RBAC in the member
+    cluster.
+  - TLS handshake or certificate errors usually point to mismatched or expired certificates in
+    your kubeconfigs or plugin outputs.
+
+In all cases, aim to keep reconcile functions **short, idempotent, and tolerant of temporary
+infrastructure failures**, letting Providers and operators handle most of the credential lifecycle.
+
+---
+
+### Summary
+
+- `multicluster-runtime` centralizes authentication concerns in Providers and `*rest.Config`
+  construction, so reconcilers can focus on business logic.
+- File, Kind, Kubeconfig, and Cluster API Providers all rely on kubeconfig semantics; the
+  Cluster Inventory API Provider builds on ClusterProfile and credential plugins (KEP‑5339) for
+  more advanced, dynamic flows.
+- The Namespace Provider shares a single credential across many virtual clusters, which is ideal
+  for development and multi-tenant simulations on one physical cluster.
+- By aligning with KEP‑2149, KEP‑4322, and KEP‑5339, `multicluster-runtime` offers a flexible,
+  standardized way to model cluster identity, inventory, and credentials across large fleets.
+
+

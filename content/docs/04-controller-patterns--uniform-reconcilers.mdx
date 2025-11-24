@@ -1,0 +1,421 @@
+---
+title: Uniform Reconcilers
+---
+
+This chapter focuses on **Uniform Reconcilers**: controllers that run **the same reconciliation logic independently in every cluster**.  
+They are the simplest and most common pattern in `multicluster-runtime`, and in many cases you can turn an existing single‑cluster
+controller into a uniform multi‑cluster controller with only small, mechanical changes.
+
+We will cover:
+
+- what a uniform reconciler is and how it differs from a multi‑cluster‑aware reconciler,
+- typical use cases and topologies,
+- how to implement a uniform reconciler with `mcreconcile.Request` and the Multi‑Cluster Manager,
+- how to migrate an existing controller-runtime controller to this pattern,
+- options for choosing **which clusters** a uniform controller should watch,
+- best practices and common pitfalls.
+
+---
+
+### What is a Uniform Reconciler?
+
+In the **uniform** pattern, each cluster in the fleet is treated as an **independent copy** of the same problem:
+
+- the reconciler reads from **cluster A** and writes back to **cluster A**,
+- the same reconciler reads from **cluster B** and writes back to **cluster B**,
+- and so on for **cluster C, D, …**.
+
+From the reconciler’s point of view:
+
+- each work item is qualified by a **`ClusterName`** (from `mcreconcile.Request`),
+- but **no cross‑cluster coordination** is required,
+- and the desired state can be expressed **per cluster**.
+
+This is in contrast to **multi‑cluster‑aware reconcilers**, which reason about relationships between clusters
+(for example, “deploy N replicas across this ClusterSet, weighted by capacity” or “sync CA certificates from a hub cluster to all members”).
+
+Uniform reconcilers are:
+
+- **easy to reason about** – the logic is almost identical to a single‑cluster controller,
+- **safe to scale out** – failures or delays in one cluster do not affect others,
+- **a good first step** when introducing `multicluster-runtime` into existing codebases.
+
+The upstream `README.md` describes this pattern as:
+
+- “Run the same reconciler against many clusters:
+  - reads from cluster A and writes to cluster A,
+  - reads from cluster B and writes to cluster B,
+  - reads from cluster C and writes to cluster C.”
+
+---
+
+### Typical Use Cases
+
+Uniform reconcilers are a natural fit whenever **each cluster should converge to the same baseline state**:
+
+- **Compliance and policy enforcement**
+  - Ensure that every cluster has:
+    - a standard set of `ConfigMap`s and Secrets,
+    - baseline `NetworkPolicy` and `PodSecurity` settings,
+    - required CRDs or admission webhooks installed.
+- **Add‑on controllers and operators**
+  - Run the same operator logic (for example, Crossplane, logging/monitoring agents, ingress controllers)
+    against many workload clusters while keeping a single control deployment.
+- **Per‑cluster health and inventory collection**
+  - Periodically reconcile cluster health resources,
+  - emit Events or metrics summarizing conditions in each cluster,
+  - maintain per‑cluster “status CRDs” in a hub or in each member cluster.
+- **Namespace‑based multi‑tenancy (Namespace provider)**
+  - Treat Namespaces as “virtual clusters” and enforce the same namespace‑level policies in each one.
+
+In all of these, each cluster can be reconciled in isolation:
+
+- **no cross‑cluster reads or writes** are required,
+- the reconciler’s inputs and outputs are scoped to a single `ClusterName`.
+
+---
+
+### How Uniform Reconcilers Run Across the Fleet
+
+Uniform reconcilers build on the core concepts from earlier chapters:
+
+- **Providers** discover clusters (from kubeconfig files, Kind, Cluster API, ClusterProfile, Namespaces, …)
+  and **engage** them with the Multi‑Cluster Manager.
+- For each engaged cluster, multi‑cluster **Sources** (for example `mcsource.Kind`) connect to that cluster’s cache
+  and emit **cluster‑qualified events** using `mcreconcile.Request`:
+  - `ClusterName` tells you which cluster the event came from,
+  - `Request.NamespacedName` identifies the object inside that cluster.
+- A single multi‑cluster **Controller** reads from a unified workqueue and calls your reconciler with each `mcreconcile.Request`.
+- Your reconciler uses `mgr.GetCluster(ctx, req.ClusterName)` (see the **Multi‑Cluster Manager** chapter)
+  to obtain the correct `cluster.Cluster` and then reads/writes as in single‑cluster controller‑runtime.
+
+The key point:
+
+- you write **one controller**, but it behaves as if it were running once **per cluster**,
+- all the multi‑cluster wiring (multiple caches, per‑cluster Sources, workqueue fan‑in) is handled by `multicluster-runtime`.
+
+---
+
+### A Minimal Uniform Reconciler Example
+
+The following example is a simplified version of the examples in `refs/multicluster-runtime/examples/*/main.go`.  
+It watches `ConfigMap`s across all clusters discovered by a Provider and logs where they exist.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+    ctx := signals.SetupSignalHandler()
+
+    // 1. Choose a Provider – here: discover local Kind clusters.
+    provider := kind.New()
+
+    // 2. Create a Multi-Cluster Manager using that Provider.
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+    if err != nil {
+        log.Fatal(err, "unable to create manager")
+    }
+
+    // 3. Register a controller that watches ConfigMaps in all engaged clusters.
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("multicluster-configmaps").
+        For(&corev1.ConfigMap{}). // primary resource, watched across the fleet
+        Complete(mcreconcile.Func(
+            func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+                // req.ClusterName tells us which cluster this event belongs to.
+                cl, err := mgr.GetCluster(ctx, req.ClusterName)
+                if err != nil {
+                    return reconcile.Result{}, err
+                }
+
+                cm := &corev1.ConfigMap{}
+                if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                    if apierrors.IsNotFound(err) {
+                        // Object was deleted; nothing to do.
+                        return reconcile.Result{}, nil
+                    }
+                    return reconcile.Result{}, err
+                }
+
+                log.Printf("ConfigMap %s/%s in cluster %q", cm.Namespace, cm.Name, req.ClusterName)
+                return ctrl.Result{}, nil
+            },
+        )); err != nil {
+        log.Fatal(err, "unable to create controller")
+    }
+
+    // 4. Start the manager – it will start the Provider and per-cluster caches as needed.
+    if err := mgr.Start(ctx); err != nil {
+        log.Fatal(err, "unable to run manager")
+    }
+}
+```
+
+This controller:
+
+- sees `ConfigMap` events from **every Kind cluster** that the provider knows about,
+- processes each event using the same reconciliation logic,
+- uses `req.ClusterName` to route reads and writes to the correct cluster.
+
+You can swap the Provider (Kind, File, Kubeconfig, Cluster API, Cluster Inventory API, Namespace)
+without changing the reconciler’s business logic.
+
+---
+
+### Migrating an Existing Single‑Cluster Controller
+
+Many single‑cluster controllers can become uniform multi‑cluster controllers with a small series of refactors.
+The process is largely mechanical:
+
+#### 1. Switch to the Multi‑Cluster Manager and Builder
+
+In your `main.go` (or wherever you construct the manager and controllers):
+
+- replace `controller-runtime` imports with their `multicluster-runtime` equivalents:
+
+```go
+import (
+    // ctrl "sigs.k8s.io/controller-runtime"
+    // "sigs.k8s.io/controller-runtime/pkg/manager"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    "sigs.k8s.io/multicluster-runtime/providers/kubeconfig" // or kind/file/cluster-api/...
+)
+```
+
+- construct an `mcmanager.Manager` with a Provider:
+
+```go
+provider := kubeconfig.New(kubeconfig.Options{/* ... */})
+
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+if err != nil {
+    // handle error
+}
+```
+
+- register controllers via `mcbuilder.ControllerManagedBy(mgr)` instead of `builder.ControllerManagedBy(mgr)`.
+
+If you do **not** yet have a multi‑cluster Provider, you can still start with:
+
+- `mcmanager.New(config, nil, opts)` – this behaves like a single‑cluster manager
+  while preparing your code for multi‑cluster,
+- and introduce a Provider later with minimal further changes.
+
+#### 2. Change the Reconcile Signature to `mcreconcile.Request`
+
+Where you previously had:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // implicitly talks to "the" cluster
+}
+```
+
+update to:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // Use cl.GetClient() instead of mgr.GetClient().
+    // Use req.Request.NamespacedName instead of req.NamespacedName.
+}
+```
+
+Key points:
+
+- **`req.ClusterName`** identifies the target cluster.
+- **`req.Request`** is the inner `reconcile.Request` for that cluster.
+- the rest of the reconcile body is typically a straight copy from the single‑cluster version,
+  with `r.Client` or `mgr.GetClient()` replaced by `cl.GetClient()`.
+
+If you have existing reconcilers that must keep the original signature for now,
+you can use `context.ReconcilerWithClusterInContext` (see the **Reconcile Loop** chapter) to adapt them gradually.
+
+#### 3. Keep Event Sources the Same – Let the Builder Handle Multi‑Cluster Wiring
+
+Most controllers use the standard “watch a primary type via `For`, optionally own or watch other types via `Owns` / `Watches`”.
+This stays the same:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("baseline-config").
+    For(&corev1.ConfigMap{}).
+    Owns(&myv1alpha1.BaselineConfig{}).
+    Complete(myReconciler)
+```
+
+Under the hood, the multi‑cluster Builder:
+
+- uses `mcsource.Kind` to attach per‑cluster informers and handlers,
+- tags each request with the correct `ClusterName`,
+- and forwards events from all engaged clusters into the same controller.
+
+You do **not** need to write any per‑cluster watch logic yourself.
+
+---
+
+### Choosing Which Clusters a Uniform Controller Watches
+
+Uniform reconcilers are often meant to run on **all clusters in a fleet**, but there are many useful variations:
+
+- host‑only controllers (act only on the “local” cluster),
+- fleet‑only controllers (act only on Provider‑managed clusters),
+- hybrid controllers (read CRDs in the host cluster, act on member clusters).
+
+The `EngageOptions` type in `pkg/builder/multicluster_options.go` controls this:
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - if `true`, the controller watches resources in the **host cluster** (cluster name `""`),
+  - defaults to:
+    - `false` when a Provider is configured (focus on the fleet),
+    - `true` when no Provider is configured (single‑cluster mode).
+- **`WithEngageWithProviderClusters(bool)`**
+  - if `true`, the controller watches resources in **all clusters managed by the Provider**,
+  - has an effect only if a Provider is configured.
+
+You pass these as options to `For`, `Owns`, or `Watches`:
+
+```go
+// Watch ConfigMaps in all provider-managed clusters, but not in the host cluster.
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("baseline-config").
+    For(
+        &corev1.ConfigMap{},
+        mcbuilder.WithEngageWithLocalCluster(false),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(myReconciler)
+```
+
+Patterns:
+
+- **fleet‑wide uniform controller**
+  - `WithEngageWithProviderClusters(true)`, `WithEngageWithLocalCluster(false)` (when the host cluster is just a management plane).
+- **host‑only controller**
+  - `WithEngageWithLocalCluster(true)`, `WithEngageWithProviderClusters(false)` (for controllers that manage only local resources).
+- **hybrid controller**
+  - combine a host‑only controller (for CRDs storing desired state) with a fleet‑wide uniform controller that reads that state
+    and applies it per member cluster.
+
+---
+
+### Working with Composed Providers and Cluster Inventories
+
+Uniform reconcilers can run on top of any Provider:
+
+- **simple fleets**:
+  - `kind` / `file` / `kubeconfig` providers enumerate sets of clusters directly,
+  - the reconciler simply runs uniformly across that set.
+- **Cluster API–backed fleets**:
+  - the Cluster API provider discovers clusters from CAPI `Cluster` objects and their kubeconfig Secrets,
+  - the reconciler runs uniformly across those CAPI‑managed clusters.
+- **Cluster Inventory API–backed fleets (KEP‑4322 / KEP‑2149 / KEP‑5339)**:
+  - the Cluster Inventory API provider turns `ClusterProfile` objects into `cluster.Cluster` instances,
+  - `ClusterProfile.Status.Properties` and ClusterProperty IDs identify clusters and ClusterSets,
+  - credential plugins obtain per‑cluster `rest.Config`s.
+
+The **Multi Provider** (`providers/multi`) allows you to compose multiple such sources under distinct prefixes:
+
+- `kind#dev-cluster-1`, `kind#dev-cluster-2`,
+- `capi#prod-eu-1`, `capi#prod-us-1`, …
+
+From a uniform reconciler’s perspective:
+
+- `req.ClusterName` is an opaque string; you should not parse it,
+- you can still log or label by `ClusterName`,
+- and you can rely on Providers and inventories to ensure stability and uniqueness.
+
+This separation lets you reuse the **same uniform controller** across very different fleet‑management implementations.
+
+---
+
+### Error Handling and Disappearing Clusters
+
+In a dynamic fleet, clusters may disappear while work items for them are still in the queue.
+When that happens, calls like:
+
+```go
+cl, err := mgr.GetCluster(ctx, req.ClusterName)
+```
+
+may fail with `multicluster.ErrClusterNotFound`.
+
+To make this case safe by default:
+
+- the multi‑cluster Builder wraps your reconciler in a **`ClusterNotFoundWrapper`** unless you opt out,
+- the wrapper:
+  - calls your reconciler,
+  - if the returned error is (or wraps) `multicluster.ErrClusterNotFound`,
+  - it treats the reconcile as **successful** and **does not requeue**,
+  - otherwise it forwards the original result and error.
+
+This behaviour is usually what you want for uniform reconcilers:
+
+- if a cluster is gone, there is nothing left to reconcile for it,
+- repeatedly retrying those items would only waste resources.
+
+If you need custom handling (for example, metrics or specific Events), you can:
+
+- disable the wrapper via `WithClusterNotFoundWrapper(false)` on the Builder,
+- and detect `multicluster.ErrClusterNotFound` explicitly in your reconciler.
+
+Apart from this helper, error and retry semantics are identical to controller‑runtime:
+
+- returning an error causes a requeue via the rate‑limiting queue,
+- returning `ctrl.Result{RequeueAfter: ...}` schedules time‑based retries,
+- returning `ctrl.Result{}` and `nil` marks the work as successfully processed.
+
+---
+
+### Best Practices for Uniform Reconcilers
+
+To get the most out of this pattern:
+
+- **Keep reconciliation idempotent per cluster**
+  - Each reconcile in a given cluster should converge to the same desired state, regardless of history.
+  - Avoid global mutable state across clusters in the reconciler.
+- **Always log and measure with `ClusterName`**
+  - Include `req.ClusterName` in log fields and metrics labels,
+  - this makes debugging and per‑cluster SLOs much easier.
+- **Avoid cross‑cluster side effects**
+  - If your reconciler starts reading from one cluster and writing into another, it is no longer truly “uniform”;
+  - consider splitting responsibilities or moving to a multi‑cluster‑aware pattern instead.
+- **Resolve `cluster.Cluster` inside each reconcile**
+  - Call `mgr.GetCluster(ctx, req.ClusterName)` per reconcile instead of caching `cluster.Cluster` instances in long‑lived fields,
+  - Providers and the Manager may replace `cluster.Cluster` objects over time (for example when credentials rotate).
+- **Design for fairness and scale**
+  - Remember that a single controller may process events from many clusters:
+    - use `MaxConcurrentReconciles` and group‑kind concurrency settings to tune throughput,
+    - keep the amount of work per reconcile bounded.
+  - Advanced workqueue strategies (such as per‑cluster “fair queues”) are being explored,
+    but uniform reconciler logic does not need to change to benefit from them.
+
+When your use case evolves beyond “same logic in every cluster” – for example, coordinating rollouts across ClusterSets
+or aggregating data into a hub – look at the **Multi‑Cluster‑Aware Reconcilers** chapter for patterns that build on
+the foundations you established with uniform reconcilers.
+
+

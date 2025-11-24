@@ -1,0 +1,475 @@
+---
+title: Cluster API Provider
+---
+
+この章では、Cluster API の `Cluster` リソースからクラスターを検出する **Cluster API Provider**（`providers/cluster-api`）について解説します。  
+Cluster API（CAPI）を既にクラスターライフサイクル管理のソース・オブ・トゥルースとして利用している環境では、この Provider が `multicluster-runtime` とフリートを接続する最も自然な選択肢になります。
+
+Cluster API Provider は、ざっくり次のように動作します。
+
+- 管理クラスター上の CAPI `Cluster` リソースを watch する
+- 各 `Cluster` が **Provisioned** フェーズに到達し、kubeconfig が利用可能になるのを待つ
+- その kubeconfig から `cluster.Cluster`（Client / Cache / FieldIndexer）を構築する
+- 構築したクラスターを Multi-Cluster Manager に **Engage** して、マルチクラスターコントローラーから利用可能にする
+
+Provider の全体像については、「コアコンセプト — プロバイダー」(`03-core-concepts--providers.md`) を先に読んでおくと理解しやすくなります。  
+ここでは、とくに **Cluster API Provider 固有の構成・挙動・ユースケース** に焦点を当てます。
+
+---
+
+### Cluster API Provider を使うべき場面
+
+次のような場合に Cluster API Provider の利用を検討してください。
+
+- **Cluster API が既に導入されている**
+  - Workload クラスターを CAPI の `Cluster` リソースで管理している。
+  - 同じクラスター群に対してマルチクラスターコントローラーを実行したい。
+- **クラスターインベントリを Kubernetes API で一元管理したい**
+  - 管理クラスター上の API（`cluster.x-k8s.io`）がクラスター一覧のソース・オブ・トゥルースになっている。
+  - 別途 kubeconfig のファイルリストや外部レジストリを維持したくない。
+- **既存の CAPI 運用と整合させたい**
+  - CAPI が生成する kubeconfig Secret やステータスの意味をそのまま活かしたい。
+  - CAPI のラベル・アノテーション・条件などをもとにクラスターを選択したい。
+
+逆に、次のようなケースでは別の Provider が適しているかもしれません。
+
+- CAPI をまったく使っていない（File / Kubeconfig / Cluster Inventory API Provider などの方が自然）
+- CAPI の管理対象外のクラスター（既存の手作りクラスター、別のインベントリシステム管理下のクラスターなど）も混在している
+- 物理的には 1 クラスター内でマルチクラスター挙動をシミュレートしたい（Namespace Provider 向き）
+
+---
+
+### トポロジー: Cluster API Provider が収まる位置関係
+
+典型的な構成は次のようになります。
+
+- **管理クラスター（Management Cluster）**
+  - Cluster API（`cluster.x-k8s.io`）と `Cluster` リソースをホストする。
+  - CAPI `Cluster` を監視するための通常の `controller-runtime` の `manager.Manager`（以下 **ローカルマネージャー**）が動作する。
+- **Multi-Cluster Manager（mcmanager.Manager）**
+  - 同じ管理クラスター上で動作する。
+  - `multicluster.Provider` として Cluster API Provider を受け取り、フリートを管理する。
+- **Workload クラスター**
+  - CAPI によって作成・管理される。
+  - 管理クラスター上の Secret に格納された kubeconfig を通じてアクセスされる。
+
+`examples/cluster-api/main.go` では、これらのコンポーネントを以下のように接続しています。
+
+- まず **ローカルマネージャー** を作成:
+  - `ctrl.GetConfig()` で管理クラスターの `*rest.Config` を取得。
+  - `manager.New` で Manager を構築し、CAPI の `Cluster` 型を Scheme に登録。
+  - `corev1.Secret` は **キャッシュ対象外**（Always direct）にすることで、kubeconfig の更新を即座に反映できるようにする。
+- このローカルマネージャーを Cluster API Provider に渡す:
+
+  ```go
+  provider, err := capi.New(localMgr, capi.Options{})
+  ```
+
+- つづいて、同じ `*rest.Config` と Provider を使って **Multi-Cluster Manager** を作成:
+
+  ```go
+  mcMgr, err := mcmanager.New(cfg, provider, mcmanager.Options{ /* ... */ })
+  ```
+
+- 最後に **両方の Manager を起動** する:
+  - ローカルマネージャーは、CAPI `Cluster` を監視する Controller（Provider 内部の Controller）を実行。
+  - Multi-Cluster Manager は、マルチクラスター対応の Source / Controller を実行し、Engage 済みの全クラスターを束ねる。
+
+Reconciler の視点では、他の Provider を使う場合と変わりません。
+
+- `mcreconcile.Request` の `ClusterName` に CAPI クラスターを識別する文字列が入り、
+- `mcMgr.GetCluster(ctx, req.ClusterName)` で対象クラスターの `cluster.Cluster` を取得して処理するだけです。
+
+---
+
+### ディスカバリと Engage の仕組み
+
+Cluster API Provider の実装は `providers/cluster-api/provider.go` にあります。  
+実体は「**CAPI `Cluster` の Reconciler でありつつ、`multicluster.Provider` / `ProviderRunnable` も実装しているコントローラー」です。
+
+#### Provider の構築
+
+```go
+provider, err := capi.New(localMgr, capi.Options{})
+```
+
+`New` 関数は次のことを行います。
+
+- 渡された `Options` とロガー、ローカルマネージャーの `client.Client` を保存する
+- Provider 内部で利用する:
+  - `clusters` マップ（`ClusterName` → `cluster.Cluster`）
+  - `cancelFns` マップ（`ClusterName` → `context.CancelFunc`）
+  - `indexers` スライス（後から登録される Field Index 定義）
+  を初期化する
+- `setDefaults` を呼び出して `Options` をデフォルトで埋める:
+  - `GetSecret`:
+    - CAPI の `utilkubeconfig.FromSecret` を利用して kubeconfig Secret からバイト列を取得し、
+    - `clientcmd.RESTConfigFromKubeConfig` で `*rest.Config` に変換する。
+  - `NewCluster`:
+    - `cluster.New(cfg, opts...)` を利用して `cluster.Cluster` を生成する。
+- ローカルマネージャー上に CAPI `Cluster` 用の Controller を登録する:
+
+  - `builder.ControllerManagedBy(localMgr).For(&capiv1beta1.Cluster{}).WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(p)`
+  - これにより、Provider 自身が `capiv1beta1.Cluster` の Reconciler になる。
+
+さらに、Provider は `multicluster.ProviderRunnable.Start` も実装しており、Multi-Cluster Manager の `Start` の中で自動的に起動されます。  
+`Start` 自体は、渡された `multicluster.Aware`（Multi-Cluster Manager）を保存して、コンテキストの終了まで待機するだけです。
+
+#### CAPI `Cluster` の Reconcile ループ
+
+各 CAPI `Cluster` に対する `Reconcile(ctx, req)` の流れは次のとおりです。
+
+1. **CAPI `Cluster` の読み取り**
+   - ローカルマネージャーの Client を使って `req.NamespacedName` で `Cluster` を取得する。
+   - `IsNotFound` の場合（削除された場合）は:
+     - 内部 `clusters` マップから該当エントリを削除し、
+     - `cancelFns` に登録されているコンテキストをキャンセルし、
+     - 正常終了として返す。
+2. **Multi-Cluster Manager の起動待ち**
+   - `Start` がまだ呼ばれておらず `mcAware` が `nil` の場合、
+     - `reconcile.Result{RequeueAfter: 2 * time.Second}` を返して 2 秒後に再実行する。
+   - これにより、Multi-Cluster Manager が準備できる前に Engage を試みることを防ぐ。
+3. **Provisioned フェーズ以前のクラスターはスキップ**
+   - `ccl.Status.GetTypedPhase()` を参照し、
+   - フェーズが `capiv1beta1.ClusterPhaseProvisioned` でない場合は:
+     - 「まだプロビジョニング完了前」とログ出力して、そのまま成功として終了する。
+   - 後続のステータス更新（フェーズ変化）によって再度 Reconcile されることを期待している。
+4. **二重 Engage の防止**
+   - Provider は次の文字列を、このクラスターの `ClusterName` として利用する。
+
+     ```go
+     key := req.NamespacedName.String() // "<namespace>/<name>"
+     ```
+
+   - `key` がすでに `p.clusters` に存在する場合、「すでに Engage 済み」として何もせず終了する。
+5. **kubeconfig の取得**
+   - `opts.GetSecret(ctx, ccl)` を呼び出して `*rest.Config` を取得する:
+     - デフォルト実装では、CAPI 標準の kubeconfig Secret から「管理者」相当の kubeconfig を読み取る。
+     - Secret の名前付けや取得方法を変えたい場合は、`Options` で `GetSecret` をオーバーライドできる。
+6. **`cluster.Cluster` の生成と起動**
+   - `opts.NewCluster(ctx, ccl, cfg, opts.ClusterOptions...)` を呼び出して `cluster.Cluster` を生成する。
+   - これまでに `IndexField` で登録されていたすべての Field Index を、新しいクラスターの Cache に適用する。
+   - `context.WithCancel(ctx)` でクラスター専用の `clusterCtx` を作成し、ゴルーチンで Cache を起動する:
+
+     ```go
+     go cl.Start(clusterCtx)
+     if !cl.GetCache().WaitForCacheSync(ctx) {
+       cancel()
+       return error
+     }
+     ```
+
+   - Cache の同期が完了するまで待ってから、次の Engage に進む。
+7. **内部状態への登録と Engage**
+   - Provider 内のマップを更新する:
+     - `p.clusters[key] = cl`
+     - `p.cancelFns[key] = cancel`
+   - Multi-Cluster Manager（`mcAware`）に対して `p.mcAware.Engage(clusterCtx, key, cl)` を呼ぶ:
+     - これにより、該当クラスターが Multi-Cluster Manager に登録され、
+     - マルチクラスター Source とコントローラーがこのクラスターに対しても動作を開始する。
+   - `Engage` が失敗した場合はログにエラーを出力し、登録したクラスターとキャンセル関数を削除してエラーを返す。
+
+`clusters` / `cancelFns` / `indexers` へのアクセスは、すべて `sync.Mutex` で保護されています。  
+また、CAPI `Cluster` 用の Controller は `MaxConcurrentReconciles: 1` で構成されており、同じクラスターに対する並列 Engage を避けています。
+
+#### 削除時の Disengage
+
+CAPI `Cluster` が削除された場合（`IsNotFound`）:
+
+- Provider は内部マップから対応するエントリを削除し、
+- 登録されている `context.CancelFunc` を呼び出して、そのクラスター専用コンテキストをキャンセルします。
+
+Multi-Cluster Manager には明示的な「Disengage」メソッドはありません。その代わり:
+
+- `Engage` 時に渡したコンテキストがキャンセルされることで、
+- そのクラスターに紐づく Cache や Source、Controller が順次停止し、
+- そのクラスターからのイベントはこれ以上キューに入らなくなります。
+
+そのため、Reconciler 側では次のような挙動に備える必要があります。
+
+- `mcMgr.GetCluster(ctx, req.ClusterName)` が `multicluster.ErrClusterNotFound` を返す（フリートから離脱したとみなす）
+- 長時間動作する処理では、コンテキストキャンセル（`ctx.Done()`）を正しく検知して早期終了する
+
+---
+
+### クラスター名とアイデンティティ
+
+Cluster API Provider は、CAPI `Cluster` の **名前空間付き名前** を `ClusterName` として利用します。
+
+- 形式: `"<namespace>/<name>"`  
+  例:
+  - `capi-system/workload-eu-1`
+  - `prod-management/cluster-a`
+
+この選択には次のような性質があります。
+
+- 同一管理クラスター内で、Namespace と Name を組み合わせれば **一意** である。
+- CAPI `Cluster` オブジェクトのライフタイムにわたって **安定** している。
+
+一方で、SIG-Multicluster の標準（KEP-2149 など）とは別レイヤーの概念として扱われます。
+
+- KEP‑2149 は `ClusterProperty` CRD と、以下のような「よく知られたプロパティ」を定義しています。
+  - `cluster.clusterset.k8s.io`: ClusterSet 内で一意なクラスター ID
+  - `clusterset.k8s.io`: ClusterSet 自体の ID
+- Cluster API Provider は、これらの `ClusterProperty` から `ClusterName` を導出しているわけではなく、あくまで `namespace/name` 文字列を使っています。
+- もし About API / `ClusterProperty` CRD を併用している場合は:
+  - `ClusterName` は Multi-Cluster Manager / Controller 内部でのルーティングキーとして扱い、
+  - 実際の長期的なクラスター ID や ClusterSet 座標は、各 Workload クラスター内の `ClusterProperty` から取得する、といった使い分けが可能です。
+
+`providers/multi` などの合成 Provider を利用する場合は、Cluster API Provider にもプレフィックスを付けることで衝突を避けられます。
+
+- 例: `capi#capi-system/workload-eu-1`, `kind#dev-1` など
+- `ClusterName` を `"prefix#name"` 形式にして、どの Provider によるクラスターなのかを明示できます。
+
+Reconciler 側のベストプラクティスとしては、`ClusterName` を **不透明な文字列** とみなし:
+
+- ログやメトリクスのタグとしては利用する一方で、
+- 文字列の構造（`namespace/name` や `prefix#name` など）に依存したパースロジックは極力書かない、という方針が推奨されます。
+
+---
+
+### `Options` による Provider のカスタマイズ
+
+`providers/cluster-api/provider.go` には、Cluster API Provider を環境に合わせて調整するための `Options` 型が定義されています。
+
+```go
+type Options struct {
+  // cluster.Cluster を構築するときに渡すオプション。
+  ClusterOptions []cluster.Option
+
+  // CAPI Cluster から kubeconfig を取得し、*rest.Config を返す関数。
+  GetSecret func(ctx context.Context, ccl *capiv1beta1.Cluster) (*rest.Config, error)
+
+  // *rest.Config から cluster.Cluster を構築する関数。
+  // 実際の起動とライフサイクル管理は Provider が行う。
+  NewCluster func(ctx context.Context, ccl *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)
+}
+```
+
+デフォルトでは次のように振る舞います。
+
+- **`GetSecret`**
+  - CAPI の `utilkubeconfig.FromSecret` を利用して kubeconfig Secret を読み取り、
+  - `clientcmd.RESTConfigFromKubeConfig` で `*rest.Config` を構築します。
+- **`NewCluster`**
+  - `cluster.New(cfg, opts...)` をそのまま呼び出して `cluster.Cluster` を生成します。
+
+これらを上書きすることで、例えば次のような用途に対応できます。
+
+- 独自命名の kubeconfig Secret や別 Namespace にある Secret を利用したい
+- クラスタごとに異なる認証フロー（Workload Identity など）を組み込みたい
+- `cluster.Cluster` の生成時に Scheme / Rate Limit / Cache 設定などを細かく調整したい
+
+#### 例: Secret の名前付けをカスタマイズする
+
+環境によっては、CAPI のデフォルトとは異なる Secret 名（例: `<cluster-name>-admin`）を利用しているかもしれません。  
+その場合、デフォルト実装をラップして名前だけ差し替えることができます。
+
+```go
+provider, err := capi.New(localMgr, capi.Options{
+  GetSecret: func(ctx context.Context, c *capiv1beta1.Cluster) (*rest.Config, error) {
+    // Secret 名だけカスタマイズした NamespacedName を組み立てる
+    nn := types.NamespacedName{
+      Namespace: c.Namespace,
+      Name:      c.Name + "-admin",
+    }
+    bs, err := utilkubeconfig.FromSecret(ctx, localMgr.GetClient(), nn)
+    if err != nil {
+      return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
+    }
+    return clientcmd.RESTConfigFromKubeConfig(bs)
+  },
+})
+```
+
+#### 例: `cluster.Cluster` の構築方法をカスタマイズする
+
+クラスターごとに追加のオプションを渡したい / ラッパーで包みたい場合は、`NewCluster` を上書きできます。
+
+```go
+provider, err := capi.New(localMgr, capi.Options{
+  ClusterOptions: []cluster.Option{
+    // 例: ロガーやメトリクス、カスタムキャッシュオプションなど
+  },
+  NewCluster: func(ctx context.Context, c *capiv1beta1.Cluster, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error) {
+    // ここで opts を加工したり、検証を挟んだりできる
+    return cluster.New(cfg, opts...)
+  },
+})
+```
+
+これにより、たとえば:
+
+- Workload クラスターが独自 CRD を多数持っており、Scheme を明示的に登録したい場合
+- クラスターごとに異なるレートリミットやキャッシュ戦略を適用したい場合
+- クラスター単位でメトリクスやログのラベル付けを行いたい場合
+
+などにも柔軟に対応できます。
+
+---
+
+### マルチクラスターコントローラーへの組み込み例
+
+`examples/cluster-api/main.go` には、Cluster API Provider を使った end-to-end のサンプルが含まれています。大まかな流れは次のとおりです。
+
+1. **CAPI 型を Scheme に登録する**
+
+   ```go
+   func init() {
+     runtime.Must(capiv1beta1.AddToScheme(scheme.Scheme))
+   }
+   ```
+
+2. **管理クラスターに対するローカルマネージャーを作成する**
+
+   - `ctrl.GetConfig()` で `*rest.Config` を取得。
+   - `manager.New(cfg, manager.Options{ ... })` で Manager を生成。
+   - `Client.Cache.DisableFor: []client.Object{&corev1.Secret{}}` として、`Secret` はキャッシュせず API サーバーから直接取得するようにする。
+
+3. **Cluster API Provider をローカルマネージャーに対して生成**
+
+   ```go
+   provider, err := capi.New(localMgr, capi.Options{})
+   ```
+
+4. **Provider を渡して Multi-Cluster Manager を作成**
+
+   ```go
+   mcMgr, err := mcmanager.New(cfg, provider, mcmanager.Options{
+     LeaderElection: false,
+     Metrics: metricsserver.Options{
+       BindAddress: "0", // メトリクスはこのプロセスでは公開しない
+     },
+   })
+   ```
+
+5. **Multi-Cluster Manager 上にマルチクラスターコントローラーを登録**
+
+   ```go
+   if err := mcbuilder.ControllerManagedBy(mcMgr).
+     Named("multicluster-configmaps").
+     For(&corev1.ConfigMap{}).
+     Complete(mcreconcile.Func(func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+       cl, err := mcMgr.GetCluster(ctx, req.ClusterName)
+       if err != nil {
+         return reconcile.Result{}, err
+       }
+       // cl.GetClient() を使って Workload クラスター上のリソースを操作する
+       return ctrl.Result{}, nil
+     })); err != nil {
+     // セットアップ時のエラー処理
+   }
+   ```
+
+6. **ローカルマネージャーと Multi-Cluster Manager を並行起動する**
+
+   ```go
+   g, ctx := errgroup.WithContext(ctx)
+   g.Go(func() error { return ignoreCanceled(localMgr.Start(ctx)) })
+   g.Go(func() error { return ignoreCanceled(mcMgr.Start(ctx)) })
+   if err := g.Wait(); err != nil { /* ... */ }
+   ```
+
+実行時の挙動は次のようになります。
+
+- ローカルマネージャー上の CAPI Controller（Provider 内部）が `Cluster` リソースを Reconcile し、
+  - Provisioned になったクラスターの kubeconfig を読み取り、
+  - `cluster.Cluster` を作成・起動して、Multi-Cluster Manager に Engage します。
+- Multi-Cluster Manager は Engage 済みクラスターに対して:
+  - `Kind` Source や Cache を構築し、
+  - マルチクラスターコントローラーを起動し、
+  - 統合されたキューに `mcreconcile.Request{ClusterName: "<ns>/<name>", ...}` を投入します。
+
+Reconciler のコード自体は、CAPI そのものに依存しません。
+
+- CAPI Provider をやめて、将来的に Cluster Inventory API Provider などに切り替えても、
+- `ClusterName` と `GetCluster` さえ守られていれば、ビジネスロジックはそのまま動作させられます。
+
+---
+
+### Field Index の挙動
+
+Cluster API Provider は、`multicluster.Provider.IndexField` の契約を満たすように実装されています。
+
+- `IndexField(ctx, obj, field, extractValue)` が呼ばれると:
+  - `(obj, field, extractValue)` の組を内部 `indexers` スライスに保存し、
+  - 現在 Engage 済みのすべてのクラスターに対して `cl.GetCache().IndexField(...)` を即座に適用します。
+- その後、新しいクラスターが Engage されるたびに:
+  - これまで保存されていたすべての `indexers` をそのクラスターの Cache に再適用してから、
+  - Cache を同期し、`Engage` を呼び出します。
+
+これにより、マルチクラスターコントローラーは:
+
+- セットアップ時に一度 `mcMgr.GetFieldIndexer().IndexField(...)` を呼ぶだけで、
+- 既存のクラスターも、これから追加されるクラスターも、
+- 同じ Field Index を使って高速な参照ができるようになります。
+
+---
+
+### RBAC とセキュリティの考慮事項
+
+**管理クラスター** 上で、ローカルマネージャー（および Provider）が実行される ServiceAccount には、少なくとも次の権限が必要です。
+
+- CAPI `Cluster` リソースの読み取り:
+  - API グループ: `cluster.x-k8s.io`
+  - リソース: `clusters`
+  - 動詞: `get`, `list`, `watch`
+- kubeconfig Secret の読み取り:
+  - API グループ: `""`（core）
+  - リソース: `secrets`
+  - 動詞: `get`（必要に応じて `list` / `watch` も）
+  - 対象 Namespace は、CAPI `Cluster` が存在する Namespace に合わせる。
+
+**Workload クラスター** 側の権限は、`GetSecret` が返す kubeconfig の中身に依存します。
+
+- 多くの CAPI 実装では、デフォルトでかなり強い権限（cluster-admin など）を持つ kubeconfig を生成します。
+- マルチクラスターコントローラー用の専用アカウントを作成し:
+  - 必要最小限の RBAC に絞った kubeconfig を生成する、
+  - もしくは Workload Identity などの仕組みで外部認証を行う、
+  といった設計を検討してください。
+
+なお、Provider はローカルマネージャーの Client を介して CAPI `Cluster` や Secret にアクセスします。
+
+- ローカルマネージャーのキャッシュ設定やレートリミットは、そのまま:
+  - CAPI `Cluster` のステータス変化を検出する速さ、
+  - kubeconfig Secret の更新が Provider に伝わる速さ、
+  に影響します。
+
+`GetSecret` を独自実装で上書きして、KEP‑5339 で定義されるような Credential Plugin / Workload Identity Federation を組み込むことも可能です。その場合:
+
+- Provider は「最終的な `*rest.Config`」さえ得られればよく、
+- 認証情報のキャッシュ戦略やローテーションポリシーは `GetSecret` 実装側の責務になります。
+
+---
+
+### フェイルパターンとトラブルシュート
+
+運用上よく遭遇する挙動と、その見方をいくつか挙げます。
+
+- **クラスターがいつまで経っても Engage されない**
+  - 次の点を確認してください。
+    - CAPI `Cluster` が `Provisioned` フェーズに到達しているか
+    - 対応する kubeconfig Secret が存在し、Provider の ServiceAccount に読み取り権限があるか
+    - `GetSecret` / `NewCluster` がエラーを返していないか（`cluster-api-cluster-provider` ロガーの出力を確認）
+- **Reconciler が `ErrClusterNotFound` を受け取る**
+  - これは次のいずれかを意味します。
+    - 対応する CAPI `Cluster` が削除された / 存在しない
+    - まだ Provider が Engage していない（`Provisioned` 前、または kubeconfig 未取得）
+  - Reconciler 内では「クラスターがフリートから離脱した」とみなし、**再キューせず成功終了** するのが一般的です。
+- **Workload クラスターの認証情報やエンドポイントが更新された**
+  - 現状の実装では、すでに Engage 済みの `cluster.Cluster` を自動的に作り直すことはありません。
+  - 当面の対策としては:
+    - コントローラーデプロイメントを再起動して `cluster.Cluster` を作り直す、
+    - あるいは Provider の実装を拡張して kubeconfig / CAPI ステータスの変化を検知し、再構築する、
+    といったアプローチが考えられます。
+- **大量のクラスターを一度に扱う場合**
+  - CAPI `Cluster` Controller の `MaxConcurrentReconciles` は 1 に制限されており、クラスターの Engage は直列に処理されます。
+  - 非常に大規模なフリートでは、クラスターの立ち上がり時間がやや長くなるトレードオフがありますが、その分シンプルで安全な挙動になります。
+
+---
+
+### まとめ
+
+Cluster API Provider は、CAPI `Cluster` をソース・オブ・トゥルースとする環境で、`multicluster-runtime` を自然に統合するための Provider です。  
+管理クラスター上の CAPI `Cluster` と kubeconfig Secret をもとに `cluster.Cluster` を生成・ Engage し、Multi-Cluster Manager からは他の Provider と同様に `ClusterName` と `GetCluster` を通じて透過的に扱えるようにします。  
+これにより、Reconciler 側は CAPI 固有のロジックを埋め込むことなく、マルチクラスター対応のビジネスロジックに集中できます。

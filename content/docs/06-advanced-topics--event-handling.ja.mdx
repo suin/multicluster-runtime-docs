@@ -1,0 +1,516 @@
+---
+title: イベントハンドリング
+---
+
+この章では、Kubernetes のイベントが **複数クラスターをまたぐコントローラーの中でどのように流れるか** を詳しく見ていきます。  
+controller-runtime のイベントモデル（`Source` → `EventHandler` → Workqueue → `Reconcile`）に慣れている読者は、
+`multicluster-runtime` を「そのモデルに **クラスターという次元** を 1 つ追加したもの」と捉えると理解しやすいでしょう。
+
+ここでは次の点を扱います。
+
+- マルチクラスター **Source** がどのように複数クラスターからイベントを集約するか
+- **ハンドラー** がどのように `ClusterName` を各 Work Item に付与するか
+- **`EnqueueRequestForObject`** などのハンドラーをマルチクラスター環境でどう使うか
+- **マッピング関数** を使ったクロスクラスターの Watch パターン
+- フリート規模のイベントストリームを効率的かつ観測しやすく保つコツ
+
+この章は、次の内容を前提として話を進めます。
+
+- **Reconcile ループ**（`03-core-concepts--the-reconcile-loop.md`）
+- **Uniform Reconciler / Multi-Cluster-Aware Reconciler**
+  （`04-controller-patterns--*.md`）
+- クラスター ID やインベントリに関する KEP:
+  `ClusterProperty`（KEP-2149）、`ClusterProfile`（KEP-4322）、
+  および `ClusterProfile` 用の認証情報プラグイン（KEP-5339）
+
+---
+
+### controller-runtime におけるイベント処理の復習
+
+シングルクラスターの controller-runtime では、典型的なイベントパイプラインは次のようになります。
+
+- **Source**（`source.Source` / `source.Kind`）
+  - Informer や外部チャネルをラップし、
+  - 生のイベント（Create / Update / Delete / Generic）を型付きイベントに変換する。
+- **EventHandler**（`handler.EventHandler`）
+  - キューに積むべきキー（通常は `reconcile.Request`）を決め、
+  - それらを **RateLimitingQueue** に enqueue する。
+- **Controller**
+  - キューから `reconcile.Request` を取り出し、
+  - `Reconcile(ctx, req)` で Reconciler を呼び出す。
+
+`multicluster-runtime` はこのアーキテクチャを **そのまま再利用** します。
+
+- Cache / Informer / Queue といった基盤は controller-runtime のものを使い続けます。
+- `EnqueueRequestForObject` などおなじみのハンドラーも引き続き利用します。
+- ただし、すべての Work Item は **クラスター情報を持つキー** に拡張されます。
+
+---
+
+### マルチクラスター Request と ClusterAware なキュー
+
+マルチクラスターでの中心的な Request 型は `mcreconcile.Request` です（`pkg/reconcile/request.go`）。
+
+- **フィールド**
+  - `ClusterName string`  
+    この Work Item が属する論理クラスター名。  
+    空文字列（`""`）は常に **ローカル（ホスト）クラスター** を表します。
+  - `Request reconcile.Request`  
+    そのクラスター **内** のオブジェクトを表す、通常の `reconcile.Request`（`NamespacedName`）。
+
+内部では、マルチクラスター用の汎用インターフェースとして **`ClusterAware[request]`** が使われます。
+
+- 任意の `request` 型に対して:
+  - `comparable` であること
+  - `fmt.Stringer` を実装していること
+  - `Cluster() string` / `WithCluster(string) request` メソッドを持つこと
+
+`mcreconcile.Request` はこのインターフェースを実装しており、多くの場合はこれをそのまま使えば十分です。  
+より特殊なキーが必要な場合は、独自の `ClusterAware` な型を定義することもできます。
+
+キュー側では、`multicluster-runtime` は controller-runtime の
+`workqueue.RateLimitingInterface` をラップし、**クラスター対応キュー** を構成します。
+
+- `handler.clusterQueue`（`pkg/handler/lift.go`）
+  - `workqueue.TypedRateLimitingInterface[mcreconcile.Request]` をラップし、
+  - `Add` などでアイテムを入れるときに `ClusterName` を埋め込み、
+  - `Get` / `Done` などで取り出す・終わらせるときには期待される形に変換します。
+- `handler.clusterInjectingQueue`（`pkg/handler/inject.go`）
+  - 任意の `ClusterAware` な request 型に対して同様のラップを行います。
+
+これにより:
+
+- クラスターごとの Source は、従来どおりの controller-runtime ハンドラーをほぼそのまま使えます。
+- キュー内では常に **クラスター付きの Request** が扱われます。
+- Reconciler は常に正しい `ClusterName` を持った Request を受け取れます。
+
+`mcreconcile.Request` そのものについては、  
+「**コアコンセプト — Reconcile ループ**」の章も参照してください。
+
+---
+
+### マルチクラスター Source: 複数クラスターのイベントを 1 つのコントローラーへ
+
+マルチクラスター用の Source は `pkg/source` に定義されており、
+controller-runtime の `source` パッケージをジェネリクスで拡張した形になっています。
+
+- **`Source`**（`pkg/source/source.go`）
+  - `TypedSource[client.Object, mcreconcile.Request]` のエイリアス。
+  - 「`mcreconcile.Request` を生み出す Source」を表します。
+- **`TypedSource[object, request]`**
+  - `ForCluster(name string, cl cluster.Cluster) (source.TypedSource[request], error)` を持つインターフェース。
+  - 1 つの Kubernetes 型（`object`）と 1 つのクラスターから、controller-runtime の
+    `source.TypedSource[request]` を生成します。
+- **`SyncingSource` / `TypedSyncingSource`**
+  - 上記に加え `SyncingForCluster` / `WaitForSync` を持つバージョン。
+  - コントローラーがワーカーを開始する前に Cache Sync を待つことができます。
+
+代表的な実装は **`mcsource.Kind`**（`pkg/source/kind.go`）です。
+
+- 作成例:
+
+  ```go
+  src := mcsource.Kind(
+      &corev1.ConfigMap{},
+      mchandler.TypedEnqueueRequestForObject[*corev1.ConfigMap](),
+  )
+  ```
+
+- Engage 済みの各クラスターに対して、マルチクラスターコントローラーは内部で次を呼び出します。
+
+  ```go
+  clusterSrc, err := src.ForCluster(clusterName, clusterInstance)
+  ```
+
+  これにより:
+
+  - そのクラスター専用の Cache から対応する Informer が取得され、
+  - `clusterName` にバインドされた EventHandler が登録され、
+  - `source.TypedSource[mcreconcile.Request]` として controller-runtime の Controller に接続されます。
+
+- 起動時には、クラスターごとの Source が:
+  - 対象クラスターの Informer を監視し、
+  - Predicate を評価し、
+  - マルチクラスター対応のハンドラーを用いて、正しい `ClusterName` を持つ `mcreconcile.Request` を enqueue します。
+
+通常、`ForCluster` を直接呼び出す必要はなく、  
+Multi-Cluster Controller と Builder が内部でよしなに行ってくれます。
+
+#### クラスターごとの Projection
+
+`mcsource.Kind` は `WithProjection` による **Projection（変換）** もサポートしています。
+
+- `WithProjection(func(cluster.Cluster, object) (object, error))` により:
+  - クラスターごとに監視対象オブジェクトを変えたり、
+  - 特定の Namespace にスコープしたり、
+  - 一部のクラスターでのみ CRD を監視する、といったことが可能です。
+
+これは主に Provider やフレームワーク側のコードで利用されることが多く、
+一般的なアプリケーション Reconciler では直接触る必要はありません。
+
+---
+
+### クラスターを動的に Engage する Controller
+
+Multi-Cluster Controller の実体は `mcController`（`pkg/controller/controller.go`）で、
+これは通常の Typed Controller をラップしたものです。
+
+- `multicluster.Aware` を実装しています。
+  - `Engage(ctx, name string, cl cluster.Cluster)` が Manager / Provider から呼ばれ、
+  - 内部のマップ `{clusterName → cluster.Cluster}` にクラスターが登録されます。
+- `MultiClusterWatch` を公開しています。
+  - 一度 `mcsource.TypedSource` を登録しておくと、
+  - 現在 Engage 済みの **すべてのクラスター** に対して `ForCluster` を呼び、
+  - 将来新しく Engage されたクラスターに対しても同じ Source を適用します。
+
+Provider（Kind / Kubeconfig / Cluster API / Cluster Inventory API / Namespace など）が
+新しいクラスターを発見して Engage したときの流れは次のとおりです。
+
+1. Controller はそのクラスター専用の **子コンテキスト** を生成します。
+2. 登録済みのマルチクラスター Source それぞれに対して:
+   - `ForCluster(name, cl)` を呼び出してクラスター固有の Source を生成し、
+   - そのクラスター用コンテキストに紐づく `Start` 関数で controller-runtime Controller に `Watch` します。
+3. クラスターが削除されたり、コンテキストがキャンセルされると:
+   - クラスター用コンテキストがキャンセルされ、
+   - Source が停止し、
+   - `{clusterName → cluster}` マップからそのエントリが削除されます。
+
+Reconciler 作者の視点から見ると:
+
+- コード上ではこれまでどおり `mcbuilder.ControllerManagedBy(mgr)` でコントローラーを定義し、
+- クラスターの生死は Multi-Cluster Manager / Provider / Controller が面倒を見てくれます。
+- 自分は `mcreconcile.Request` に入っている `ClusterName` を見て処理するだけです
+  （クラスターが消えたあとの Work Item については `ErrClusterNotFound` の扱いに注意）。
+
+---
+
+### マルチクラスターにおける EnqueueRequestForObject
+
+controller-runtime の `handler.EnqueueRequestForObject` は、
+イベント元オブジェクト自身に対応する `reconcile.Request` を 1 つキューに積むハンドラーです。
+
+`multicluster-runtime` では、これをマルチクラスター用にラップしたものが `pkg/handler` に用意されています。
+
+- **`mchandler.EnqueueRequestForObject(clusterName string, cl cluster.Cluster)`**
+  - controller-runtime の `handler.EnqueueRequestForObject` をラップし、
+  - `mcreconcile.Request` を生成します。
+  - フレームワークや Provider 側でハンドラーを手動で配線するときに便利です。
+- **`mchandler.TypedEnqueueRequestForObject[object]()`**
+  - `TypedEventHandlerFunc[object, mcreconcile.Request]` を返します。
+  - `mcsource.Kind` やカスタム `Watches` に渡して利用します。
+
+多くのアプリケーションコントローラーでは、これらを直接意識する必要はありません。
+
+```go
+import mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("multicluster-configmaps").
+    For(&corev1.ConfigMap{}).
+    Complete(mcreconcile.Func(...))
+```
+
+このように Builder を呼ぶと、内部で:
+
+- マルチクラスター対応の `mcsource.Kind` が生成され、
+- 各クラスターからのイベントに対して、
+  `ClusterName` 付きの `mcreconcile.Request` が正しく enqueue されるようにハンドラーが配線されます。
+
+`mchandler.TypedEnqueueRequestForObject` を明示的に使うのは:
+
+- `Watches` で独自のイベント関係を構築したいとき
+- 自作の Source を実装するとき
+
+といった、より高度なケースに限られるでしょう。
+
+---
+
+### Owner ベースのハンドラーをマルチクラスターで使う
+
+`Deployment` が `ReplicaSet` を所有するような OwnerReference ベースの関係は、
+controller-runtime では `EnqueueRequestForOwner` で扱います。
+
+`multicluster-runtime` はこれをマルチクラスター対応させたラッパーを提供します。
+
+- **`mchandler.EnqueueRequestForOwner(ownerType client.Object, opts ...handler.OwnerOption)`**
+  - `EventHandlerFunc` を返し、
+  - クラスターごとの Scheme / RESTMapper を使って Owner を解決します。
+  - 「イベント元オブジェクトと同じクラスター」にある Owner に対する
+    `mcreconcile.Request` を enqueue します。
+- **`mchandler.TypedEnqueueRequestForOwner[object](ownerType client.Object, opts ...handler.OwnerOption)`**
+  - ジェネリック版。Typed Controller で利用します。
+
+Builder は `Owns` を使ったときに、これらをデフォルトで用いるようになっています。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("workload-controller").
+    For(&appv1alpha1.Workload{}).
+    Owns(&appv1alpha1.WorkloadReplica{}). // デフォルトでマルチクラスター対応
+    Complete(reconciler)
+```
+
+あるクラスターで `WorkloadReplica` にイベントが発生すると:
+
+- マルチクラスター対応の Kind Source がそのイベントを受け取り、
+- 同一クラスター内の `Workload` Owner を解決し、
+- 次のキーで `mcreconcile.Request` を enqueue します。
+  - `ClusterName` = イベント元クラスター名
+  - `Request.NamespacedName` = Owner の名前と Namespace
+
+`mchandler.*EnqueueRequestForOwner` を明示的に使うのは:
+
+- `Watches` を使ってカスタムな Owner 関係を張るとき
+- Controller でデフォルトと異なる OwnerOption を使いたいとき
+
+など、こちらも高度なケースに限られます。
+
+---
+
+### マッピング関数とクロスクラスター Watch
+
+マッピングハンドラーは、「1 つのオブジェクトから **任意の Work Item 群** を enqueue する」
+ための仕組みです。  
+controller-runtime では `EnqueueRequestsFromMapFunc` / `TypedEnqueueRequestsFromMapFunc` が用意されています。
+
+`multicluster-runtime` では、以下の 2 系統があります。
+
+- **「同一クラスターへマップする」ケース向け（クラスタ名を注入）**
+- **「別クラスターへマップする」ケース向け（クラスタ名を保持）**
+
+#### 同一クラスターへのマッピング（クラスタ注入あり）
+
+イベント元オブジェクトと **同じクラスター** に対して Work Item を enqueue したい場合は、
+次のラッパーを使います。
+
+- **`mchandler.EnqueueRequestsFromMapFunc(fn handler.MapFunc)`**
+- **`mchandler.TypedEnqueueRequestsFromMapFunc[object, request](fn handler.TypedMapFunc[object, request])`**
+
+これらは controller-runtime のマッピングハンドラーを **クラスタ注入付き** でラップしたものです。
+
+- マップ関数 `fn` は基本的に **クラスター非依存** に書きます。
+  - 多くの場合、`ClusterName == ""` の Request を返すだけです。
+- ラッパー側が、イベント元のクラスター名を `WithCluster` で注入して enqueue します。
+
+例: 各クラスターの `ConfigMap` 変更をトリガーに、
+同じクラスター内の `FleetConfig` を Reconcile する場合:
+
+```go
+import (
+    mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
+)
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-config").
+    For(&appv1alpha1.FleetConfig{}).
+    Watches(
+        &corev1.ConfigMap{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[*corev1.ConfigMap, mcreconcile.Request](
+            func(ctx context.Context, cm *corev1.ConfigMap) []mcreconcile.Request {
+                // ConfigMap と同じ Namespace にある FleetConfig を Reconcile したい。
+                key := types.NamespacedName{
+                    Namespace: cm.Namespace,
+                    Name:      "fleet-config",
+                }
+                return []mcreconcile.Request{{
+                    // ClusterName はハンドラー側が注入するので空でよい。
+                    Request: reconcile.Request{NamespacedName: key},
+                }}
+            },
+        ),
+    ).
+    Complete(reconciler)
+```
+
+ここで:
+
+- マップ関数はクラスターを一切意識していません。
+- ハンドラーがイベント元のクラスター名を注入し、適切な `ClusterName` で enqueue します。
+
+#### 別クラスターへのマッピング（クラスタ名保持）
+
+より高度なパターンでは、「イベントが発生したクラスター」と
+「Reconcile したいクラスター」が異なることがあります。
+
+- メンバークラスターのリソースの変化を観測しつつ、
+  **ハブクラスター** 上の CRD を Reconcile する。
+- あるクラスターインベントリを見て、**複数のメンバークラスター** に対する
+  Work Item をキューに追加する。
+
+このようなケースでは、マップ関数側で **ターゲットのクラスター名まで含めて**
+`mcreconcile.Request` を構築したい、というニーズが出てきます。
+
+その場合に使うのが:
+
+- **`mchandler.TypedEnqueueRequestsFromMapFuncWithClusterPreservation`**
+
+です。このラッパーは:
+
+- クラスタ名の注入を行わず、
+- マップ関数が設定した `ClusterName` を **そのまま保持** した Request を enqueue します。
+
+例: 各クラスターに `ClusterStatus` カスタムリソースがあり、
+それらの変化をトリガーに「ハブクラスター上の `FleetSummary` 1 つ」を Reconcile する場合:
+
+```go
+import (
+    mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
+)
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-summary").
+    For(&appv1alpha1.FleetSummary{}).
+    Watches(
+        &appv1alpha1.ClusterStatus{},
+        mchandler.TypedEnqueueRequestsFromMapFuncWithClusterPreservation[
+            *appv1alpha1.ClusterStatus,
+            mcreconcile.Request,
+        ](func(ctx context.Context, cs *appv1alpha1.ClusterStatus) []mcreconcile.Request {
+            // どのクラスターの ClusterStatus であっても、
+            // ハブクラスター（ClusterName == ""）上の FleetSummary を Reconcile したい。
+            return []mcreconcile.Request{{
+                ClusterName: "",
+                Request: reconcile.Request{
+                    NamespacedName: types.NamespacedName{
+                        Namespace: "fleet-system",
+                        Name:      "summary",
+                    },
+                },
+            }}
+        }),
+    ).
+    Complete(reconciler)
+```
+
+使い分けの指針は次のとおりです。
+
+- **`TypedEnqueueRequestsFromMapFunc` を使うべきケース**
+  - 「ターゲットクラスター ＝ イベント元クラスター」であり、
+  - クラスタ名はフレームワークに任せたいとき。
+- **`TypedEnqueueRequestsFromMapFuncWithClusterPreservation` を使うべきケース**
+  - マップ関数側で `ClusterName` を明示的に決めたいとき（ハブクラスター固定、多数のクラスターへの fan-out など）。
+
+---
+
+### どのクラスターのイベントを見るかを選ぶ（EngageOptions）
+
+イベントハンドリングは、「コントローラーが **どのクラスターを監視するか**」と密接に関係しています。  
+これは Builder の **EngageOptions**（`pkg/builder/multicluster_options.go` と
+「Uniform Reconciler」の章で詳述）で制御します。
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - `true` の場合、コントローラーは **ホストクラスター**（`ClusterName == ""`）のリソースを監視します。
+  - デフォルト値:
+    - Provider が設定されている場合: `false`（フリートに集中）
+    - Provider がない場合: `true`（シングルクラスターモード）
+- **`WithEngageWithProviderClusters(bool)`**
+  - `true` の場合、Provider が管理する **すべてのクラスター** のリソースを監視します。
+  - Provider が設定されている場合にのみ意味を持ちます。
+
+これらのオプションは `For` / `Owns` / `Watches` それぞれに渡せます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("hub-and-fleet").
+    // Primary CRD はハブクラスターだけで監視。
+    For(
+        &appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    // Deployment はフリート全体（Provider 管理クラスターすべて）で監視。
+    Watches(
+        &appsv1.Deployment{},
+        mchandler.TypedEnqueueRequestForOwner[*appsv1.Deployment](&appv1alpha1.FleetDeployment{}),
+        mcbuilder.WithEngageWithProviderClusters(true),
+        mcbuilder.WithEngageWithLocalCluster(false),
+    ).
+    Complete(reconciler)
+```
+
+代表的なパターン:
+
+- **ホスト専用コントローラー**
+  - `WithEngageWithLocalCluster(true)`  
+    `WithEngageWithProviderClusters(false)`
+- **フリート専用コントローラー**
+  - `WithEngageWithProviderClusters(true)`  
+    `WithEngageWithLocalCluster(false)`
+- **ハイブリッドコントローラー**
+  - 1 つのコントローラーの中で、`For` はホスト、`Watches` はフリートのように組み合わせる。
+
+EngageOptions は「**どのクラスターからイベントを飛ばすか**」を決めますが、
+Reconciler 自体は `mgr.GetCluster` を使って任意のクラスターに対して読み書きできます。
+
+---
+
+### 観測性: イベントと ClusterID / インベントリを紐づける
+
+マルチクラスター環境では、発生したイベントを **安定したクラスター ID** と結びつけて追跡できることが、
+運用やデバッグの観点から非常に重要です。
+
+ここで役立つのが、次の 2 つの API です。
+
+- **ClusterProperty**（KEP-2149 / About API）
+  - クラスタースコープのメタデータを `ClusterProperty` CRD で表現します。
+  - 既知のプロパティ `cluster.clusterset.k8s.io` には、
+    ClusterSet 内で一意な **クラスター ID** が入ります。
+  - `clusterset.k8s.io` には、そのクラスターが所属する **ClusterSet 名** が入ります。
+- **ClusterProfile**（KEP-4322 / Cluster Inventory API）と認証情報プラグイン（KEP-5339）
+  - `ClusterProfile` はインベントリ内のクラスターを 1 つずつ表現します。
+  - `status.properties` に ClusterSet やロケーション、クラウド種別などのメタデータが格納されます。
+  - `credentialProviders` と exec プラグイン（KEP-5339）で、そのクラスターに到達するための認証情報の取得方法を標準化します。
+
+イベントハンドリングやログ / メトリクス設計の際には、次を意識することを勧めます。
+
+- **ログやメトリクスに必ず `req.ClusterName` を含める**
+  - これにより、Controller 側のログやメトリクスを ClusterProperty / ClusterProfile 上の情報と簡単に突き合わせられます。
+  - たとえば、`cluster.clusterset.k8s.io` の値を Prometheus ラベルとして付与することで、
+    ClusterSet 単位でのエラー率や遅延を集計できます。
+- ハブクラスター側で集約用 CRD を Reconcile する場合:
+  - ClusterProfile や ClusterProperty そのものを Watch し、
+  - 各クラスターからの状態をこれらの CRD に集約するパターンを採用すると、他のマルチクラスター機能とも整合性が取りやすくなります。
+
+こうした設計により、`multicluster-runtime` ベースのコントローラーは、
+Multi-Cluster Services や Cluster Inventory、外部の監視基盤と自然に連携できるようになります。
+
+---
+
+### マルチクラスターのイベントストリームにおける性能とフェアネス
+
+単一のマルチクラスターコントローラーが **多数のクラスターからのイベントを 1 本のキューに集約する**
+という構造上、イベントハンドリングの設計はスケーラビリティと「フェアネス（公平性）」を強く意識する必要があります。  
+（この点は KubeCon EU 2025 のセッションでも詳しく議論されています。）
+
+推奨されるプラクティスは次のとおりです。
+
+- **Reconcile 1 回あたりの仕事を小さく・べき等に保つ**
+  - 1 回の Reconcile で行う仕事量は、クラスター数やオブジェクト数に対して「上限付き」になるように設計します。
+  - Handler / Source の内部では長時間ブロックする処理（ネットワーク I/O など）を避け、
+    それらは Reconciler 内で適切な再キュー戦略とともに行うようにします。
+- **並列度のチューニングを行う**
+  - controller-runtime の `MaxConcurrentReconciles` や GroupKind ごとの並列設定を利用してスループットを調整します。
+  - 並列度はクラスター間で共有されるため、1 クラスターだけが全体を専有しないように注意します。
+- **グローバルロックを避ける**
+  - クラスター全体やフリート全体に対して 1 つの大きな Mutex を掛けるような設計は避けます。
+  - 代わりに、オブジェクト単位・Namespace 単位のロックや、ハブ側の CRD による明示的な調整を検討します。
+
+`multicluster-runtime` 自体も、将来的にはクラスター間の処理をより公平にする
+**Fair Queue** のような仕組みを検討していますが、
+本章で説明したイベントハンドリングパターンは、現行の実装・将来の改良のどちらに対しても有効な設計になっています。
+
+---
+
+### まとめ
+
+`multicluster-runtime` におけるイベントハンドリングは、controller-runtime のモデルを拡張し、
+**クラスター対応の Request 型**・**マルチクラスター Source**・
+**`ClusterName` を注入 / 保持するハンドラー** を組み合わせたものです。
+
+- Provider と Multi-Cluster Manager がクラスターを発見・Engage し、
+- マルチクラスター Source が各クラスターのイベントを監視して `mcreconcile.Request` を enqueue し、
+- `EnqueueRequestForObject` / `EnqueueRequestForOwner` / 各種マッピングハンドラーのマルチクラスター版がキューへの積み方を制御し、
+- Reconciler は `req.ClusterName` と `mgr.GetCluster` を使って、対象クラスターに対するビジネスロジックに専念できます。
+
+とくにマッピング関数と EngageOptions の使い分けを理解しておくことで、
+フリート全体にわたるイベントストリームを、正しく・効率的に・観測しやすく扱えるようになります。

@@ -1,0 +1,178 @@
+---
+title: Why multicluster-runtime?
+---
+
+Modern Kubernetes platforms rarely stop at a single cluster. Whether due to isolation, geography, scale, cost optimisation, or differing control planes, most real-world environments end up managing a **fleet of clusters**. `controller-runtime` makes it easy to write single-cluster controllers, but it leaves several gaps once you try to reconcile across many clusters with the same codebase.
+
+`multicluster-runtime` exists to close that gap while staying as close as possible to the `controller-runtime` mental model. This chapter explains **why** the project exists, which problems it solves, and how it compares to other options.
+
+---
+
+### The multi-cluster problem space
+
+As fleets grow, platform teams typically need controllers that can:
+
+- **Discover and track a changing fleet**: clusters join, leave, or change properties over time.
+- **React to events within each cluster**: watch objects, index fields, and reconcile on changes.
+- **Coordinate across clusters where necessary**: e.g. schedule workloads based on location or capacity, aggregate health, or fan out configuration.
+- **Preserve the existing controller-runtime workflow**: reuse Managers, Builders, Reconcilers, and clients without rewriting everything around a new framework.
+
+Attempting this with plain `controller-runtime` alone quickly runs into challenges that are not obvious in a single-cluster world.
+
+---
+
+### What goes wrong with naive approaches
+
+Common ways to build multi-cluster controllers today include:
+
+- **One controller per cluster (classic model)**  
+  - Deploy a full controller stack (Manager, Cache, workqueue, Reconcilers) into every member cluster.  
+  - **Drawbacks**:
+    - Operational overhead grows linearly with cluster count.
+    - Upgrades, configuration changes, and observability must be coordinated across many deployments.
+    - Cross-cluster logic still needs an extra coordination layer.
+
+- **Many independent managers in one process**  
+  - Run one `manager.Manager` per target cluster in the same Pod.  
+  - **Drawbacks**:
+    - Each manager has its own caches, informers, workqueues, and metrics.
+    - Memory and CPU usage scale poorly with the number of clusters.
+    - Wiring watches and reconcilers across many managers becomes complex and error-prone.
+
+- **External process managers and bespoke frameworks**  
+  - Use a supervisor that starts one controller binary per cluster, or adopt a separate multi-cluster framework that does not share controller-runtime’s abstractions.  
+  - **Drawbacks**:
+    - Yet another process management plane to operate.
+    - Harder to reuse existing controller-runtime code or expertise.
+    - Often tied to a specific control-plane technology instead of being provider-agnostic.
+
+In all of these models, **reconcilers are written as if the world were single-cluster**, and the multi-cluster aspects (discovery, lifecycle, fan-out, back-pressure) are handled elsewhere with significant bespoke code.
+
+---
+
+### Design goals of multicluster-runtime
+
+`multicluster-runtime` is designed around a few core goals:
+
+- **Extend, don’t replace, controller-runtime**  
+  - Keep the familiar Manager / Builder / Reconciler / Source architecture.  
+  - Avoid forks, custom managers, or `go.mod` replaces.
+
+- **One Pod, Many Clusters**  
+  - Run a single controller process that can connect to a **dynamic fleet** of clusters.  
+  - Share as much infrastructure as possible (e.g. workqueues) while still giving each cluster its own cache and client.
+
+- **Provider-driven discovery and lifecycle**  
+  - Model “where do clusters come from?” as a pluggable `multicluster.Provider`.  
+  - Support a wide range of inventory sources (Cluster API, ClusterProfile, kubeconfig, Kind, files, namespaces, in-memory lists, and compositions of these).
+
+- **Minimal diff from single-cluster reconcilers**  
+  - Replace `reconcile.Request` with `mcreconcile.Request`, and use `mgr.GetCluster(ctx, req.ClusterName)` to obtain the right client.  
+  - Keep business logic mostly unchanged and remain fully compatible with single-cluster deployments.
+
+- **Align with SIG-Multicluster standards**  
+  - Treat **Cluster identity** (KEP-2149), **Cluster inventory** (KEP-4322), and **credential plugins** (KEP-5339) as first-class inputs to Providers.  
+  - Make it easier for controllers to plug into emerging multi-cluster platforms instead of reinventing these concepts.
+
+The architecture chapter goes deeper into how these ideas are realised in code; here we focus on why they matter in practice.
+
+See: [01-introduction--architecture.md](01-introduction--architecture)
+
+---
+
+### How multicluster-runtime changes the picture
+
+With `multicluster-runtime`, you still start from a `controller-runtime` Manager, but wrap it in a **multi-cluster-aware Manager** and plug in a Provider:
+
+- **Multi-cluster Manager**  
+  - Embeds a normal `manager.Manager` for the host cluster.  
+  - Exposes `GetCluster`, `GetManager`, `ClusterFromContext`, and `GetFieldIndexer` to work against specific member clusters.  
+  - Implements the `multicluster.Aware` interface so Providers can **engage** and **disengage** clusters at runtime.
+
+- **Providers as fleet adapters**  
+  - Each Provider knows how to discover clusters and build `cluster.Cluster` objects for them.  
+  - Examples:
+    - Cluster API Provider: reads CAPI `Cluster` resources.
+    - Cluster Inventory API Provider: consumes `ClusterProfile` objects and credential plugins aligned with KEP-4322 and KEP-5339.
+    - Kind / Kubeconfig / File / Namespace Providers: support local development, simple demos, and namespaces-as-clusters simulations.
+    - Multi / Clusters / Single / Nop Providers: composition and testing utilities.
+
+- **Unified controller pipeline**  
+  - Sources and handlers are registered once, but **fan out per engaged cluster**, feeding events into a single logical controller pipeline.  
+  - Reconcilers receive `mcreconcile.Request{ClusterName, Request}` and resolve the right `cluster.Cluster` at runtime.
+
+The result is that you can **scale from one to many clusters without rewriting your controllers**, and without proliferating managers and processes.
+
+---
+
+### Comparison with other multi-cluster approaches
+
+`multicluster-runtime` is not the only way to build multi-cluster controllers. Its niche is:
+
+- **Compared to raw controller-runtime plus custom wiring**  
+  - You could manually create multiple `cluster.Cluster` instances, manage their caches, and multiplex events into a single queue.  
+  - `multicluster-runtime` packages these patterns into reusable Manager, Provider, Source, and Builder components so every project does not have to solve them from scratch.
+
+- **Compared to dedicated multi-cluster frameworks or platforms**  
+  - Platforms like OCM, Clusternet, Fleet, or Karmada provide full management planes (scheduling, placement, rollout, policy, UIs).  
+  - `multicluster-runtime` operates at a lower level: it is a **Go library** for writing controllers, and can in fact consume those platforms’ cluster inventories via the ClusterProfile API (KEP-4322).
+
+- **Compared to other multi-cluster controller libraries**  
+  - Some libraries (e.g. earlier multi-cluster frameworks) define their own controller abstractions and managers.  
+  - `multicluster-runtime` intentionally stays as a **thin, generic extension** on top of upstream controller-runtime:
+    - No replacement Manager types to learn.
+    - No custom workqueue or reconciler patterns beyond adding `ClusterName`.
+    - Easier migration of existing controllers and sharing of ecosystem tooling.
+
+If you already use controller-runtime and want to scale to fleets, `multicluster-runtime` is designed to feel like the “native” path forward.
+
+---
+
+### When multicluster-runtime is a good fit
+
+You are likely to benefit from `multicluster-runtime` if:
+
+- **You already build controllers with controller-runtime** and want to adopt multi-cluster capabilities without abandoning that ecosystem.
+- **You manage tens or hundreds of clusters** and need a single controller binary to observe and act across them.
+- **You need both uniform and cross-cluster logic**:
+  - Enforce policies and baselines everywhere.
+  - Orchestrate workloads, certificates, or configuration across clusters.
+- **You want to integrate with standardized inventory and identity**:
+  - Consume `ClusterProfile` inventories and ClusterSets.
+  - Use credential plugins instead of baking per-environment authentication logic into every controller.
+
+---
+
+### When you might not need multicluster-runtime
+
+`multicluster-runtime` is not required for every controller:
+
+- **Purely single-cluster controllers**  
+  - If your controller will only ever run in one cluster, plain `controller-runtime` remains the simplest choice.
+  - You can still migrate later; multicluster-runtime aims to keep the diff small.
+
+- **Non-Go or non-controller-runtime projects**  
+  - If you are not using Go or controller-runtime, this library will not help directly—though the architectural ideas may still be useful.
+
+- **Fully managed multi-cluster platforms**  
+  - If your organisation already relies on a platform that provides all the controllers you need (and you do not plan to write your own), multicluster-runtime may be unnecessary.
+
+---
+
+### Why this matters for SIG-Multicluster and the ecosystem
+
+`multicluster-runtime` is developed under SIG-Multicluster as a **practical bridge** between evolving Kubernetes multi-cluster standards and everyday controller authors:
+
+- It treats **cluster identity** (KEP-2149) as the stable key for `ClusterName`.
+- It consumes **cluster inventory** from the **ClusterProfile API** (KEP-4322) via Providers.
+- It uses **credential plugins** (KEP-5339) to obtain `rest.Config` for each member cluster without hard-coding cloud-specific logic.
+
+By grounding multi-cluster controllers in these shared APIs, `multicluster-runtime` helps ensure that controllers you write today can participate in a broader ecosystem of schedulers, management planes, and tools—without giving up the familiar controller-runtime development experience.
+
+Next, continue with:
+
+- **Architecture**: [01-introduction--architecture.md](01-introduction--architecture)  
+- **Key Concepts**: [01-introduction--key-concepts.md](01-introduction--key-concepts)
+
+
+

@@ -1,0 +1,326 @@
+---
+title: Kind Provider
+---
+
+The **Kind provider** lets `multicluster-runtime` discover and connect to multiple local [Kind](https://kind.sigs.k8s.io/) clusters from a single controller process.  
+It is optimised for **development**, **testing**, and **demos** where you manage a small fleet of Docker‑backed clusters on your workstation or CI runner.
+
+This chapter explains:
+
+- **what the Kind provider does** and when to use it,
+- **how discovery and lifecycle management work**,
+- **how to configure it via `kind.Options`**, and
+- concrete **usage patterns and troubleshooting tips**.
+
+---
+
+### When to use the Kind provider
+
+Use the Kind provider when:
+
+- **Developing locally**:
+  - You want quick feedback loops against a handful of ephemeral clusters.
+  - You can create and destroy Kind clusters freely without impacting shared environments.
+- **Testing multi-cluster logic**:
+  - You want to validate your reconcilers across multiple clusters before plugging into a real inventory (Cluster API, ClusterProfile, kubeconfig Secrets, etc.).
+  - You want deterministic, scriptable clusters for CI jobs.
+- **Learning `multicluster-runtime`**:
+  - You are following the **Quickstart** or experimenting with controller patterns, and you need a simple fleet source.
+
+You should **not** use the Kind provider:
+
+- for **production fleets**,
+- when clusters live outside the local container runtime (for example, managed cloud clusters), or
+- when you already have a stronger source of truth such as **Cluster API** or the **Cluster Inventory API**.
+
+In those cases, prefer the **Cluster API**, **Cluster Inventory API**, **Kubeconfig**, or **File** providers instead.
+
+---
+
+### How the Kind provider discovers clusters
+
+The Kind provider implementation lives in `sigs.k8s.io/multicluster-runtime/providers/kind` and implements both:
+
+- `multicluster.Provider`, and
+- `multicluster.ProviderRunnable`.
+
+At runtime it behaves as follows:
+
+- **Discovery loop**
+  - Internally, it uses the Kind Go library (`"sigs.k8s.io/kind/pkg/cluster"`) to call `kind.List()` in a loop.
+  - The loop runs periodically (every few seconds) until the top‑level context is cancelled (for example, when the manager stops).
+  - On each iteration it calculates:
+    - **new clusters** that appeared since last time, and
+    - **clusters that disappeared** (were deleted with `kind delete cluster`).
+
+- **Name filtering with `Prefix`**
+  - Each discovered Kind cluster has a name such as `fleet-alpha` or `dev-cluster`.
+  - The provider exposes an optional `Prefix` field in `kind.Options`:
+    - if `Prefix` is empty: **all** Kind clusters are considered part of the fleet,
+    - if `Prefix` is non‑empty: only clusters whose names start with that prefix are included (for example, `"fleet-"`).
+  - This makes it easy to share a host with other Kind clusters (for example, personal experiments) while letting your controller focus only on the clusters it owns.
+
+- **Constructing `cluster.Cluster` instances**
+  - For each matching Kind cluster name, the provider:
+    - obtains its kubeconfig via `provider.KubeConfig(clusterName, false)`,
+    - turns that kubeconfig into a `*rest.Config`,
+    - applies any custom **REST options** (QPS, Burst, impersonation, etc.),
+    - creates a `cluster.Cluster` via `cluster.New(restConfig, options...)`,
+    - applies any previously registered **field indexers** to its cache,
+    - starts the cluster’s cache in its own goroutine and waits for it to sync,
+    - **engages** the cluster with the Multi-Cluster Manager.
+
+- **Removing clusters**
+  - If a cluster disappears from Kind’s `List` output:
+    - the provider cancels the context associated with that cluster,
+    - the cluster’s cache and informers stop,
+    - the cluster is removed from the provider’s internal map,
+    - subsequent `Get` calls for that name return `multicluster.ErrClusterNotFound`.
+  - Controllers typically rely on the **ClusterNotFound wrapper** so these stale requests are treated as successful and are not requeued.
+
+In short, the Kind provider turns **whatever Kind clusters currently exist on your machine** into a dynamic fleet for `multicluster-runtime`.
+
+---
+
+### Configuration: `kind.Options`
+
+You create a Kind provider with the `Options` struct:
+
+```go
+type Options struct {
+	// Prefix is an optional prefix applied to filter kind clusters by name.
+	Prefix string
+	// ClusterOptions is the list of options to pass to the cluster object.
+	ClusterOptions []cluster.Option
+	// RESTOptions is the list of options to pass to the rest client.
+	RESTOptions []func(cfg *rest.Config) error
+}
+```
+
+- **`Prefix`**
+  - Filters which Kind cluster names are considered part of the fleet.
+  - Recommended in almost all real projects so you do not accidentally pick up unrelated clusters.
+  - Examples:
+    - `Prefix: "fleet-"` → matches `fleet-alpha`, `fleet-beta`, etc.
+    - `Prefix: ""` → matches *all* Kind clusters on the host.
+
+- **`ClusterOptions`**
+  - Options forwarded to `cluster.New` from controller-runtime.
+  - Use this to:
+    - register additional API schemes,
+    - tune cache behaviour or rate limits,
+    - apply health probes or other cluster‑level options.
+  - In many simple examples this slice is left empty, relying on defaults.
+
+- **`RESTOptions`**
+  - Functions that mutate the generated `*rest.Config` before it is used.
+  - Typical uses:
+    - adjusting `QPS` / `Burst` limits for heavy test workloads,
+    - setting custom user agents for telemetry,
+    - configuring TLS details if you have a customised Kind setup.
+
+All three fields are optional; you can start with a minimal configuration and introduce advanced options later as needed.
+
+---
+
+### Wiring the Kind provider into a Multi-Cluster Manager
+
+In code, you typically:
+
+1. **Create the provider** with the desired options.
+2. **Create a Multi-Cluster Manager** using `mcmanager.New`.
+3. **Register controllers** using `mcbuilder.ControllerManagedBy`.
+4. **Start the manager**, which will start the provider automatically.
+
+The following is a minimal example (very similar to the Quickstart) that:
+
+- discovers Kind clusters whose names start with `fleet-`,
+- watches `ConfigMap` objects in all engaged clusters,
+- logs and emits an Event when a `ConfigMap` is found.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	"sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	log := ctrllog.Log.WithName("kind-example")
+	ctx := signals.SetupSignalHandler()
+
+	// 1. Discover Kind clusters whose names start with "fleet-".
+	provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+	// 2. Create a Multi-Cluster Manager wired to the Kind provider.
+	mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+	if err != nil {
+		log.Error(err, "unable to create manager")
+		os.Exit(1)
+	}
+
+	// 3. Register a simple uniform reconciler for ConfigMaps.
+	if err := mcbuilder.ControllerManagedBy(mgr).
+		Named("multicluster-configmaps").
+		For(&corev1.ConfigMap{}).
+		Complete(mcreconcile.Func(
+			func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+				log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+				log.Info("Reconciling ConfigMap")
+
+				cl, err := mgr.GetCluster(ctx, req.ClusterName)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+
+				cm := &corev1.ConfigMap{}
+				if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+					if apierrors.IsNotFound(err) {
+						return ctrl.Result{}, nil
+					}
+					return ctrl.Result{}, err
+				}
+
+				cl.GetEventRecorderFor("kind-multicluster-configmaps").Event(
+					cm,
+					corev1.EventTypeNormal,
+					"ConfigMapFound",
+					"ConfigMap found in cluster "+req.ClusterName,
+				)
+
+				log.Info("ConfigMap found",
+					"namespace", cm.Namespace,
+					"name", cm.Name,
+					"cluster", req.ClusterName,
+				)
+
+				return ctrl.Result{}, nil
+			},
+		)); err != nil {
+		log.Error(err, "unable to create controller")
+		os.Exit(1)
+	}
+
+	// 4. Start the manager (and, transitively, the Kind provider).
+	if err := mgr.Start(ctx); ignoreCanceled(err) != nil {
+		log.Error(err, "manager exited with error")
+		os.Exit(1)
+	}
+}
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+```
+
+Key points:
+
+- You do **not** call `Start` on the Kind provider yourself; `mcmanager.Manager` detects that it implements `ProviderRunnable` and starts it automatically when you call `mgr.Start(ctx)`.
+- Reconcilers receive `mcreconcile.Request`, which includes `ClusterName` plus the inner `reconcile.Request`.
+- `mgr.GetCluster(ctx, req.ClusterName)` returns a per‑cluster `cluster.Cluster` that behaves just like a standard controller-runtime cluster, with its own client and cache.
+
+For a step‑by‑step walkthrough of this example, including how to create Kind clusters and inspect Events, see **Getting Started — Quickstart**.
+
+---
+
+### Runtime behaviour and lifecycle details
+
+Some additional details that matter when operating the Kind provider:
+
+- **Polling interval**
+  - The provider uses a fixed polling interval (currently a few seconds) to re‑list Kind clusters.
+  - This is sufficient for development and CI; if you create or delete clusters, they will be recognised on the next poll.
+
+- **Concurrency and safety**
+  - Internal maps of clusters and cancel functions are protected by a read‑write mutex.
+  - `Get` is safe to call from multiple reconcilers concurrently.
+
+- **Field indexing**
+  - When you call `mgr.GetFieldIndexer().IndexField(...)`, the Multi-Cluster Manager forwards the registration to the provider.
+  - The Kind provider:
+    - records index definitions in memory, and
+    - applies them to:
+      - all **existing** clusters immediately, and
+      - any **newly discovered** clusters when they are created.
+  - This guarantees consistent indexing semantics even as clusters are added or removed.
+
+- **Cluster naming**
+  - `ClusterName` in `mcreconcile.Request` is exactly the Kind cluster name (for example, `"fleet-alpha"`).
+  - The provider does not add extra prefixes beyond whatever you set in `Options.Prefix`.
+  - Your reconcilers should treat `ClusterName` as an opaque string and avoid baking in Kind‑specific assumptions.
+
+---
+
+### Prerequisites and environment assumptions
+
+Because the Kind provider talks directly to the local container runtime and kubeconfig files:
+
+- The controller process must run in an environment where:
+  - the **Kind CLI** (`kind`) is installed and available in `PATH`,
+  - the underlying container runtime (typically Docker) is reachable.
+- This usually means:
+  - running the controller **on your workstation** during development, or
+  - running it in a CI job container that has access to Docker‑in‑Docker or a similar setup.
+
+You can still deploy a Kind‑backed controller into a Kubernetes cluster, but only if:
+
+- the Pod’s container image includes the `kind` CLI, and
+- the cluster nodes have access to the same Docker daemon where the Kind clusters live.
+
+Most users start with a **local binary** (`go run ./...`) rather than an in‑cluster deployment when using the Kind provider.
+
+---
+
+### Troubleshooting
+
+- **The manager fails to start with “failed to list kind clusters”**
+  - The Kind provider performs an initial `List` before entering the polling loop.
+  - Check that:
+    - `kind` is installed and in `PATH`,
+    - your process has permission to talk to the container runtime.
+  - Running `kind get clusters` manually in the same environment is a good sanity check.
+
+- **New Kind clusters are not discovered**
+  - Ensure their names match the configured `Prefix` (if any).
+  - Wait at least one polling interval after creating the clusters.
+  - Verify discovery by looking at controller logs for messages like `"Added new cluster"` and by running `kind get clusters`.
+
+- **Reconcilers see `ErrClusterNotFound`**
+  - This usually means:
+    - the Kind cluster was deleted after events were queued, or
+    - the cluster name never matched the provider’s prefix.
+  - By default, controllers created with `mcbuilder` use a `ClusterNotFound` wrapper that:
+    - treats this error as non‑fatal, and
+    - does not requeue the request.
+  - If you need custom metrics or logging, you can disable that wrapper and handle `ErrClusterNotFound` explicitly.
+
+- **Load testing many Kind clusters**
+  - Kind clusters are relatively heavy; running too many in parallel can exhaust local CPU or memory.
+  - Consider:
+    - keeping fleets small for local development (a handful of clusters),
+    - using the **Namespace provider** or other lightweight providers for large‑scale simulations,
+    - moving to a more realistic provider (Cluster API or Cluster Inventory API) when testing higher cluster counts.
+
+With these behaviours and caveats in mind, the Kind provider is an excellent starting point for exploring `multicluster-runtime` and validating multi-cluster controller designs on your laptop before integrating with production‑grade inventory systems.
+
+

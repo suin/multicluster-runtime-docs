@@ -1,0 +1,325 @@
+---
+title: Testing
+---
+
+This chapter describes how to **test controllers and providers built with `multicluster-runtime`**.  
+It builds on the controller-runtime testing story (envtest, fake clients) and adds patterns for
+dealing with multiple clusters and Providers.
+
+We will cover:
+
+- **What to test**: unit vs integration tests for multi-cluster logic.
+- **Unit tests**: testing reconcilers as plain Go code with fake managers and clusters.
+- **Integration tests with envtest**: spinning up one or many API servers to exercise real Providers and controllers.
+- **Provider testing patterns**: testing custom Providers and cluster lifecycle.
+- **Best practices**: speed, determinism, and how to simulate cluster failure or removal.
+
+---
+
+### What to Test in a Multi-Cluster Controller
+
+From a testing perspective, a `multicluster-runtime`–based system has three main layers:
+
+- **Business logic (your reconciler)**  
+  - Takes `context.Context` and `mcreconcile.Request`.  
+  - Decides **what should happen** (create/update/delete objects, emit events, pick target clusters, etc.).
+
+- **Multi-Cluster plumbing (Manager + Providers + Sources)**  
+  - `mcmanager.Manager`, `multicluster.Provider`, and multi-cluster `Source`s (`mcsource.Kind`, etc.).  
+  - Decide **which clusters exist**, **how events get tagged with `ClusterName`**, and **how caches and indexes work**.
+
+- **Real clusters (or envtest clusters)**  
+  - API servers exposed through `cluster.Cluster` instances.  
+  - Decide **how real Kubernetes behaviour** (admission, validation, status, CRDs) interacts with your logic.
+
+Most projects end up with three kinds of tests:
+
+- **Unit tests for reconcilers**  
+  - Exercise your reconcile logic directly with **fake managers/clients**.  
+  - Fast, hermetic, great for edge cases and error handling.
+- **Integration tests with envtest**  
+  - Run a real manager and controllers against one or more **envtest** API servers.  
+  - Validate that watches, Providers, and the Reconcile loop work together.
+- **Provider tests**  
+  - For authors of custom `multicluster.Provider` implementations.  
+  - Verify that clusters are discovered, engaged, disengaged, and indexed as expected.
+
+The rest of this chapter walks through recommended patterns for each of these.
+
+---
+
+### Unit Testing Reconcilers
+
+At the unit-test level, multi-cluster reconcilers are still just functions:
+
+- **Signature**: `Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error)`.
+- **Extra dimension**: `req.ClusterName` tells you which cluster to talk to.
+
+A good testing strategy is to **keep the reconciler’s dependencies small and injectable**.
+
+#### Structuring Reconcilers for Testability
+
+Instead of letting your reconciler reach out to a global `mcmanager.Manager`, introduce a small
+interface that captures just what it needs:
+
+```go
+type ClusterGetter interface {
+    GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
+}
+
+type AnimalReconciler struct {
+    Clusters ClusterGetter
+}
+
+func (r *AnimalReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Clusters.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // business logic using cl.GetClient(), cl.GetCache(), ...
+    return ctrl.Result{}, nil
+}
+```
+
+In production you pass the real `mcmanager.Manager` (which already implements `GetCluster`);  
+in tests you can pass a small fake:
+
+```go
+type fakeClusterGetter struct {
+    clusters map[string]cluster.Cluster
+}
+
+func (f *fakeClusterGetter) GetCluster(_ context.Context, name string) (cluster.Cluster, error) {
+    cl, ok := f.clusters[name]
+    if !ok {
+        return nil, multicluster.ErrClusterNotFound
+    }
+    return cl, nil
+}
+```
+
+You then decide how “real” each `cluster.Cluster` should be:
+
+- **Pure unit tests**  
+  - Use controller-runtime’s `fake.Client` with a tiny wrapper that implements just the methods your reconciler calls.
+  - Great when you want tests that run in milliseconds and do not touch a real API server.
+- **Lightweight integration-style unit tests**  
+  - Use `envtest` or `cluster.New` to build a real `cluster.Cluster`, but keep the rest of the test minimal.
+  - Useful when your logic depends on Kubernetes behaviour (owner references, server-side defaulting, etc.).
+
+#### Testing Cluster-Aware Behaviour
+
+The main new behaviours you typically want to unit-test are:
+
+- **Cluster-specific branching**  
+  - e.g. “in clusters in region `eu`, set this annotation; elsewhere use a different value”.
+  - Construct multiple `mcreconcile.Request`s with different `ClusterName`, and assert that:
+    - the correct client is called,
+    - the expected objects are created/updated in that cluster’s fake state.
+
+- **Error paths involving cluster lifecycle**  
+  - e.g. behaviour when `GetCluster` returns `multicluster.ErrClusterNotFound`.  
+  - Unit tests can simulate this simply by having the fake `ClusterGetter` return that error.
+  - If you rely on `ClusterNotFoundWrapper` (see below), assert that your reconciler returns that error and that
+    the wrapper turns it into a successful, non-requeued result.
+
+Keeping these behaviours covered by **small, focused unit tests** lets your integration tests concentrate on
+multi-cluster wiring rather than every edge case.
+
+---
+
+### Integration Tests with envtest (Single API Server, Many “Clusters”)
+
+Many multi-cluster scenarios can be tested efficiently against a **single Kubernetes API server**
+by using the **Namespace Provider** (`providers/namespace`):
+
+- **Idea**: run one envtest API server, and expose each namespace as a virtual `cluster.Cluster`.
+- **Benefit**: you get realistic controller-runtime caches, watches, and reconciliation,
+  but only pay for **one** API server startup.
+
+The high-level pattern, adapted from `providers/namespace` tests and the `namespace` example, is:
+
+- **1. Start an envtest environment**
+  - Use `envtest.Environment{}` and record its `*rest.Config`.
+  - Disable metrics binding if you do not need it (set `metricsserver.DefaultBindAddress = "0"`).
+
+- **2. Create a base `cluster.Cluster` and Namespace Provider**
+  - Build a `cluster.Cluster` with `cluster.New(cfg)`.
+  - Create a `namespace.Provider` with that cluster. It will:
+    - watch `Namespace` objects in the host cluster,
+    - expose each namespace name as a `ClusterName`,
+    - route all reads/writes through the underlying API server, scoped to that namespace.
+
+- **3. Wire a multi-cluster Manager and controller**
+  - Call `mcmanager.New(cfg, provider, mcmanager.Options{...})`.
+  - Register your controller with `mcbuilder.ControllerManagedBy(mgr)...Complete(...)`,
+    using an `mcreconcile.Request`-based reconciler, just like in production.
+  - Optionally call `mgr.GetFieldIndexer().IndexField(...)` to create **multi-cluster indexes** you want to test.
+
+- **4. Seed test data and start the system**
+  - Use a plain `client.Client` built from `cfg` to:
+    - create namespaces such as `zoo`, `jungle`, `island`,
+    - create `ConfigMap`s or other objects in those namespaces.
+  - Start the provider’s underlying cluster and the multi-cluster manager in background goroutines.
+
+- **5. Assert behaviour with Eventually-style checks**
+  - Use `Eventually` (or simple polling loops) to:
+    - wait for reconcilers to run and mutate resources,
+    - query per-cluster caches via `mgr.GetCluster(ctx, "zoo").GetCache().List(...)`,
+    - verify that multi-cluster indexes and `ClusterName` routing behave as expected.
+
+This pattern is ideal when:
+
+- you want to test **multi-cluster controller patterns** (uniform or multi-cluster-aware),
+- but you do not yet need separate API servers per cluster,
+- and you care about throughput and test run time.
+
+---
+
+### Integration Tests with Multiple API Servers
+
+For more realistic end-to-end tests—especially when working with Providers such as
+**File**, **Kubeconfig**, **Cluster API**, or **Cluster Inventory API**—you can start
+**one envtest.Environment per cluster**.
+
+Patterns used in the upstream tests include:
+
+- **Hub + member clusters (Cluster Inventory API Provider)**  
+  - Start one envtest for the **hub** (where `ClusterProfile` objects live).  
+  - Start one envtest per **member cluster** you want to model.  
+  - Create a `cluster-inventory-api` Provider that:
+    - reads `ClusterProfile` objects and their properties (KEP‑4322, KEP‑2149, KEP‑5339),
+    - obtains credentials for member clusters (via Secrets or credential plugins),
+    - exposes each member as a `cluster.Cluster`.  
+  - Create an `mcmanager.Manager` against the hub config and this Provider.  
+  - Register controllers using `mcbuilder`, start the manager, and:
+    - create `ClusterProfile` objects and secrets on the hub,
+    - create workloads (e.g. `ConfigMap`s) in member clusters,
+    - assert that reconcilers, indexes, and re-engagement logic work end to end.
+
+- **Local + remote clusters (Kubeconfig and File Providers)**  
+  - Start one envtest for the **local** cluster hosting the manager.  
+  - Start one envtest per **remote** cluster.  
+  - Materialize their kubeconfigs either:
+    - on disk (for the File provider), or
+    - in Secrets (for the Kubeconfig provider).  
+  - Build a Provider from those kubeconfigs and an `mcmanager.Manager` with it.  
+  - Use integration tests to verify that:
+    - clusters appear and disappear when kubeconfigs are added/removed,
+    - controllers see events from all clusters,
+    - reconcilers act on the right cluster based on `req.ClusterName`.
+
+- **Composed fleets (Multi Provider)**  
+  - Combine several underlying Providers under a single `multi.Provider`.  
+  - Start one envtest per underlying provider (for example, separate “cloud” clusters).  
+  - Assert that cluster names are prefixed correctly and that `mgr.GetCluster` routes to the
+    right underlying provider even when several clusters share similar names.
+
+These tests are heavier than Namespace-based ones, but they are the closest thing to a
+full integration environment:
+
+- they exercise **real cluster lifecycles** (credentials, disconnection, replacement),
+- they help validate your **Provider implementation** as well as controller logic,
+- and they are an excellent place to encode **regressions and bug fixes** found in production.
+
+---
+
+### Testing Custom Providers and Cluster Lifecycle
+
+If you are writing your own `multicluster.Provider`, you will usually embed
+`clusters.Clusters` from `pkg/clusters` and add discovery logic on top.
+
+Recommended tests for such providers typically:
+
+- **Start an envtest-based cluster for each member you want to simulate**  
+  - Use `envtest.Environment` and `cluster.New(cfg)` to build `cluster.Cluster` instances.
+  - Use `Clusters.Add` / `AddOrReplace` to register them under stable names.
+
+- **Run a real multi-cluster Manager in tests**  
+  - Create an `mcmanager.Manager` with your Provider.  
+  - Start the manager in a background goroutine.  
+  - Verify that:
+    - `mgr.GetCluster(ctx, name)` returns the cluster you added,
+    - `Clusters.Remove(name)` causes the manager to stop seeing it and that
+      reconcilers receive `multicluster.ErrClusterNotFound` when they try to use it.
+
+- **Exercise indexing and discovery behaviour**  
+  - Call `mgr.GetFieldIndexer().IndexField(...)` and verify that:
+    - the index exists on all existing clusters,
+    - new clusters added later also receive the index.  
+  - Use `List` calls against per-cluster caches to assert that cross-cluster field
+    indexes behave as documented.
+
+The `clusters` Provider tests show this pattern in a minimal setting:
+
+- one envtest cluster is started on demand,
+- added to a `clusters.Provider`,
+- then retrieved via an `mcmanager.Manager` and finally removed again to ensure
+  lifecycle and clean-up are correct.
+
+---
+
+### Testing Error Handling and Disappearing Clusters
+
+In a dynamic fleet, clusters can disappear while work items for them are still in the queue.
+`multicluster-runtime` provides helpers so your tests (and reconcilers) can handle this safely:
+
+- **`multicluster.ErrClusterNotFound`**  
+  - Returned when a `clusterName` is unknown or has been removed.  
+  - You can simulate this in tests by:
+    - calling `provider.Remove(name)` before reconciliation, or
+    - using a fake `ClusterGetter` that explicitly returns this error.
+
+- **`ClusterNotFoundWrapper`**  
+  - A wrapper around a `reconcile.TypedReconciler` (including `mcreconcile.Request` reconciliers).  
+  - If your reconciler returns an error that `errors.Is(err, multicluster.ErrClusterNotFound)`:
+    - the wrapper converts it into **success with no requeue**,  
+    - preventing infinite retries for a cluster that has left the fleet.
+
+When testing controllers that rely on this behaviour, you should:
+
+- **Assert that your reconciler returns `ErrClusterNotFound` in the right situations**  
+  - For example, when `mgr.GetCluster(ctx, req.ClusterName)` fails because the Provider has
+    dropped the cluster.
+- **Optionally assert wrapper semantics separately**  
+  - Wrap a tiny fake reconciler with `NewClusterNotFoundWrapper`, call `Reconcile`, and assert
+    that the returned `reconcile.Result` has no requeue and `error == nil` for that specific case.
+
+These tests make sure your controllers behave predictably when fleets are reconfigured,
+clusters are removed, or credentials are rotated.
+
+---
+
+### Best Practices for Testing Multi-Cluster Logic
+
+To keep your test suite fast, reliable, and informative:
+
+- **Prefer unit tests for business logic**  
+  - Push as much logic as possible behind small interfaces (`ClusterGetter`, typed clients, etc.).  
+  - Use fake clients or in-memory structures to exercise edge cases cheaply.
+
+- **Use envtest sparingly but deliberately**  
+  - **Namespace Provider** + a single envtest cluster is a great default for multi-cluster tests.  
+  - Only introduce multiple envtest clusters when you really need to test Provider-specific
+    behaviour or credential flows.
+
+- **Be explicit about `ClusterName` in tests**  
+  - Always include `ClusterName` in logs, metrics, and test failure messages.  
+  - When asserting on objects, double-check both the **cluster** and the **namespaced name**.
+
+- **Keep tests deterministic and bounded**  
+  - Use `Eventually` with reasonable timeouts, and keep the work per reconcile small.  
+  - Avoid depending on external services; envtest should be the only API server you talk to.
+
+- **Test both “happy path” and lifecycle edges**  
+  - Include tests where:
+    - clusters join and leave the fleet,
+    - kubeconfigs or credentials change and reconcilers re-engage clusters,
+    - indexes span multiple clusters and still behave as expected.
+
+With these patterns, you can build a test suite that gives you high confidence in both
+your **multi-cluster controller logic** and the **Providers** that underpin it, while
+remaining close to the familiar controller-runtime testing experience.
+
+

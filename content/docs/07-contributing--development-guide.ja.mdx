@@ -1,0 +1,688 @@
+---
+title: 貢献と開発ガイド
+---
+
+この章では、`multicluster-runtime` のコードベースに **どのように開発者として関わり、どのように貢献するか** を説明します。  
+対象はこのドキュメントリポジトリそのものではなく、`multicluster-runtime` 本体（Manager / Builder / Providers / Sources など）のコードです。
+
+ここでは次のようなトピックを扱います。
+
+- **リポジトリ構造** と、どこを見れば何を変更できるのか
+- **開発環境のセットアップ** とテストの実行方法
+- 既存のパターン（Uniform / Multi-Cluster-Aware）を踏まえた **コントローラー / プロバイダー開発の進め方**
+- **公開 API を変更するときの注意点** と、アップストリームへのコントリビュート手順
+
+---
+
+### このガイドの対象読者
+
+このガイドは、主に次の 3 つのロールを想定しています。
+
+- **コントローラー開発者**  
+  自分のプロジェクト向けにコントローラーを書いており、Kind / Kubeconfig / Cluster API / Cluster Inventory API などのプロバイダーを通じて `multicluster-runtime` をライブラリとして利用したい人。
+- **プロバイダー開発者**  
+  `multicluster.Provider` を実装・拡張して、自分のクラスタインベントリやプラットフォーム（ClusterProfile 実装、独自レジストリ、SaaS コントロールプレーンなど）と統合したい人。
+- **アップストリーム貢献者**  
+  コアライブラリや同梱のプロバイダーを直接変更し、`kubernetes-sigs/multicluster-runtime` リポジトリに Pull Request を送りたい人。
+
+ほとんどのセクションは 3 つすべてに共通しますが、プロバイダー開発やアップストリーム貢献に特有の点は明示します。
+
+---
+
+### リポジトリ構造
+
+`multicluster-runtime` のコードベースは、controller-runtime と同様のレイアウトと命名を採用しています。  
+主なディレクトリは次のとおりです。
+
+- **ルート**
+  - `go.mod`, `go.sum`: メインモジュール定義。
+  - `Makefile`: テスト・Lint・リリースツールのエントリポイント。
+  - `CONTRIBUTING.md`, `README.md`, `SECURITY.md`, `RELEASE.md`: プロジェクトのガイドラインやメタ情報。
+- **コアライブラリ（`pkg/`）**
+  - `pkg/manager`: マルチクラスタ対応 `Manager` インターフェースと実装。controller-runtime の `manager.Manager` と `multicluster.Provider` をラップします。
+  - `pkg/multicluster`: `Aware` / `Provider` / `ProviderRunnable` など、マネージャーとプロバイダーが共有するコアインターフェース。
+  - `pkg/builder`: マルチクラスタ版ビルダー（`mcbuilder`）。`mcreconcile.Request` やマルチクラスタ Source を扱えるようにした controller-runtime builder のフォークです。
+  - `pkg/reconcile`: `mcreconcile.Request` や `ClusterNotFound` ラッパーなど、Reconcile まわりの型とヘルパー。
+  - `pkg/source`: マルチクラスタ版の Source 実装（マルチクラスタ `Kind` Source など）。
+  - `pkg/clusters`, `pkg/context`, `pkg/controller`, `pkg/handler`: フリート管理・クラスタスコープの Manager・イベントハンドラーなどの補助パッケージ。
+- **プロバイダー（`providers/`）**
+  - `providers/kind`: ローカル開発用の Kind プロバイダー。
+  - `providers/file`: ファイルベースの kubeconfig プロバイダー。
+  - `providers/kubeconfig`: 管理クラスター上の Secret から kubeconfig を読むプロバイダー。
+  - `providers/cluster-api`: CAPI `Cluster` とその kubeconfig Secret を元にクラスターを発見するプロバイダー。
+  - `providers/cluster-inventory-api`: KEP‑4322 / KEP‑5339 による ClusterProfile / 認証情報プラグイン設計に沿った Cluster Inventory API プロバイダー。
+  - `providers/namespace`: Namespace を「仮想クラスター」として扱うプロバイダー。
+  - `providers/multi`, `providers/clusters`, `providers/single`, `providers/nop`: 合成・ユーティリティ用途のプロバイダー。
+  - 多くのプロバイダーは独立した `go.mod` と `OWNERS` を持ち、「**リファレンス実装**」としてメンテナンスされます。
+- **サンプル（`examples/`）**
+  - `examples/kind`, `examples/kubeconfig`, `examples/file`, `examples/cluster-api`, `examples/cluster-inventory-api`, `examples/namespace` など。  
+    それぞれが独立した Go モジュールであり、具体的なコントローラーとプロバイダーの組み合わせを示す `main.go` を含みます。
+- **Hack / ツール（`hack/`, `hack/tools/`）**
+  - `hack/check-everything.sh`: 検証スクリプト・テスト・サンプルビルドをまとめて実行。
+  - `hack/test-all.sh`: すべてのモジュールに対して envtest つき `go test` を実行。
+  - `hack/verify.sh`: `make modules` / `make imports` / `make lint` /（CI 環境では）`make verify-modules` を実行。
+  - `hack/tools/`: `golangci-lint`, `controller-gen`, `go-apidiff` などのツールを固定バージョンで管理。
+
+「どこに何があるかわからない」と感じたら、まずは本ドキュメントの該当章（Providers / Manager / Builder など）を読み、  
+続いて対応する `pkg/` や `providers/` のコードを参照する、という流れがスムーズです。
+
+---
+
+### 開発環境のセットアップ
+
+`multicluster-runtime` は、**「もし controller-runtime の一部だったらどう実装されるか」** を意識して開発されています。  
+Go のバージョン管理やテスト戦略、Lint ルールも controller-runtime に揃える方針です。
+
+- **前提条件**
+  - Go **1.24.9 以上**（Makefile で固定されているバージョンと合わせます。`make go-version` で確認可能）。
+  - POSIX シェル環境（Linux / macOS / WSL など）。
+  - Kind ベースのサンプルを動かす場合は、Docker などのコンテナランタイム。
+
+- **リポジトリのクローン**
+
+```bash
+git clone https://github.com/kubernetes-sigs/multicluster-runtime.git
+cd multicluster-runtime
+
+# プロジェクトが想定している Go ツールチェーンのバージョンを確認
+make go-version
+```
+
+- **モジュールの整備**
+
+```bash
+# すべての go.mod / go.sum を最新状態に
+make modules
+
+# すべてのモジュールで import の並び順を統一
+make imports
+```
+
+- **テスト＋検証フルスイートの実行**
+
+```bash
+# hack/check-everything.sh を実行:
+# - モジュールとフォーマットの検証
+# - envtest つき go test ./... の実行
+# - examples/* のビルド確認
+make test
+```
+
+内部的には `make test` は次のことを行います。
+
+- `setup-envtest` を用いて envtest 用の Kubernetes バイナリ群を取得する
+- すべてのモジュールに対して `go test -race ./...`（必要に応じて Ginkgo フラグ付き）を実行する
+- 各 `examples/*` モジュールを `go install` し、コンパイル可能であることを確認する
+
+日々の開発では、より小さな範囲でテストを回すこともできます。
+
+```bash
+# 特定モジュールだけテスト
+WHAT=./providers/kind make test
+
+# パッケージ単位で直接 go test を回す
+cd providers/kind
+go test ./...
+```
+
+- **Lint とフォーマット**
+
+```bash
+# すべてのモジュールに対して golangci-lint を実行
+make lint
+
+# 自動修正可能なものは --fix つきで修正
+make lint-fix
+```
+
+Pull Request を送る前に `make test` と `make lint` をローカルで通しておくことを強く推奨します。  
+CI でもほぼ同等のチェックが実行されます。
+
+---
+
+### サンプルの実行と変更
+
+`examples/` ディレクトリには、小さく自己完結したプログラムが多数含まれており、次のような点を確認できます。
+
+- 特定のプロバイダーを使った **マルチクラスターマネージャーの構築方法**
+- `mcbuilder.ControllerManagedBy` を使った **コントローラー登録**
+- `mcreconcile.Request` と `mgr.GetCluster` を使った **Reconcile 実装**
+
+典型的なワークフローは次のようになります。
+
+```bash
+# Kind プロバイダーのサンプル
+cd examples/kind
+
+# Kind クラスターをいくつか作成（詳細はクイックスタートを参照）
+kind create cluster --name fleet-alpha
+kind create cluster --name fleet-beta
+
+# サンプルコントローラーを実行
+go run ./main.go
+```
+
+これらのサンプルをベースに、次のような変更を試してみると理解が深まります。
+
+- 利用するプロバイダーの差し替え（Kind → File / Kubeconfig など）
+- 監視対象リソースや Reconcile ロジックの変更
+- Builder の `EngageOptions` を切り替え、ホストクラスター・プロバイダークラスター・両方のどこを監視するかを変えてみる
+
+サンプルは **「実行可能なドキュメント」** という位置付けなので、PR で編集する場合も学習しやすさを意識した変更に留めるのが理想です。
+
+---
+
+### multicluster-runtime を用いたコントローラー開発
+
+多くのコントローラーは、もともと普通の controller-runtime ベースのプロジェクトとして始まり、  
+後から少量の機械的な変更で **マルチクラスター対応** へ移行できます。
+
+- **1. マルチクラスタ Manager / Builder を使うようにする**
+  - controller-runtime の import をマルチクラスター版に置き換えます。
+
+```go
+import (
+    mcbuilder  "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager  "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind" // あるいは kubeconfig / cluster-api など
+)
+```
+
+  - 選択したプロバイダーを用いて `mcmanager.Manager` を作成します。
+
+```go
+provider := kind.New()
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+```
+
+  - コントローラー登録では、controller-runtime builder の代わりに `mcbuilder.ControllerManagedBy(mgr)` を利用します。
+
+- **2. Reconcile の引数を `mcreconcile.Request` に変更する**
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // クラスターごとのクライアントを利用
+    obj := &myv1alpha1.MyResource{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+        // ...
+    }
+
+    // ビジネスロジック
+}
+```
+
+それ以外の部分は、ほとんどの場合シングルクラスター版と同じままにできます。  
+あくまで「Reconcile のキーに ClusterName が増えた」というだけであり、  
+結果やエラーの扱いも controller-runtime と同じです。
+
+- **3. どのクラスターを監視対象にするか決める**
+
+Builder に渡す `EngageOptions` を通じて、次のどれを監視するかを制御できます。
+
+- **ローカル（ホスト）クラスター**
+- **プロバイダーが管理するメンバークラスター**
+- その両方（ハブ＆スポーク型などのハイブリッドパターン）
+
+具体的なパターンやマイグレーション手順は、  
+**「Controller Patterns — Uniform Reconcilers」** と **「Controller Patterns — Multi-Cluster-Aware Reconcilers」** を参照してください。
+
+---
+
+### プロバイダー開発とインベントリ統合
+
+プロバイダーは、`multicluster-runtime` と「自分たちのクラスタインベントリ／ID／認証情報モデル」を結び付ける場所です。  
+プロバイダーを新規実装・拡張する際は、次の点を意識するとよいでしょう。
+
+- **コアインターフェースを実装する**
+  - すべてのプロバイダーは少なくとも次を実装します。
+    - `multicluster.Provider`（必須）
+    - 必要に応じて `multicluster.ProviderRunnable`（長時間動作するディスカバリループが必要な場合）
+  - テスト用や静的なフリート用であれば、事前に構築した `cluster.Cluster` を返すだけのシンプルな `Provider` 実装でも構いません。
+
+- **Kubernetes API を監視する場合は controller-runtime のパターンを踏襲する**
+  - Cluster API や ClusterProfile などと連携するプロバイダー自身も、controller-runtime のコントローラーです。
+    - `builder.ControllerManagedBy(localMgr).For(&MyInventoryType{}).Complete(provider)` のように構成し、
+    - 「インベントリリソース → `cluster.Cluster`」という変換を Reconcile で行い、
+    - 新しいクラスターが利用可能になったタイミングで Multi-Cluster Manager に対して `Engage` を呼び出します。
+
+- **SIG-Multicluster の標準（KEP）に沿う**
+  - **KEP‑2149 (ClusterId)**: `ClusterProperty` を用いたクラスター ID 標準。
+  - **KEP‑4322 (ClusterProfile API)**: クラスタインベントリとステータスを表現するための API。
+  - **KEP‑5339 (Plugin for Credentials in ClusterProfile)**: 外部プラグインを用いて `rest.Config` を取得するための仕組み。
+  - これらを組み合わせたリファレンス実装として、`providers/cluster-inventory-api` が提供されています。
+
+- **合成しやすい設計にする**
+  - できるだけ小さく焦点の定まったプロバイダーを作り、次のような使い方ができるようにします。
+    - `multi` プロバイダーと組み合わせて、複数のソースを prefix 付きで統合する
+    - テストコードから `clusters` / `single` プロバイダー経由で再利用する
+    - グローバル変数ではなく `Options` 構造体を通じて設定を受け取る
+
+概念的な整理は **「Core Concepts — Providers」** 章、  
+具体的な API／オプションは **Providers Reference** 各章を参照してください。  
+実装例としては `providers/cluster-api` と `providers/cluster-inventory-api` のコードが特に参考になります。
+
+---
+
+### テスト戦略
+
+`multicluster-runtime` では、次のようなテストを組み合わせています。
+
+- **ユニットテスト**: コアパッケージや小さなヘルパーのロジックを高速に検証
+- **envtest ベースの統合テスト**: Kubernetes API を監視するプロバイダーや、複数モジュールにまたがる動作の検証
+- **サンプルのコンパイル確認**: `hack/check-everything.sh` による `examples/*` の `go install` 実行
+
+新しい機能を追加するときは、次のような方針を推奨します。
+
+- まずは **高速なユニットテスト** で大部分のロジックをカバーする
+- controller-runtime のキャッシュや envtest クラスターに依存する部分は **統合テスト** でカバーする
+- 機能を説明するサンプルプログラムがある場合は、それがコンパイルし続けるように保ち、必要ならドキュメントからも参照する
+
+Pull Request を送る前に `make test` をローカルで通しておくと、CI と同じテストを事前に確認できます。
+
+---
+
+### API 設計と互換性
+
+`multicluster-runtime` は controller-runtime のリリースにできるだけ追随し、  
+将来的には一部機能を controller-runtime 本体へ還元することも視野に入れています。  
+そのため、API を設計／変更する際は次の点に注意してください。
+
+- **可能な限り controller-runtime らしい API にする**
+  - 名前付け・オプションパターン・エラー処理などを controller-runtime に揃えます。
+  - 既存の抽象で表現できる場合は、新しい概念を増やさないようにします。
+
+- **公開型を変更するときは特に慎重に**
+  - `pkg/` や `providers/` にある公開シンボルは、ライブラリの外部 API 面です。
+  - `go-apidiff`（`make verify-apidiff`）により、`origin/main` との互換性が自動チェックされます。
+  - 意図的に互換性を崩す場合は、PR 説明や本ドキュメントで理由とマイグレーションパスを明示してください。
+
+- **プロバイダーは保守的に設計する**
+  - 同梱プロバイダーは「唯一の正解」ではなく、あくまでも **リファレンス実装** です。
+  - 特定環境に依存した前提を公開 API に埋め込まず、`Options` や設定で切り替えられるようにします。
+
+---
+
+### アップストリームへの貢献
+
+`multicluster-runtime` は SIG-Multicluster のサブプロジェクトとして開発されており、  
+Kubernetes コミュニティ全体のプロセスやガイドラインに従います。
+
+- **コミュニティと行動規範**
+  - すべてのコントリビューター／メンテナーは [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md) に従います。
+  - 上流の `CONTRIBUTING.md` から、Kubernetes Contributor Guide やメンタープログラムへのリンクを参照できます。
+
+- **Pull Request を開く前に**
+  - 大きな機能追加や設計変更は、まず SIG-Multicluster（例: Slack の `#sig-multicluster` チャンネルや KEP）で相談するのが望ましいです。
+  - ローカルで `make test`（可能なら `make lint` も）を実行しておきます。
+  - 変更内容をカバーするテストを追加・更新します。
+  - ユーザー向けの挙動やパターンに影響する場合は、このドキュメント群も更新します。
+
+- **PR の送信**
+  - GitHub の `kubernetes-sigs/multicluster-runtime` に対して PR を作成します。
+  - レビューしやすいように、コミットは小さく焦点の定まった単位に分け、メッセージも明確にします。
+  - レビュアーからのフィードバックには柔軟に対応してください。実際のところ、多くの PR は何度かのラウンドを経てマージされます。
+
+これらのガイドラインと、前章までで紹介したコントローラーパターンを踏まえることで、  
+`multicluster-runtime` 本体を拡張する場合も、その上に堅牢なマルチクラスターコントローラーやプロバイダーを構築する場合も、  
+安心して開発と貢献を進めることができます。
+
+### Contributing — 開発ガイド
+
+この章では、**multicluster-runtime** 本体や組み込み Provider にコントリビュートするためのローカル開発環境の整え方、テスト・Lint の実行方法、そして既存コードベースとなじむ形で変更を提案するためのポイントを説明します。  
+ライブラリの開発者はもちろん、内部構造を深く理解したい上級ユーザーにも役立つ内容です。
+
+multicluster-runtime は Kubernetes SIG のサブプロジェクトであり、CNCF の Code of Conduct と Kubernetes プロジェクト全体のコントリビューションガイドラインに従います。
+
+- **Code of Conduct**: すべてのコントリビューションは CNCF Code of Conduct に従う必要があります。
+- **Kubernetes コントリビューター向けドキュメント**: Issue / PR / レビューの進め方など、より一般的なルールは upstream の `CONTRIBUTING.md` と Kubernetes Contributor Guide を参照してください。
+
+---
+
+### リポジトリ構成（概要）
+
+upstream の multicluster-runtime リポジトリは、小さく分割されたコアパッケージ群、Provider 実装、実行可能な examples から構成されています。
+
+- **コアランタイム**
+  - `pkg/manager`: `multicluster.Provider` を埋め込んだマルチクラスター版の `Manager` 抽象。controller-runtime の Manager をラップします。
+  - `pkg/multicluster`: Provider やマルチクラスター対応コンポーネント用のインターフェイス（`Provider`, `ProviderRunnable`, `Aware` など）。
+  - `pkg/builder`: controller-runtime の builder をマルチクラスター対応にした `mcbuilder`。
+  - `pkg/reconcile`, `pkg/source`, `pkg/handler`, `pkg/controller`, `pkg/clusters`, `pkg/context`: それぞれ controller-runtime の対応するコンポーネントのマルチクラスター版。
+- **Providers**
+  - `providers/kind`, `providers/kubeconfig`, `providers/file`, `providers/cluster-api`, `providers/cluster-inventory-api`, `providers/namespace`, `providers/multi`, `providers/clusters`, `providers/single`, `providers/nop` など。
+  - 各 Provider は **独立した Go モジュール**（専用の `go.mod` / `go.sum` を持つ）として実装され、専用のテストや example を持つ場合もあります。
+- **Examples**
+  - `examples/kind`, `examples/kubeconfig`, `examples/file`, `examples/cluster-api`, `examples/cluster-inventory-api`, `examples/namespace` など。
+  - いずれも単体で動作する `main.go` を持ち、特定の Provider やコントローラーパターンをデモします。
+- **Hack / ツール**
+  - `hack/` にはテスト・検証・リリース作業向けのシェルスクリプトがまとまっています。
+  - `hack/tools` には API Diff やモジュール検証など、CI から利用される小さな Go 製ツールが入っています。
+
+新しい機能を追加する際は、可能な限り変更範囲を局所化するのが理想です。
+
+- コア抽象は `pkg/...` に、
+- Provider 固有のロジックは対応する `providers/...` モジュールに、
+- 利用例は `examples/...` に
+
+と分けることで、レビューしやすく保守しやすい構造を維持できます。
+
+---
+
+### 開発に必要な前提条件
+
+- **Go ツールチェーン**
+  - 利用する Go のバージョンはトップレベルの `Makefile` でピン留めされています。  
+    期待されるバージョンは次のコマンドで確認できます。
+    ```bash
+    make go-version
+    ```
+  - ローカル開発でも、ここで表示されたバージョン（もしくは互換性のあるパッチバージョン）を利用することを推奨します。`hack/check-everything.sh` は `GOTOOLCHAIN` を設定し、一貫した toolchain でテストが実行されるようにしています。
+- **Kubernetes 関連ツール（テスト・examples 用）**
+  - `kubectl`（クラスタ操作用）
+  - `kind` と Docker（Kind ベースの examples やローカルマルチクラスターシナリオを動かす場合）
+  - `envtest` バイナリや Go モジュール依存を取得するためのインターネット接続
+- **前提知識**
+  - `controller-runtime`（Manager / Controller / Reconciler）への基本的な理解
+  - 関連する KEP 群の概要
+    - クラスター識別（`ClusterProperty` / ClusterSet）
+    - クラスターインベントリ（`ClusterProfile`）
+    - `ClusterProfile` 用の認証プラグイン（Credential Plugin）
+
+---
+
+### リポジトリのクローン
+
+upstream のプロジェクトをクローンし、リポジトリルートに移動します。
+
+```bash
+git clone https://github.com/kubernetes-sigs/multicluster-runtime.git
+cd multicluster-runtime
+```
+
+以降で紹介する `make` や `hack/...` のコマンドは、特に断りがなければこのリポジトリルートで実行することを前提としています。
+
+---
+
+### テストの実行
+
+テストと基本的な検証を一括で行うための推奨エントリポイントは `test` ターゲットです。
+
+- **検証とテストをまとめて実行する**
+
+```bash
+make test
+```
+
+このターゲットは内部で:
+
+- `hack/check-everything.sh` を呼び出し、
+  - `hack/verify.sh`（コード生成・フォーマット・リポジトリ整合性チェックなど）を実行し、
+  - `hack/test-all.sh` を使ってルートモジュールとすべてのサブモジュールのテストを実行します。
+- さらに `examples/` 以下のすべての example を `go install` してビルド可能であることを確認します。
+
+特定のモジュールだけに絞ってテストを回したい場合は、次のように `WHAT` 環境変数を指定します。
+
+- **単一モジュールのテストを実行する**
+
+```bash
+# リポジトリルートから
+WHAT=./providers/kind hack/test-all.sh
+```
+
+`hack/test-all.sh` は:
+
+- `go.mod` を探索してモジュールリストを構築し、
+- `WHAT` が指定されていれば、そのモジュールのみに `go test ./...` を流し、
+- `setup-envtest` を使って `envtest` 用の API Server / etcd バイナリを自動取得・設定します。
+
+利用する Kubernetes バージョンを変えたい場合は、次のように `ENVTEST_K8S_VERSION` を設定したうえでテストを再実行できます。
+
+```bash
+export ENVTEST_K8S_VERSION=1.30.0   # サポートされている任意のバージョン
+```
+
+---
+
+### Lint とフォーマット
+
+本プロジェクトは `golangci-lint` を共通設定 (`.golangci.yml`) 付きで利用しています。  
+`Makefile` は適切なバージョンの `golangci-lint` を `hack/tools/bin` 以下にビルドしてキャッシュします。
+
+- **すべてのモジュールに対して Lint を実行する**
+
+```bash
+make lint
+```
+
+- **1 つのモジュールだけ Lint する**
+
+```bash
+make lint WHAT=./providers/file
+```
+
+- **自動修正可能な問題をまとめて修正する**
+
+```bash
+make lint-fix
+```
+
+`import` 順やグルーピングを整えたい場合は、専用ターゲットを利用できます。
+
+- **import の整形（リポジトリ全体 or モジュール単位）**
+
+```bash
+# リポジトリ全体
+make imports
+
+# 単一モジュール
+make imports WHAT=./pkg/manager
+```
+
+PR を送る前に `make lint` と `make imports` を実行しておくと、差分が小さくなりレビューしやすくなります。
+
+---
+
+### Go モジュールの管理
+
+multicluster-runtime はマルチモジュールリポジトリです。  
+ルート、各 Provider、多くの example がそれぞれ独自の `go.mod` / `go.sum` を持ちます。
+
+- **すべてのモジュールの `go.mod` / `go.sum` を更新する**
+
+```bash
+make modules
+```
+
+- **単一モジュールだけを更新する**
+
+```bash
+make modules WHAT=./providers/cluster-api
+```
+
+依存関係が tidy な状態であることを検証するには、次のターゲットを使います。
+
+- **モジュールが tidy であることを検証する**
+
+```bash
+make verify-modules
+```
+
+このターゲットは:
+
+- 必要に応じて `go mod tidy` の実行を促し、
+- 内部の `gomodcheck` ツールを用いて未使用・余分な依存関係を検出します。
+
+`verify-modules` が失敗した場合は、ローカルで `make modules` を実行し、生成された差分（`go.mod` / `go.sum`）を確認してから PR に含めてください。
+
+---
+
+### 作業ツリーのクリーンアップ
+
+ローカルのツールキャッシュや生成バイナリを削除したい場合は次のコマンドを利用します。
+
+```bash
+make clean
+```
+
+これにより `golangci-lint` のキャッシュと `hack/tools/bin` 以下の生成バイナリが削除されます。  
+生成バイナリだけを削除したい場合は、次のターゲットも利用できます。
+
+```bash
+make clean-bin
+```
+
+定期的に `make clean` を実行しておくと、古いツールや設定による誤動作を避けやすくなります。
+
+---
+
+### Examples をローカルで実行する
+
+`examples/` ディレクトリには、Provider やコントローラーパターンを実際に動かして確認できるプログラムがまとまっています。  
+これらは「統合テスト」と「ベストプラクティスのカタログ」を兼ねた存在です。
+
+examples を実行するには、それぞれの README に記載された前提条件（利用するクラスタ、必要な CRD / Secret など）を満たす必要があります。
+
+- **Kind Provider の例**
+  - テスト用に Kind クラスターを複数作成します。
+    ```bash
+    kind create cluster --name fleet-alpha
+    kind create cluster --name fleet-beta
+    ```
+  - example を実行します。
+    ```bash
+    cd examples/kind
+    go run ./main.go
+    ```
+  - 各クラスターでイベントやリソースの変化を監視し、マルチクラスターコントローラーがどのように動作するかを確認できます。
+
+- **Kubeconfig Provider の例**
+  - `examples/kubeconfig/scripts/` 以下のスクリプトを使って、管理クラスター上に kubeconfig Secret と対応する RBAC を作成します。
+  - その後、次のように example を実行します。
+    ```bash
+    cd examples/kubeconfig
+    go run ./main.go
+    ```
+
+その他の examples（File Provider、Cluster API Provider、Cluster Inventory API Provider、Namespace Provider など）もおおむね同じ流れです。
+
+1. バックエンドとなるクラスターや CRD（CAPI の `Cluster` や `ClusterProfile` など）を用意する
+2. example のバイナリを実行する
+3. Provider が検出したフリート上で、同じ Reconciler コードがどのように動くかを観察する
+
+---
+
+### 設計上の指針とインバリアント
+
+multicluster-runtime への変更は、プロジェクトが大切にしている設計原則と整合しているほどレビューしやすくなります。
+
+#### controller-runtime に寄り添う
+
+- ほとんどの抽象は、controller-runtime に対する **薄い型付きラッパー** です。
+- 新しい API を追加する場合は、次の点を意識してください。
+  - 可能な限り controller-runtime の型を再利用する
+  - 既存の命名・パターン（`Builder`, `Manager`, `Reconciler` など）を踏襲する
+  - Provider が設定されていない場合でも、**シングルクラスター** として自然に動作する
+
+もし「controller-runtime の大部分を書き直している」ような変更になりそうであれば、その機能は multicluster-runtime よりも controller-runtime 本体に適していないかを検討してください。
+
+#### マルチクラスターマネージャーと Provider
+
+マルチクラスターマネージャー（`pkg/manager`）は、通常の controller-runtime Manager をラップしつつ:
+
+- 名前から `cluster.Cluster` を取得するためのメソッド（`GetCluster`, `ClusterFromContext`）を追加し、
+- クラスターの検出と Engage を担う `multicluster.Provider` を保持します。
+
+Provider や Manager に手を入れる際は、次のインバリアントを守ることが重要です。
+
+- **Provider.Get**
+  - Engage されている間は、同じ論理クラスター名に対して常に同じ `cluster.Cluster` インスタンスを返します。
+  - クラスターが未知／削除済みの場合は、一貫した `ErrClusterNotFound` を返します。
+- **Provider.IndexField**
+  - **すでに Engage 済みのすべてのクラスター**に対してインデックスを適用し、
+  - 今後 Engage されるクラスターにも同じインデックスが適用されるようにします。
+  - マルチスレッド環境でも安全かつ効率的に動作する必要があります。
+- **ProviderRunnable.Start**
+  - コンテキストがキャンセルされるまでブロックする長時間稼働処理です。
+  - 渡された `multicluster.Aware` の `Engage(ctx, name, cluster)` を用いて、新しく利用可能になったクラスターをマネージャーに知らせます。
+  - クラスターが削除された際には、クラスター固有の goroutine やキャッシュを適切にクリーンアップします。
+
+たとえば Cluster API Provider は、CAPI の `Cluster` リソースを監視し、「Provisioned」フェーズになったら次のように処理します。
+
+1. 対象クラスター用の kubeconfig を取得する。
+2. その kubeconfig から controller-runtime の `cluster.Cluster` を生成する。
+3. クラスター内部のキャッシュとクライアントを起動する。
+4. `Engage` を呼び出し、マルチクラスターマネージャー側で当該クラスター向けのイベント処理が始まるようにする。
+
+#### ID / インベントリ / 認証モデルへの整合
+
+一部の Provider は、より広いマルチクラスター API 群と統合されています。
+
+- **クラスター識別（ClusterProperty）**: フリート横断で安定して照会できるクラスター ID を利用することで、クロスクラスターのオーケストレーションを安全に行えます。
+- **クラスターインベントリ（ClusterProfile）**: どのクラスターが存在し、どの ClusterSet に属しているかを示す「ソース・オブ・トゥルース」として扱います。
+- **Credential プラグイン**: Provider が認証情報をハードコードするのではなく、`ClusterProfile` に対する標準的なプラグインメカニズムに委譲します。
+
+これらの領域に関連する変更を行う場合は、対応する KEP の仕様を確認し、それと整合した挙動になっているかを意識してください。
+
+---
+
+### 新しいコードにテストを追加する
+
+意味のある変更には、基本的にテストをセットで追加することが望まれます。
+
+- **ユニットテスト**
+  - 個々のロジックを小さく分割し、依存をモック化したうえでテストするのが理想です。
+  - Provider に対しては、次の観点をカバーするとよいでしょう。
+    - クラスターライフサイクル（追加・更新・削除）の扱い
+    - kubeconfig や認証情報が欠落／不正な場合のエラーハンドリング
+    - `Get` / `IndexField` の正しい挙動
+- **統合テスト / envtest ベースのテスト**
+  - Kubernetes API マシナリ（コントローラー、キャッシュ、Webhook など）に依存する変更では、既存の envtest パターンを利用します。
+  - 各 Provider のテストスイート（`providers/...` 以下）では、軽量なコントロールプレーンを立ち上げ、Controller を end-to-end で検証する例が見られます。
+
+開発中に繰り返しテストを実行する際は、`WHAT=...` を指定して `hack/test-all.sh`（もしくは `make test`）を実行すると、対象モジュールだけを素早く回せます。
+
+---
+
+### Pull Request を送る前に
+
+変更を upstream に提案する際は、次のポイントを意識するとスムーズです。
+
+- **プロジェクトのスコープと整合しているか確認する**
+  - 似たアイデアが既に Issue や PR、ドキュメントで議論されていないかを確認します。
+  - 大きめの機能追加であれば、いきなり巨大な PR を出すのではなく、まずは設計文書（KEP やサブプロジェクトの設計ドキュメント）として方向性を合意してから実装に進むのが安全です。
+- **PR はできるだけフォーカスする**
+  - 単一の明確な目的に絞った小さめの PR の方が、レビューしやすくマージも早くなります。
+  - リネームやフォーマット変更など「機械的な変更」と、ロジック変更を同じ PR に混ぜないようにします。
+- **ローカルで各種チェックを実行する**
+  - 少なくとも次の 3 つは通してから PR を作成することを推奨します。
+    ```bash
+    make test
+    make lint
+    make verify-modules
+    ```
+  - これらで報告された問題は極力ローカルで修正したうえで Push します。
+- **Kubernetes プロジェクトの一般的なプロセスに従う**
+  - 必要に応じて CLA（Contributor License Agreement）へのサインを済ませます。
+  - 読みやすいコミットメッセージと PR 説明文を書くよう心がけます。
+  - マルチクラスター挙動や API 形状はレビュアーとの議論で数回の修正を経ることが多いので、フィードバックに対して柔軟に対応します。
+
+新しい Provider の追加や既存 Provider の拡張に関するコントリビューションを行う場合は、この章に加えて **Provider Ecosystem** の章も参照してください。どのような Provider をどのリポジトリに置くべきか、所有権や安定度のレベルについての方針が説明されています。
+
+---
+
+### この先に進むには
+
+ローカル開発環境を整え、テストと Lint を実行できるようになったら、次のステップとして以下のドキュメントを読むとよいでしょう。
+
+- **Provider Ecosystem**  
+  新しい Provider を提案する際のガイドライン、Provider をどこにホストすべきか、production-ready な Provider をどのように扱うかについて説明しています。
+- **Advanced Topics**  
+  Event Handling / Authentication / Cluster Identification / Testing といった高度なトピックは、新しいマルチクラスター機能を設計する際に頻繁に関係してきます。
+
+multicluster-runtime では、ドキュメント改善や小さなバグフィックスから、新しい Provider やコントローラーパターンの提案に至るまで、幅広いコントリビューションを歓迎しています。  
+最初の一歩としては、examples やテストコードを読み・改善してプロジェクトの流儀に慣れていくのがとてもおすすめです。

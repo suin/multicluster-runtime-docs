@@ -1,0 +1,239 @@
+---
+title: インストール
+---
+
+この章では、Go プロジェクトに `multicluster-runtime` を追加し、マルチクラスター対応のコントローラーを書ける状態にするまでの手順を説明します。  
+手順に進む前に、すでに **前提条件** を満たしていることを前提とします。
+
+---
+
+### ステップ 1. Go モジュールを新規作成するか既存モジュールを選ぶ
+
+- **新規プロジェクトの場合**  
+  まだモジュールを作成していない場合は、まず Go モジュールを用意します。
+
+```bash
+mkdir my-multicluster-controller
+cd my-multicluster-controller
+go mod init example.com/my-multicluster-controller
+```
+
+- **既存の controller-runtime プロジェクトの場合**  
+  すでに `sigs.k8s.io/controller-runtime` を使ったコントローラーがある場合は、そのまま既存モジュールを利用し、以降のステップで依存関係の追加とマルチクラスターマネージャーへの移行を段階的に進められます。
+
+---
+
+### ステップ 2. multicluster-runtime と controller-runtime を追加する
+
+まず、`multicluster-runtime` 本体と互換性のある `controller-runtime` を `go.mod` に追加します。
+
+```bash
+go get sigs.k8s.io/multicluster-runtime@v0.22.0-beta.0
+go get sigs.k8s.io/controller-runtime@v0.22.0
+```
+
+執筆時点で、upstream プロジェクト本体は次のバージョンを前提にビルドされています。
+
+- `sigs.k8s.io/controller-runtime v0.22.0`
+- `k8s.io/client-go v0.34.0`
+
+これらと整合したバージョンを利用することで、`controller-runtime` と `multicluster-runtime` の型不整合などの問題を避けやすくなります。  
+最新版のサポート状況は upstream の `go.mod` や pkg.go.dev を確認し、必要に応じて上記コマンドのバージョンを更新してください。
+
+---
+
+### ステップ 3. Provider モジュールを選択して追加する
+
+`multicluster-runtime` は、**Provider** を通じてクラスターを検出・管理します。  
+各 Provider は独立した Go モジュールとして提供されているため、利用したいものをプロジェクトに明示的に追加します。
+
+- **Kind Provider**（Kind クラスターを用いたローカル開発向け）
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kind@v0.22.0-beta.0
+```
+
+- **Kubeconfig Provider**（管理クラスター上の Secret に保存した kubeconfig を利用）
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kubeconfig@v0.22.0-beta.0
+```
+
+- **File Provider**（ローカルディスク上の kubeconfig ファイルを利用）
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/file@v0.22.0-beta.0
+```
+
+upstream の examples では、コアライブラリおよび Provider モジュールに共通して `v0.22.0-beta.0` を利用しています。  
+自分のプロジェクトでも通常は:
+
+- コアモジュールの `multicluster-runtime` に 1 つのバージョンをピン留めし、
+- Provider モジュールにも同じバージョン（例: `@v0.22.0-beta.0`）を指定する
+
+という形に揃えることを推奨します。
+
+他にも、**Cluster API Provider** や **Cluster Inventory API Provider**、**Namespace Provider**、**Multi Provider** などの組み込み Provider が存在し、同様に `go get` で追加できます。詳細な使い方は Provider リファレンスの各章を参照してください。
+
+> **Tip**: pkg.go.dev や GitHub のタグを確認し、より新しい安定版が利用可能であればバージョン番号を更新してください。
+
+---
+
+### ステップ 4. マルチクラスターマネージャーを配線する
+
+マルチクラスター対応を有効にするためには、従来の `manager.New` を `mcmanager.New` に置き換え、Provider を渡します。
+
+- **典型的な import 例**
+
+```go
+import (
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+```
+
+- **シングルクラスターの Manager（変更前）**
+
+```go
+mgr, err := manager.New(ctrl.GetConfigOrDie(), manager.Options{})
+if err != nil {
+    // handle error
+}
+```
+
+- **Provider を用いたマルチクラスターマネージャー（変更後）**
+
+```go
+provider := kind.New() // あるいはオプション付きで別の Provider を利用
+
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+if err != nil {
+    // handle error
+}
+```
+
+この時点で `mgr` は **マルチクラスターマネージャー** になります。
+
+- ホストクラスターに対しては、通常の `controller-runtime` の Manager と同様に振る舞います。
+- Provider を通じて追加のメンバークラスターを検出できます。
+- Reconciler からは `mgr.GetCluster(ctx, clusterName)` を使って、クラスターごとの client にアクセスできます。
+
+`multicluster.ProviderRunnable` を実装している Provider（**Kind** や **File** など）の場合は、`mgr.Start(...)` を呼び出すだけで Manager と Provider の双方が起動します。  
+一方、**Kubeconfig Provider** や **Cluster Inventory API Provider** のように、管理クラスター上の `Secret` や `ClusterProfile` を監視するタイプの Provider では、起動前に `provider.SetupWithManager(ctx, mgr)` を呼び出しておくことで、内部のコントローラーが正しく登録され、クラスターが動的に Engage されるようになります。
+
+---
+
+### ステップ 5. マルチクラスターコントローラーを登録する
+
+コントローラーは、マルチクラスター対応の builder である `mcbuilder` 経由で登録します。  
+シングルクラスターコードとの主な違いは次の 2 点です。
+
+- `controller-runtime` の builder の代わりに `mcbuilder.ControllerManagedBy(mgr)` を使うこと。
+- Reconciler が受け取るのが `reconcile.Request` ではなく、`ClusterName` と内側の `reconcile.Request` を含む `mcreconcile.Request` になること。
+
+例: すべての検出済みクラスターに対して `ConfigMap` の名前をログに出力するコントローラー
+
+```go
+err = mcbuilder.ControllerManagedBy(mgr).
+    Named("multicluster-configmaps").
+    For(&corev1.ConfigMap{}).
+    Complete(mcreconcile.Func(
+        func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            // 対象クラスターを解決
+            cl, err := mgr.GetCluster(ctx, req.ClusterName)
+            if err != nil {
+                return reconcile.Result{}, err
+            }
+
+            cm := &corev1.ConfigMap{}
+            if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                if apierrors.IsNotFound(err) {
+                    return ctrl.Result{}, nil
+                }
+                return ctrl.Result{}, err
+            }
+
+            // ここにビジネスロジックを実装
+            return ctrl.Result{}, nil
+        },
+    ))
+if err != nil {
+    // handle error
+}
+```
+
+コントローラーを登録したあとは、通常どおり Manager を起動します。
+
+```go
+if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+    // handle error
+}
+```
+
+Provider は新しいクラスターを順次 Engage し、各メンバークラスターに対する `mcreconcile.Request` が Reconciler に届くようにします。
+
+---
+
+### ステップ 6. ローカルで動かしてみる
+
+実際の実行方法は、選択した Provider によって変わります。
+
+- **Kind Provider**
+  - 1 つ以上の Kind クラスターを作成します（例: `kind create cluster --name fleet-alpha`）。
+  - 開発環境からこれらのクラスターに到達できることを確認します。
+  - コントローラーをローカルで実行します。
+
+    ```bash
+    go run ./...
+    ```
+
+- **File Provider**
+  - 指定した kubeconfig ファイルやディレクトリが存在し、期待するコンテキストが有効であることを確認します。
+
+- **Kubeconfig Provider**
+  - 管理クラスター上に kubeconfig を格納した Secret を用意します。
+    - upstream リポジトリの `examples/kubeconfig/scripts/create-kubeconfig-secret.sh` を使うと、RBAC 設定と kubeconfig Secret の作成を自動化できます。
+
+このドキュメントの **Quickstart** では、Kind Provider を用いて小さなフリートを構築し、実際にリコンサイルがどのように流れるかを観察するステップバイステップの手順を解説します。
+
+---
+
+### 既存の controller-runtime コントローラーを移行する（まとめ）
+
+すでに `controller-runtime` ベースのシングルクラスターコントローラーがある場合、`multicluster-runtime` への最小限の移行は概ね次のようになります。
+
+- **import の整理**
+  - 一部の `controller-runtime` import をマルチクラスター版に差し替えます。
+    - `sigs.k8s.io/multicluster-runtime/pkg/builder` を `mcbuilder` として import
+    - `sigs.k8s.io/multicluster-runtime/pkg/manager` を `mcmanager` として import
+    - `sigs.k8s.io/multicluster-runtime/pkg/reconcile` を `mcreconcile` として import
+  - 必要な Provider を `sigs.k8s.io/multicluster-runtime/providers/...` から import します。
+
+- **Manager の生成**
+  - `manager.New` を `mcmanager.New` に置き換え、Provider を渡します。
+
+- **Reconcile 関数のシグネチャ**
+  - `func(ctx context.Context, req reconcile.Request)` を `func(ctx context.Context, req mcreconcile.Request)` に変更します。
+  - 対象リソースを解決するときは、`req.ClusterName` と `req.Request.NamespacedName` を利用します。
+  - `mgr.GetCluster(ctx, req.ClusterName)` で正しいクラスターの client を取得します。
+
+これらの変更は、既存のビジネスロジックをほぼそのまま保ったまま、処理対象を「単一クラスター」から「クラスターのフリート」へ広げるための最小限の差分です。
+
+---
+
+### 次のステップ
+
+`multicluster-runtime` をプロジェクトに導入し、マルチクラスターマネージャーを配線したら、次に進みます。
+
+- Kind Provider を使ったステップバイステップのチュートリアル:  
+  - [02-getting-started--quickstart.md](02-getting-started--quickstart)
+- さらに深く学びたい場合:
+  - マルチクラスターマネージャーの詳細: [03-core-concepts--the-multi-cluster-manager.md](03-core-concepts--the-multi-cluster-manager)
+  - Provider の詳細: [03-core-concepts--providers.md](03-core-concepts--providers)
+  - 各 Provider ごとの詳細リファレンス: **Providers Reference** セクション

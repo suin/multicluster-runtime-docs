@@ -1,0 +1,412 @@
+---
+title: クラスター識別 (Cluster Identification)
+---
+
+この章では、`multicluster-runtime` における **クラスター識別** について掘り下げます。  
+具体的には、フレームワーク内で使われる **`ClusterName`** と、SIG‑Multicluster が定義する
+**ClusterID / ClusterSet**（KEP‑2149）や **ClusterProfile**（KEP‑4322）との関係、  
+そしてそれらを踏まえた **命名戦略・設計指針** を解説します。
+
+すでに以下の章を読んでいることを前提にします。
+
+- **コアコンセプト — クラスターオブジェクト** (`03-core-concepts--the-cluster-object.md`)
+- **コアコンセプト — プロバイダー** (`03-core-concepts--providers.md`)
+
+これらの章では、Reconciler が扱うのはあくまで `ClusterName` という文字列であり、  
+その裏側にある ClusterID や ClusterSet の実体は外部 API（ClusterProperty, ClusterProfile, など）が担う、  
+という大枠を説明しました。この章では、その結びつきをより具体的に整理していきます。
+
+---
+
+### なぜクラスター識別が重要なのか
+
+シングルクラスターのコントローラーにおいては、「どのクラスターに話しているか」は暗黙的です。
+
+- 接続先の API サーバーは 1 つ
+- 認証情報も 1 つ
+- ログやメトリクスのラベルも「このクラスター」だけを指せばよい
+
+一方、マルチクラスターコントローラーでは:
+
+- 1 つのプロセスが **多数のクラスター** に接続し、
+- それらが 1 つ以上の **ClusterSet** に属している可能性があり、
+- MCS（Multi-Cluster Services）、DNS、インベントリ、スケジューラ、監視基盤など  
+  複数のシステムが協調して動作します。
+
+そのため、多くの場合次の 2 つのレベルのアイデンティティが必要になります。
+
+- **ルーティング用アイデンティティ**
+  - `multicluster-runtime` の内部で「どの `cluster.Cluster` に送るか」を決めるためのキー
+  - Reconciler から見れば、`mgr.GetCluster(ctx, clusterName)` に渡す **`ClusterName`** がこれにあたります。
+- **グローバルなアイデンティティ**
+  - 他のシステム（MCS の DNS 名、ログ・メトリクス、インベントリやスケジューラ）が  
+    「同じクラスター」を指し示すための安定した **ClusterID**
+  - 多くの場合、`ClusterProperty` / `ClusterProfile` によって表現されます。
+
+この章では、次の前提に立って話を進めます。
+
+- `ClusterName` は主に **コントローラー内部でのルーティングキー**
+- ClusterID / ClusterSet は **SIG‑Multicluster 標準 (KEP‑2149, KEP‑4322)** に従う外部的なアイデンティティ
+- その 2 つの間に、**明確でドキュメント化されたマッピング** を持つのが理想
+
+---
+
+### SIG‑Multicluster のモデル: ClusterProperty と ClusterSet (KEP‑2149)
+
+KEP‑2149「ClusterId for ClusterSet identification」は、  
+クラスターのアイデンティティと ClusterSet への所属を Kubernetes ネイティブに表現するための標準を定義します。
+
+中心となるのは **`ClusterProperty`** CRD です。
+
+- **クラスタースコープ** のカスタムリソース（いわゆる About API）
+- 各オブジェクトは次の情報を持ちます:
+  - `metadata.name`: プロパティ名
+  - `spec.value`: 文字列値（最大 128k Unicode コードポイント）
+
+このうち、特に重要な **well-known properties** が 2 つ定義されています。
+
+- **`cluster.clusterset.k8s.io`**
+  - 対象クラスターの **ClusterID** を表す
+  - クラスターが属する **ClusterSet 内で一意**（存在している間）
+  - RFC‑1123 準拠の DNS サブドメインかつ 128 文字未満が推奨
+  - MCS の DNS 名（例:  
+    `clusterA.myservice.ns.svc.clusterset.local.`）を構成する要素として利用されます。
+
+- **`clusterset.k8s.io`**
+  - クラスターが所属する **ClusterSet の ID** を表す
+  - ClusterSet に属している間だけ存在し、脱退時には削除されるべき
+
+このモデルの重要な性質として:
+
+- **一意性と寿命**
+  - ある `cluster.clusterset.k8s.io` の値は、ある時点において  
+    同一 ClusterSet 内で一意でなければなりません。
+  - クラスター削除・再作成などにより、将来的に同じ ID が再利用されることは許容されています。
+  - ただし「ある ClusterSet に属している間」は ID を変更してはいけません。
+
+- **利用者 (Consumers) の前提**
+  - ClusterID は、少なくとも「その ClusterSet に属している期間」については  
+    安定な座標として扱えることが期待されます。
+  - MCS の DNS 名・ログ・メトリクス・外部ツールなどが、同じ ClusterID を使って  
+    「どのクラスターか」を認識できます。
+
+`multicluster-runtime` 自体は `ClusterProperty` オブジェクトを作成・更新しませんが、  
+MCS やマルチクラスター管理ソリューションを使っている環境では  
+すでにこの CRD が導入されていることが多く、コントローラーから参照可能です。
+
+---
+
+### クラスターインベントリと ClusterProfile (KEP‑4322)
+
+KEP‑4322「ClusterProfile API」は、ハブクラスター上に  
+「どのクラスターが存在し、どんな属性を持っているか」を表す **クラスターインベントリ API** を定義します。
+
+主なポイントは次の通りです。
+
+- 各 **メンバークラスター** は、ハブクラスター上の 1 つの `ClusterProfile` で表現される
+- その `status` には、クラスターのサマリが記録される
+  - **version**（Kubernetes バージョンなど）
+  - **properties**（名前と値のペア）
+    - ここに `cluster.clusterset.k8s.io` / `clusterset.k8s.io` といった  
+      ClusterID / ClusterSet 情報を含められる（KEP‑2149 と整合）
+  - **conditions**（`ControlPlaneHealthy`, `Joined` などの状態）
+  - **credentialProviders**（後述 KEP‑5339 で定義される認証プラグイン情報）
+
+`multicluster-runtime` の **Cluster Inventory API Provider** は、この `ClusterProfile` をソース・オブ・トゥルースとします。
+
+- ハブクラスター上で `ClusterProfile` を Watch / Reconcile し、
+- 既定では `ControlPlaneHealthy` 条件が `True` のときに **「利用可能なクラスター」** とみなし、
+- KEP‑5339 に準拠した **認証プラグイン** もしくはラベル付き Secret から kubeconfig を取得し、
+- `cluster.Cluster` を作成・起動したうえで、
+- `ClusterName = "<namespace>/<name>"` という名前で Multi-Cluster Manager に Engage します。
+
+この Provider を使うコントローラーから見れば:
+
+- `ClusterName` は `default/member` などの **`<namespace>/<name>` 形式** の安定したキー
+- `ClusterProfile.Status.Properties` に、  
+  ClusterID (`cluster.clusterset.k8s.io`) と ClusterSet ID (`clusterset.k8s.io`) が標準的に格納される
+- ログやメトリクスでは、`ClusterName` と ClusterID の両方をラベルとして扱うことができます
+
+---
+
+### `multicluster-runtime` はどこからクラスター名を得ているか
+
+`multicluster-runtime` の内部では、**`ClusterName` は単なる文字列**です。  
+どのような文字列にするかは、各 `Provider` の責務です。
+
+代表的な Provider ごとのパターンは次の通りです。
+
+- **ローカル（ホスト）クラスター**
+  - 特別な名前として **空文字 `""`** が予約されています（`LocalCluster` 定数）。
+  - Provider を設定しないシングルクラスター構成では、この 1 つだけが `ClusterName` になります。
+
+- **Kind Provider (`providers/kind`)**
+  - `ClusterName` は Kind のクラスター名そのもの（`kind create cluster --name=<name>` の `<name>`）
+  - `Options.Prefix` で名前にプレフィックスフィルタをかけることも可能
+  - 例: `"fleet-alpha"`, `"dev-b"`
+
+- **File Provider (`providers/file`)**
+  - ファイルパスと kubeconfig のコンテキスト名の組み合わせからクラスターを発見
+  - 各クラスターの名前は:
+    - `<絶対パス><Separator><コンテキスト名>`  
+      例: `"/clusters/prod/kubeconfig.yaml+eu-1"`
+  - `Separator` のデフォルトは `"+"` ですが、`Options.Separator` で変更可能
+
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+  - 特定 Namespace の Secret を Watch し、ラベル  
+    `sigs.k8s.io/multicluster-runtime-kubeconfig: "true"` が付いた Secret を対象とする
+  - 各 Secret に含まれる kubeconfig からクラスターを構築し、
+    - `ClusterName = <secret-name>` として公開
+  - どの Namespace を見るかは `Options.Namespace` で指定
+
+- **Cluster API Provider (`providers/cluster-api`)**
+  - 管理クラスター上の CAPI `Cluster` リソースを Watch
+  - 各 `Cluster` が `Provisioned` になり kubeconfig Secret が利用可能になると:
+    - `cluster.Cluster` を作成し、
+    - `ClusterName = "<namespace>/<name>"`（例: `"capi-system/workload-eu-1"`）で公開
+
+- **Cluster Inventory API Provider (`providers/cluster-inventory-api`)**
+  - ハブクラスター上の `ClusterProfile` を Watch
+  - 準備が整った `ClusterProfile` ごとに:
+    - kubeconfig を取得して `cluster.Cluster` を作成し、
+    - `ClusterName = "<namespace>/<name>"`（例: `"default/member"`）で公開
+
+- **Namespace Provider (`providers/namespace`)**
+  - 単一の Kubernetes クラスター内の各 Namespace を「仮想クラスター」として扱う
+  - 各 `Namespace` オブジェクトに対して `NamespacedCluster` を生成し、
+    - `ClusterName = <namespace-name>`（例: `"team-a"`, `"sandbox-1"`）として Engage
+
+- **Single Provider (`providers/single`)**
+  - 事前に構築した 1 つの `cluster.Cluster` を、任意の名前でラップする
+  - `ClusterName` は `single.New(name, cluster)` に渡した `name`
+
+- **Clusters Provider (`providers/clusters`)**
+  - 事前に構築した複数の `cluster.Cluster` を、任意の名前で公開する実験的 Provider
+  - 内部では `pkg/clusters.Clusters` を利用し、名前とクラスターのマップを管理
+
+- **Multi Provider (`providers/multi`)**
+  - 複数の Provider を 1 つの `multicluster.Provider` として合成する
+  - 各 Provider は `"kind"`, `"capi"` のような **provider 名** で登録される
+  - 外側の `ClusterName` は常に:
+    - `"<providerName><Separator><innerClusterName>"`  
+      例: `"kind#dev-a"`, `"capi#capi-system/workload-eu-1"`
+  - `Separator` のデフォルトは `"#"` だが、`Options.Separator` で変更可能
+
+- **Nop Provider (`providers/nop`)**
+  - 常に `ErrClusterNotFound` を返すダミー Provider
+  - コードをマルチクラスター対応のまま保ちつつ、実際にはフリートを持たない構成で便利
+
+これらに共通するのは:
+
+- **一意性は Provider のインスタンス内で保証** されていればよい
+- `ClusterName` の構造（`<namespace>/<name>` や `kind#dev` など）は  
+  あくまで Provider の実装詳細であり、Reconciler は **不透明な文字列** として扱うのが前提  
+
+---
+
+### `ClusterName` と ClusterID / ClusterSet の対応づけ
+
+このように Provider ごとに命名規則が異なる中で、  
+`ClusterName` と KEP‑2149 / KEP‑4322 が定義する **ClusterID / ClusterSet** を  
+どのように対応づければよいでしょうか。
+
+実務上は、次のような指針が有用です。
+
+- **`ClusterName` は「内部ルーティング用キー」と割り切る**
+  - 満たすべき要件は:
+    - Provider（および `providers/multi` のプレフィックス適用後）のフリート内で一意であること
+    - 「同一とみなすクラスター」である限り、安定していること
+  - Namespace 名やファイルパス、Provider 名など、実装依存の情報を含んでいて構いません。
+
+- **`cluster.clusterset.k8s.io` をグローバルな ClusterID とみなす**
+  - MCS の DNS、ログ、監視、外部ツールなど、他のコンポーネントと連携するための座標として利用します。
+  - 多くの環境では UUID あるいは長寿命な人間可読 ID が設定されます。
+  - `ClusterName` と同じである必要はなく、むしろ異なる方が扱いやすい場合もあります。
+
+- **Cluster Inventory API Provider を使う場合**
+  - `ClusterName` は `ClusterProfile` の `"<namespace>/<name>"` です。
+  - 対応する ClusterID / ClusterSet は:
+    - `ClusterProfile.Status.Properties` の中の  
+      `name: cluster.clusterset.k8s.io` / `name: clusterset.k8s.io` に格納されます。
+  - コントローラーは:
+    - `req.ClusterName` を使って `cluster.Cluster` を解決し、
+    - `ClusterProfile`（`<namespace>/<name>`）を参照して ClusterID / ClusterSet を取得し、
+    - ログやメトリクスに両方をラベルとして付与できます。
+
+- **その他の Provider の場合**
+  - CAPI, Kind, File, Kubeconfig, Namespace などは、ClusterProperty を直接は解釈しません。
+  - 代わりに:
+    - 各メンバークラスター上で `ClusterProperty` を用意し ClusterID を設定する、
+    - その ID を ClusterProfile の `status.properties` にミラーする、
+    - あるいは別の仕組みで「`ClusterName` → ClusterID」のマッピングを管理する、
+    - といった形で整合性を持たせることができます。
+
+- **コントローラー内部では両方を意識する**
+  - 可能であれば、ログやメトリクスでは常に:
+    - `clusterName`（`GetCluster` に渡すキー）
+    - `clusterId`（`ClusterProperty` や `ClusterProfile.Status.Properties` からの ID）
+    - の両方をラベルとして持たせます。
+  - こうしておくと、将来 Provider やインベントリの実装を差し替えても  
+    既存のメトリクスやダッシュボード、ログクエリとの整合性を保ちやすくなります。
+
+このように、「**ルーティング（ClusterName）**」と「**意味づけ（ClusterID / ClusterSet）**」を分離して考えることで、  
+フリートやインベントリの構成が変化しても、コントローラー自体は安定して動作し続けられます。
+
+---
+
+### 独自 Provider での命名戦略
+
+独自の `multicluster.Provider` を実装する際、最初に決めるべき設計の 1 つが  
+**「`ClusterName` をどのように決めるか」** です。
+
+推奨される性質は次の通りです。
+
+- **フリート内で一意**
+  - 同じ Provider（および `providers/multi` のプレフィックス適用後）のフリート内に、  
+    同じ `ClusterName` を持つクラスターが同時に存在してはいけません。
+  - Namespace Provider のように「Namespace = 仮想クラスター」とする場合でも同様です。
+
+- **時間的に安定**
+  - ある論理的なクラスター（物理クラスタ・vcluster・Namespace など）を  
+    「同一のクラスター」と見なしている間は、`ClusterName` を変えない方が安全です。
+  - IP アドレスやローリングアップデートの世代番号など、  
+    短命な情報に直接紐づけるのは避けましょう。
+
+- **ClusterID と素直に対応づけられる**
+  - 理想的には、`ClusterName` から ClusterID への対応がシンプルであるべきです。
+    - 両者が同じ文字列である場合もあれば、
+    - `ClusterName = "<inventory-scope>/<cluster-id>"` のような形もあります。
+    - `"<provider-prefix>#<cluster-id>"` のように Provider 名を付加するのも有効です。
+
+いくつかのパターンを挙げます。
+
+- **インベントリ中心のパターン**
+  - `ClusterProfile` やそれに類するインベントリオブジェクトを主キーとする:
+    - `ClusterName = "<namespace>/<name>"`
+    - `ClusterID = status.properties["cluster.clusterset.k8s.io"]`
+  - Cluster Inventory API Provider が採用している方式です。
+
+- **ClusterID 中心のパターン**
+  - ClusterID をそのまま `ClusterName` として使う:
+    - `ClusterName = <cluster.clusterset.k8s.io>`
+    - ClusterSet ID は別途 `clusterset.k8s.io` 等で管理
+  - 静的なフリートや、MCS の DNS 名を強く意識した設計では扱いやすい場合があります。
+
+- **複数ソースのフリートを束ねるパターン**
+  - Multi Provider を用いて:
+    - `ClusterName = "<provider>#<inner-name>"`
+    - とし、`inner-name` には上記いずれかの方式を採用
+  - 例:
+    - `kind#dev-1`
+    - `capi#capi-system/workload-us-1`
+    - `inventory#prod-hub/cluster-eu`
+
+**コアコンセプト — プロバイダー** でも命名規則の注意点を紹介しましたが、  
+ここでは特に **ClusterID / ClusterSet との整合性** の観点を補足しています。
+
+---
+
+### コントローラー内でのクラスターアイデンティティの使い方
+
+コントローラーがクラスター識別情報を必要とする場面は、おおよそ次の 3 つです。
+
+1. **ルーティング**
+   - 「この Reconcile はどの `cluster.Cluster` に対して実行すべきか？」  
+     → `req.ClusterName` と `mgr.GetCluster(ctx, req.ClusterName)` で決まる。
+2. **可観測性**
+   - ログ・メトリクス・イベントに、どのクラスター由来なのかを付与したい  
+     → `clusterName` / `clusterId` をラベルとして持たせる。
+3. **ビジネスロジック**
+   - 「どの ClusterSet に属するクラスターか？」  
+     「特定の地域やバージョンを持つクラスターだけを対象にしたい」など。
+
+実践的なパターンをいくつか挙げます。
+
+- **ログには常に `ClusterName` を含める**
+  - 例:
+    - `log := log.WithValues("cluster", req.ClusterName)`
+  - Provider を差し替えても、ログ検索の観点では `cluster=<ClusterName>` ですべて追跡可能になります。
+
+- **可能であれば `clusterId` も含める**
+  - ClusterProfile や ClusterProperty が利用可能な環境では、
+    - Reconcile ごと（あるいは 1 単位の処理ごと）に ClusterID を取得し、
+    - `log = log.WithValues("clusterId", "<cluster.clusterset.k8s.io>")` のように付与します。
+  - これにより、MCS や外部監視など「ClusterID しか知らないシステム」とも容易に突き合わせができます。
+
+- **`ClusterName` のパースに依存したビジネスロジックは避ける**
+  - 例:
+    - `strings.Split(req.ClusterName, "#")` を前提にしたロジック
+    - `"kind-"` で始まる場合だけ特別扱いする、など
+  - 代わりに:
+    - インベントリ API（`ClusterProfile` など）から必要な情報を取得する
+    - あるいは自分のコードの中に、小さな「`ClusterName` ↔ メタデータ」のマッピング層を設ける
+  - こうしておくと、Provider を差し替えたり Multi Provider で合成したりしても  
+    Reconciler のロジック自体はそのまま再利用できます。
+
+- **フリート全体の意思決定はインベントリ API に委ねる**
+  - 「どのクラスターにワークロードを配置するか」「どの ClusterSet に属するか」といった判断は、
+    - ハブ側のインベントリ（`ClusterProfile` や独自 CRD）を読み取り、
+    - `cluster.clusterset.k8s.io` / `clusterset.k8s.io` やその他のプロパティ（ロケーション、バージョンなど）でフィルタし、
+    - 結果として得られたクラスター群の `ClusterName` を `GetCluster` に渡す、
+    - という形で実装するのが自然です。
+
+このように、「ルーティング」と「意味づけ」を意識的に分けることで、  
+インベントリや Provider の実装が変わっても Reconciler の構造は保ちやすくなります。
+
+---
+
+### よくある落とし穴と移行時の注意点
+
+クラスター識別周りで陥りがちな問題と、その回避策をいくつか挙げます。
+
+- **別の物理クラスターに同じ `ClusterName` を再利用してしまう**
+  - 古いメトリクス・ステータス CRD・外部キャッシュなどに「昔のクラスター」の情報が残っている状態で  
+    新しいクラスターに同じ `ClusterName` を付けると、誤った相関が生まれる可能性があります。
+  - 原則として、「同じ `ClusterName` を再利用するのは、関連する状態が完全に消去されたあと」にすべきです。
+
+- **Provider 特有の前提をビジネスロジックに埋め込んでしまう**
+  - 例:
+    - `strings.HasPrefix(req.ClusterName, "kind-")` のような分岐
+  - これは Provider の差し替えや Multi Provider での合成を著しく難しくします。  
+    Provider ごとの違いは、インベントリ API や設定ファイル、  
+    あるいは専用のマッピング層に閉じ込める方が安全です。
+
+- **ClusterSet の境界を無視してしまう**
+  - MCS や Namespace Sameness を前提とするワークロードでは、  
+    「どのクラスターが同じ ClusterSet に属しているか」を正しく意識する必要があります。
+  - `clusterset.k8s.io` の値を利用して、ClusterSet 間をまたいだ誤った展開を避けるべきです。
+
+- **特定のインベントリ実装に強くロックインしてしまう**
+  - 例えば「将来的に CAPI ベースのフリートから ClusterProfile ベースへ移行したい」といった場合、
+    - `ClusterName` と ClusterID の対応づけを 1 か所に閉じ込めておくことで、
+    - Reconciler をほぼそのままに、バックエンドのインベントリだけを差し替えることができます。
+
+既存コードを段階的にマルチクラスター対応させたい場合は:
+
+- まず `ClusterName` を「不透明な文字列」とみなし、  
+  それをインベントリやメタデータへ変換するロジックを小さなヘルパーパッケージに集約します。
+- そのうえで、ClusterProperty / ClusterProfile を参照して  
+  ログやメトリクスに安定した ClusterID を付加していきます。
+- こうした基盤が整ってから、Provider や命名規則自体のリファクタリングを検討すると安全です。
+
+---
+
+### まとめ
+
+`multicluster-runtime` におけるクラスター識別は、次の 3 者の協調によって成り立っています。
+
+- **Provider**
+  - フリート内で一意かつ安定した `ClusterName` を決め、  
+    それをもとに `cluster.Cluster` のライフサイクルを管理する。
+- **SIG‑Multicluster の標準 (KEP‑2149, KEP‑4322, KEP‑5339)**
+  - ClusterID / ClusterSet / ClusterProfile / 認証プラグインといった  
+    クロスコンポーネントなアイデンティティとインベントリのモデルを提供する。
+- **コントローラー実装**
+  - `ClusterName` を内部ルーティング用のキーとして扱いつつ、
+  - 必要に応じて ClusterProperty / ClusterProfile から ClusterID / ClusterSet を取得し、
+  - ログ・メトリクス・ビジネスロジックに活用する。
+
+`ClusterName` を不透明なルーティングキーとして扱い、  
+必要な場合に ClusterProperty / ClusterProfile と対応づける、という設計を徹底することで、  
+クラスターインベントリやプロビジョニング方式、ネットワーク構成が変化したとしても、  
+あなたのマルチクラスターコントローラーは長期的に安定して運用し続けることができます。

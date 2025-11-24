@@ -1,0 +1,488 @@
+---
+title: カスタムプロバイダー
+---
+
+**カスタムプロバイダー** は、`multicluster-runtime` に「あなた独自のフリート」を教えるための拡張ポイントです。
+
+- 既存のクラスタインベントリサービス  
+- クラウドベンダー独自のクラスター管理基盤  
+- 独自フォーマットで kubeconfig を配布するレガシープラットフォーム  
+- 単一の物理クラスターを論理的に分割した仮想クラスター群  
+
+など、「**どのクラスターが存在し、どう接続するか**」を知っている仕組みを `multicluster-runtime` と橋渡しします。
+
+この章では次の内容を扱います。
+
+- **いつカスタムプロバイダーを書くべきか／書くべきでないか**
+- クラスター ID・インベントリ・認証情報を踏まえた **設計指針**
+- 組み込みプロバイダーに見られる **実装パターン**
+- `pkg/clusters.Clusters` を土台にした **リファレンス実装スケルトン**
+- テストや運用上の注意点
+
+インターフェースの概要については、先に **「コアコンセプト — プロバイダー」** を読んでおくと理解しやすくなります。
+
+---
+
+### いつカスタムプロバイダーを書くべきか
+
+カスタムプロバイダーを検討すべきなのは、たとえば次のような場合です。
+
+- すでに **独自のクラスタインベントリ** を持っていて、それが次のいずれにも直接は当てはまらない:
+  - **Cluster Inventory API**（`ClusterProfile`, KEP‑4322）
+  - **Cluster API** の `Cluster` リソース
+  - kubeconfig を表す Secret やファイル
+  - Kind クラスターや Namespace ベースの疑似マルチクラスター
+- プラットフォーム固有の概念と密に結びつけたい:
+  - 独自実装のマルチテナントコントロールプレーン
+  - 社内のクラスタレジストリ（DB / REST API / gRPC など）
+  - 既存の「フリートマネージャー」サービス
+- コントローラー作者に対して、よりシンプルな抽象化を見せたい:
+  - 「`prod-eu`」「`prod-us`」「`dev-sandbox`」といったビジネス寄りの名前でクラスターを扱いたい
+  - 複雑な認証・接続ロジックを Provider に隠蔽し、Reconciler は `ClusterName` だけを気にすればよい形にしたい
+
+一方、次のような場合は **カスタムプロバイダーを作らなくてもよい** ことが多いです。
+
+- すでにプラットフォームが **`ClusterProfile`（KEP‑4322）と `credentialProviders`（KEP‑5339）** を公開できる:
+  - この場合は、既存の **Cluster Inventory API Provider** を使う／拡張する方がよい候補です。
+- ユースケースが **ローカル開発・テスト専用**:
+  - **Kind / File / Kubeconfig / Namespace** Provider でカバーできるケースがほとんどです。
+
+---
+
+### Provider インターフェースのおさらい
+
+`multicluster-runtime` の中心にあるのは、`multicluster.Provider` インターフェースです。
+
+```go
+type Provider interface {
+	// Get returns a cluster for the given identifying cluster name. Get
+	// returns an existing cluster if it has been created before.
+	// If no cluster is known to the provider under the given cluster name,
+	// ErrClusterNotFound should be returned.
+	Get(ctx context.Context, clusterName string) (cluster.Cluster, error)
+
+	// IndexField indexes the given object by the given field on all engaged
+	// clusters, current and future.
+	IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error
+}
+```
+
+多くの Provider は、バックグラウンドのディスカバリループを駆動するために `ProviderRunnable` も実装します。
+
+```go
+type ProviderRunnable interface {
+	// Start runs the provider. Implementation of this method should block.
+	// If you need to pass in manager, it is recommended to implement SetupWithManager(mgr mcmanager.Manager) error method on individual providers.
+	// Even if a provider gets a manager through e.g. `SetupWithManager` the `Aware` passed to this method must be used to engage clusters.
+	Start(context.Context, Aware) error
+}
+```
+
+コントローラー作者の視点から見ると、組み込み Provider かカスタム Provider かは区別されません。
+
+- `mcmanager.New(config, provider, opts)` に Provider を渡し、
+- `mcbuilder.ControllerManagedBy(mgr)` でコントローラーを登録し、
+- Reconciler では `mcreconcile.Request{ClusterName: ..., Request: ...}` を受け取り、
+  `mgr.GetCluster(ctx, req.ClusterName)` で対象クラスターの `cluster.Cluster` を取得します。
+
+Provider と残りのシステムの間の契約は、つきつめると次の 2 点です。
+
+- ある `clusterName` に対して **`Get` がどう振る舞うか**
+- いつ・どのように **`Engage(ctx, name, cluster)` を呼ぶか**（`Start` の中で渡された `Aware` 経由、あるいは `mcmanager.Manager.Engage` 経由）
+
+---
+
+### 設計指針: クラスター ID・インベントリ・認証
+
+#### クラスター名と ID の設計
+
+**クラスター名の設計** は、Provider 実装の中でもっとも重要な決断のひとつです。
+
+- クラスター名は、クラスターのライフタイム（少なくとも ClusterSet への所属期間）を通じて **安定している** 必要があります。
+- フリート内、できれば ClusterSet 内で **一意** であるべきです。
+- インベントリ側のレコードから **機械的に導出できる** 形にしておくと、デバッグや監査が容易です。
+
+SIG‑Multicluster の **KEP‑2149（ClusterId for ClusterSet identification）** では、
+`ClusterProperty` CRD と、次のような well-known プロパティが定義されています。
+
+- `cluster.clusterset.k8s.io`: ClusterSet 内で一意なクラスター ID
+- `clusterset.k8s.io`: ClusterSet 自体の ID
+
+あなたの環境がこれらのプロパティ（あるいは `ClusterProfile` 経由の同等情報）を持っているなら:
+
+- `cluster.clusterset.k8s.io` をそのまま、あるいは一部として `ClusterName` に使う、
+- 少なくともインベントリ側のレコードにラベルやフィールドとして保持し、ログやメトリクスと紐付けられるようにしておく、
+
+といった設計が推奨されます。
+
+#### インベントリと「Ready」判定
+
+ほとんどの Provider は、なんらかの **インベントリ API** をソース・オブ・トゥルースにします。
+
+- **Cluster API Provider**:
+  - CAPI の `Cluster` を watch し、
+  - `Status.Phase == Provisioned` になったクラスターだけを Engage します。
+- **Cluster Inventory API Provider**:
+  - `ClusterProfile`（KEP‑4322）を watch し、
+  - `status.conditions`（`ControlPlaneHealthy`, `Joined` など）を見てクラスターの「利用可能性」を判定します。
+
+あなたの Provider でも、次のような点を明確に定義しておくことが重要です。
+
+- **何が「クラスターが存在する」ことを意味するのか？**
+  - データベースの 1 行、独自 CRD、設定ファイル、外部 HTTP API のエントリ、など。
+- **どの状態になれば「Ready」と見なすのか？**
+  - Kubernetes のコントロールプレーンに到達できること、
+  - 基本的なヘルスチェックが通っていること、
+  - 認証情報が揃っていること、など。
+- **どのイベントでクラスターをフリートから外すのか？**
+  - レコードの削除、
+  - ヘルス条件の長時間にわたる `False`、
+  - 明示的な「廃止」フラグ、など。
+
+ここを曖昧にすると、同じクラスターが頻繁に出入りする「フラッピング」状態になりがちなので注意が必要です。
+
+#### 認証情報と接続方法
+
+最終的には、どの Provider も各クラスター向けに `*rest.Config` を構築する必要があります。
+
+- 組み込み Provider では、さまざまなパターンが示されています。
+  - **File Provider / Kubeconfig Provider**: 典型的な kubeconfig ファイルや Secret をパースする。
+  - **Cluster API Provider / Cluster Inventory API Provider**: 管理クラスタ側の仕組みから kubeconfig を取得する。
+  - **Namespace Provider**: 単一の `cluster.Cluster` を共有しつつ、Namespace ごとに論理クラスターをラップする。
+
+もし環境が **`ClusterProfile` を公開できる** 場合は、**KEP‑5339（Plugin for Credentials in ClusterProfile）** に沿うのが推奨です。
+
+- `ClusterProfile.status.credentialProviders` に、クラスターへの到達方法と受け入れ可能な認証方式を書きます。
+- `cluster-inventory-api` リポジトリのライブラリが、外部プラグインを `exec` して認証情報を取得します。
+- Provider 側は、得られた `rest.Config` を `cluster.New` に渡し、クラスターを起動・Engage するだけです。
+
+より単純な／レガシーな環境では、次のような実装も現実的です。
+
+- ファイル・Secret・独自 CRD などから kubeconfig を読み取る
+- エンドポイント URL とトークンから `rest.Config` を組み立てる
+
+いずれの場合も:
+
+- クラウド固有のロジックは **コントローラーではなく Provider に閉じ込める** こと、
+- 認証情報を **ローテーションしても `ClusterName` を変えない** こと、
+
+を意識して設計すると、コントローラー側の移植性と安全性が高まります。
+
+#### クラスターライフサイクルとキャッシュ
+
+Provider は次の責務を負います。
+
+- 実クラスタ（あるいは仮想クラスタ）ごとに `cluster.Cluster` を生成する
+- `Start` を呼び、キャッシュの同期完了を待つ
+- キャッシュが同期されたタイミングで `Engage(ctx, name, cluster)` を呼ぶ
+- クラスターがフリートから外れたときに、コンテキストをキャンセルしてクリーンアップする
+
+`pkg/clusters.Clusters` は、これらのパターンを共通化したヘルパーです。
+Provider 側が `Clusters.Add` / `AddOrReplace` / `Remove` を呼ぶだけで、次がすべて処理されます。
+
+- クラスターごとのコンテキスト生成とキャンセル
+- `Start` の実行とエラーハンドリング
+- 登録済み Field Indexer の再適用
+
+実装の詳細は次のとおりです。
+
+```go
+// Clusters implements the common patterns around managing clusters
+// observed in providers.
+// It partially implements the multicluster.Provider interface.
+type Clusters[T cluster.Cluster] struct {
+	// ErrorHandler is called when an error occurs that cannot be
+	// returned to a caller, e.g. when a cluster's Start method returns
+	// an error.
+	ErrorHandler func(error, string, ...any)
+
+	// EqualClusters is used to compare two clusters for equality when
+	// adding or replacing clusters.
+	EqualClusters func(a, b T) bool
+	// ...
+}
+```
+
+`Clusters` を活用することで、Provider 実装は
+
+- **インベントリから `cluster.Cluster` をどう作るか**  
+- **どのタイミングで追加・更新・削除とみなすか**
+
+というドメイン固有の部分に集中できます。
+
+---
+
+### 組み込みプロバイダーに学ぶ実装パターン
+
+ここでは、実際にリポジトリにある Provider 実装から、カスタム Provider にも流用しやすいパターンを整理します。
+
+#### 1. ファイル／kubeconfig ベースの Provider
+
+**File Provider (`providers/file`)** は、次のような典型的パターンを示しています。
+
+- `clusters.Clusters[cluster.Cluster]` を埋め込む
+- ファイルシステム上の kubeconfig をスキャンして **「望ましいフリート」** を計算する
+- 現在の `Clusters.ClusterNames()` と比較して:
+  - 追加・変更されたクラスターは `AddOrReplace(ctx, name, cl, aware)` で反映
+  - 見えなくなったクラスターは `Remove(name)` で削除
+- `fsnotify` でファイルやディレクトリの変更を監視し、差分同期をトリガーする
+
+**Kubeconfig Provider (`providers/kubeconfig`)** は:
+
+- 管理クラスタ上の Secret を watch するコントローラーとして動作し、
+- Secret 名からクラスター名を導出し、
+- kubeconfig 変更時にクラスターを作り直して Engage し直す、
+
+といった、**Kubernetes API ドリブンなディスカバリ** も示しています。
+
+#### 2. API ドリブンなディスカバリ（Cluster API / Cluster Inventory API）
+
+**Cluster API Provider (`providers/cluster-api`)** と  
+**Cluster Inventory API Provider (`providers/cluster-inventory-api`)** は、
+どちらも「CRD を watch するコントローラー」として実装されています。
+
+おおまかな流れは次のとおりです。
+
+1. `Cluster` または `ClusterProfile` に対する Reconciler を実装する。
+2. Reconcile ごとに:
+   - 対象オブジェクトを取得
+   - Ready 判定（CAPI の Phase / `ClusterProfile.status.conditions` など）
+   - `rest.Config` を取得（CAPI の kubeconfig Secret, ClusterInventory の KubeconfigStrategy 等）
+   - `cluster.New(restConfig, options...)` で `cluster.Cluster` を生成
+   - 保存済みの Field Indexer を適用
+   - クラスタのキャッシュ同期を待つ
+   - `Engage` を呼んで Multi-Cluster Manager に参加させる
+3. オブジェクト削除／非 Ready 化時には:
+   - クラスタ専用コンテキストをキャンセル
+   - 内部マップから削除
+
+ソース・オブ・トゥルースが Kubernetes API である場合、このパターンは
+**宣言的・再試行性の高い実装** を実現できます。
+
+#### 3. 仮想クラスター Provider（Namespace Provider）
+
+**Namespace Provider (`providers/namespace`)** は、単一の物理クラスター上で:
+
+- Namespace ごとに「仮想クラスター」を作り、
+- すべての操作を `default` Namespace にマッピングし直す `NamespacedCluster` ラッパーを用意し、
+- 各 Namespace を別々の `ClusterName` として Engage する、
+
+という手法を取っています。
+
+このパターンは、次のようなときに有効です。
+
+- 単一の物理クラスターでマルチクラスタ挙動を **高速かつ低コストにシミュレート** したい
+- テナント／プロジェクト／サンドボックスごとに論理クラスターを切りたい
+
+カスタム Provider でも同様に:
+
+- 既存の `cluster.Cluster` をラップする型を作り、
+- Namespace や Label などでスコープを切り分けた「仮想クラスター」を提供する、
+
+といった設計が可能です。
+
+#### 4. 集約型 Provider（Multi Provider）
+
+**Multi Provider (`providers/multi`)** は、複数の Provider を 1 つにまとめるコンポジット Provider です。
+
+- 各 Provider にプレフィックス（例: `kind`, `capi`, `inventory`）を割り当てる
+- `ClusterName` を `prefix#name` に分割し、`Get` / `IndexField` を適切な Provider に委譲する
+- `ProviderRunnable` を実装している Provider は、Multi Provider の `Start` から自動的に起動する
+
+このパターンは次のような用途で有用です。
+
+- 開発／ステージング／本番など、**異種混在のフリートを 1 つのビューに統合** したい
+- 既存インベントリから新しいインベントリへの **移行中に両方を併用** したい
+- Provider ごとの責務は分離しつつ、コントローラーコードは 1 箇所に保ちたい
+
+カスタム Provider として:
+
+- プラットフォームごと、クラウドごと、リージョンごとに Provider を実装し、
+- Multi Provider でまとめて提供する、
+
+といった構成も容易に実現できます。
+
+---
+
+### `pkg/clusters.Clusters` を土台にした Provider 例
+
+`providers/clusters` は主にテスト用の簡易 Provider ですが、
+`pkg/clusters.Clusters` を使った Provider 実装のよいテンプレートになっています。
+
+```go
+// Provider is a provider that embeds clusters.Clusters.
+//
+// It showcases how to implement a multicluster.Provider using
+// clusters.Clusters and can be used as a starting point for building
+// custom providers.
+type Provider struct {
+	clusters.Clusters[cluster.Cluster]
+	log logr.Logger
+
+	lock    sync.Mutex
+	waiting map[string]cluster.Cluster
+	input   chan item
+}
+```
+
+実運用のカスタム Provider でも、次のような構造をとると実装が整理しやすくなります。
+
+1. **`Options` 構造体** を定義する  
+   - インベントリ API のエンドポイント  
+   - ポーリング間隔  
+   - `cluster.Option` の追加設定 など
+2. Provider 型に `clusters.Clusters[cluster.Cluster]` を埋め込む
+3. `Start(ctx, aware)` でディスカバリループを実装する
+   - インベントリを読み取り、望ましいクラスター集合を計算する
+   - 新規・更新は `AddOrReplace(ctx, name, cl, aware)`、削除は `Remove(name)` で反映
+4. `Get` は `Clusters.Get(ctx, name)` に委譲する（すでに実装済み）
+5. テスト用に `RunOnce` のようなヘルパーを用意すると便利
+
+こうすることで、Provider 実装は
+
+- 「インベントリから `rest.Config` / `cluster.Cluster` をどう作るか」
+- 「どのタイミングで追加・更新・削除とみなすか」
+
+に集中でき、並行処理や Index 再適用は `Clusters` に任せられます。
+
+---
+
+### 疑似コードによるカスタム Provider スケルトン
+
+以下は、架空の HTTP ベースのインベントリ API をポーリングする Provider の簡略版スケルトンです。
+実際の実装ではありませんが、主要な構造がどのように組み合わさるかを示します。
+
+```go
+package myinventory
+
+type Options struct {
+    APIEndpoint    string
+    PollInterval   time.Duration
+    ClusterOptions []cluster.Option
+}
+
+type Provider struct {
+    clusters.Clusters[cluster.Cluster]
+    log logr.Logger
+    opts Options
+}
+
+func New(opts Options) *Provider {
+    p := &Provider{
+        Clusters: clusters.New[cluster.Cluster](),
+        log:      log.Log.WithName("myinventory-provider"),
+        opts:     opts,
+    }
+    p.Clusters.ErrorHandler = p.log.Error
+    return p
+}
+
+// Start implements multicluster.ProviderRunnable.
+func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
+    ticker := time.NewTicker(p.opts.PollInterval)
+    defer ticker.Stop()
+
+    for {
+        if err := p.syncOnce(ctx, aware); err != nil {
+            p.log.Error(err, "sync failed")
+        }
+
+        select {
+        case <-ctx.Done():
+            return nil
+        case <-ticker.C:
+        }
+    }
+}
+
+func (p *Provider) syncOnce(ctx context.Context, aware multicluster.Aware) error {
+    desired, err := fetchInventory(p.opts.APIEndpoint) // map[string]*rest.Config
+    if err != nil {
+        return err
+    }
+
+    known := p.ClusterNames()
+
+    // 追加・更新
+    for name, cfg := range desired {
+        cl, err := cluster.New(cfg, p.opts.ClusterOptions...)
+        if err != nil {
+            p.log.Error(err, "failed to construct cluster", "name", name)
+            continue
+        }
+        if err := p.AddOrReplace(ctx, name, cl, aware); err != nil {
+            p.log.Error(err, "failed to add or replace cluster", "name", name)
+            continue
+        }
+    }
+
+    // 削除されたクラスターを Remove
+    for _, name := range known {
+        if _, ok := desired[name]; !ok {
+            p.log.Info("removing cluster", "name", name)
+            p.Remove(name)
+        }
+    }
+
+    return nil
+}
+```
+
+ポイント:
+
+- Provider は **インベントリから `rest.Config` をどう構築するか** だけを担当します。
+- `clusters.Clusters` が:
+  - クラスターごとのコンテキスト管理と `Start` の実行、
+  - Indexer の適用、
+  - `ErrClusterNotFound` の扱い、
+  を一手に引き受けます。
+- コントローラー側はインベントリの詳細を知らずに `ClusterName` をキーとして扱えます。
+
+---
+
+### カスタムプロバイダーのテストと検証
+
+カスタム Provider を本格的に運用する前に、少なくとも次の 3 レイヤーでテストしておくことを推奨します。
+
+- **Provider ロジックのユニットテスト**
+  - インベントリの変化が `AddOrReplace` / `Remove` にどうマッピングされるか
+  - `Get` が適切なタイミングで `ErrClusterNotFound` を返すか
+  - `IndexField` が内部状態と既存クラスターの両方に正しく反映されるか
+- **Multi-Cluster Manager と組み合わせた統合テスト**
+  - `mcmanager.New` にカスタム Provider を渡し、実際に Reconciler を動かす
+  - 次を確認する:
+    - Provider がクラスターを検出したあと、`mgr.GetCluster` で取得できること
+    - 新規クラスターに対して `mcreconcile.Request` が届くこと
+    - クラスター削除後は、それ以上 Reconcile が発生しないこと
+- **障害モードのテスト**
+  - インベントリ API の障害（タイムアウト、5xx エラーなど）
+  - 無効・期限切れの認証情報
+  - Ready / NotReady のフラッピング
+
+`providers/clusters` や各組み込み Provider のテストコードは、テストの構造を考えるうえで良い参考になります。
+
+---
+
+### 本番運用に耐える Provider のチェックリスト
+
+最後に、カスタム Provider を本番相当の環境で使う前に確認しておきたいポイントをまとめます。
+
+- **クラスター ID**
+  - `ClusterName` は安定で一意か？
+  - 可能であれば KEP‑2149 の `ClusterProperty`（`cluster.clusterset.k8s.io`）と整合しているか？
+  - ログやメトリクスから `ClusterName` を起点にインベントリ上のレコードへ逆引きできるか？
+- **Ready 判定**
+  - 「Ready」「削除済み」の条件が明確か？
+  - 小さなステータス変化で頻繁に出入りしないよう、ヒステリシスや再試行戦略を持っているか？
+- **認証情報**
+  - 認証情報の取得方法が明示的かつ安全か？（`ClusterProfile` を用いる場合は KEP‑5339 に沿っているか？）
+  - トークンや証明書をローテーションしても `ClusterName` が変わらない設計になっているか？
+- **ライフサイクル**
+  - クラスターごとのコンテキストは Provider のライフサイクルに結びつき、削除時には確実にキャンセルされるか？
+  - `IndexField` で登録した Indexer が、既存・新規すべてのクラスターに一貫して適用されるか？
+- **観測性**
+  - 重要なログに `clusterName`（および必要なら ClusterSet ID）が含まれているか？
+  - 「今どのクラスターが Engage されているか」「なぜこのクラスターが消えたのか」を追えるメトリクスやダッシュボードがあるか？
+
+これらを満たしたカスタム Provider は、Kind / File / Kubeconfig / Cluster API / Cluster Inventory API といった
+組み込み Provider と同等の一級市民として、`multicluster-runtime` エコシステムの中で安全かつ拡張性の高い土台となります。

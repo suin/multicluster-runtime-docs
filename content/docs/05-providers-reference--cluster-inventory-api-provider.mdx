@@ -1,0 +1,386 @@
+---
+title: Cluster Inventory API Provider
+---
+
+The **Cluster Inventory API provider** lets `multicluster-runtime` discover and manage clusters from a hub cluster that exposes the [ClusterProfile API](https://github.com/kubernetes-sigs/cluster-inventory-api) (KEP‑4322).
+Instead of hard-coding how to reach each cluster, your controllers talk to a **standard inventory** of `ClusterProfile` objects, and this provider turns those profiles into live `cluster.Cluster` instances backed by real Kubernetes API servers.
+
+At a high level this provider:
+
+- **watches `ClusterProfile` objects** on a hub cluster,
+- **decides when a profile is “ready”** (by default using the `ControlPlaneHealthy` condition),
+- **obtains credentials and endpoints** for the member cluster using either:
+  - the **ClusterProfile credentials plugin model** (KEP‑5339, recommended), or
+  - **labeled Secrets** that contain a kubeconfig (simple but less secure),
+- **creates and runs a `cluster.Cluster`** for each `ClusterProfile`, and
+- **engages** each cluster with the Multi-Cluster Manager under the name `<namespace>/<name>` (for example `default/member`).
+
+---
+
+#### When to use this provider
+
+Use the Cluster Inventory API provider when:
+
+- you already run (or plan to run) a **hub cluster** with the ClusterProfile API installed,
+- a platform like OCM, Clusternet, Fleet, Karmada, or your own cluster manager is responsible for populating `ClusterProfile` objects,
+- you want your multi-cluster controllers to be **decoupled from the underlying management implementation** and just consume a standard inventory.
+
+In contrast:
+
+- use the **Cluster API provider** when `Cluster` objects from Cluster API are your primary source of truth,
+- use the **Kubeconfig** or **File** providers for smaller, static fleets managed via kubeconfigs,
+- use the **Kind** and **Namespace** providers for local development and testing.
+
+---
+
+#### Relationship to SIG‑Multicluster KEPs
+
+The provider is designed to align with three key KEPs:
+
+- **KEP‑4322 — ClusterProfile API (Cluster inventory)**  
+  The hub cluster exposes one `ClusterProfile` per managed cluster.
+  The provider watches these resources and uses:
+  - `status.version` and `status.properties` as metadata only (for your controllers to consume),
+  - `status.conditions` (especially `ControlPlaneHealthy` and `Joined`) to decide when a cluster is usable,
+  - `status.credentialProviders` when using the credentials plugin strategy.
+
+- **KEP‑5339 — Plugin for Credentials in ClusterProfile (Credentials)**  
+  The recommended strategy is to let the ClusterProfile status describe **how to obtain credentials**:
+  - `status.credentialProviders[*].name` identifies a credentials “type” (for example `google` for GKE),
+  - `status.credentialProviders[*].cluster` contains connection info (`server`, CA data, proxy, etc.).
+  The provider delegates to the `cluster-inventory-api` credentials library, which:
+  - executes an external plugin binary for the chosen credentials type using the same `exec` protocol as client-go’s external credential providers,
+  - receives tokens or client certs from that plugin,
+  - builds a `rest.Config`, which the provider uses to create a `cluster.Cluster`.
+
+- **KEP‑2149 — ClusterId for ClusterSet identification (Cluster identity)**  
+  ClusterProfile `status.properties` often includes:
+  - `cluster.clusterset.k8s.io`: a unique cluster ID within a ClusterSet,
+  - `clusterset.k8s.io`: the ClusterSet identity.
+  The provider itself does not interpret these properties, but they give your controllers a **stable, Kubernetes‑native cluster identity** that you can use in logs, metrics, and placement logic.
+
+---
+
+### How discovery and engagement work
+
+On the hub cluster, this provider runs a controller that:
+
+1. **Watches `ClusterProfile` resources**
+
+   Every `ClusterProfile` in the watched namespaces is reconciled under the cluster name:
+
+   - `clusterName = <namespace>/<name>`  
+     for example, `default/member`.
+
+2. **Checks readiness**
+
+   By default, the provider considers a profile “ready” if:
+
+   - `status.conditions` contains a condition of type `ControlPlaneHealthy`
+   - with `status: "True"`.
+
+   You can override this by supplying a custom `IsReady` function in `Options` (see below).
+
+3. **Obtains a kubeconfig (`rest.Config`)**
+
+   The provider calls a **kubeconfig strategy**:
+
+   - **Credentials provider strategy (recommended)**  
+     Uses the ClusterProfile credentials library and plugins; see [Choosing a kubeconfig strategy](#choosing-a-kubeconfig-strategy) for details.
+   - **Secret strategy**  
+     Looks up Secrets labeled for this consumer and profile and parses a kubeconfig from `data["Config"]`.
+
+   If the strategy fails (for example, missing credentials, invalid kubeconfig), the reconcile fails and is retried; the cluster is not engaged until configuration is valid.
+
+4. **Creates or refreshes a `cluster.Cluster`**
+
+   Once a kubeconfig is available and the profile is ready, the provider:
+
+   - builds a `cluster.Cluster` using `cluster.New(restConfig, opts.ClusterOptions...)`,
+   - applies any previously registered field indexes to the cluster’s cache,
+   - starts the cluster’s cache in its own context and waits for it to sync.
+
+   If a cluster for this profile already exists:
+
+   - and the new kubeconfig is byte‑wise identical to the previous one, it is **reused**,
+   - if the kubeconfig changed (for example, credentials rotated), the old cluster is **cleanly shut down** and replaced by a new instance.
+
+5. **Engages the cluster with the Multi-Cluster Manager**
+
+   After the cache is in sync, the provider calls:
+
+   - `mcMgr.Engage(clusterCtx, clusterName, cl)`
+
+   The Multi-Cluster Manager then:
+
+   - replays all registered field indexes,
+   - wires multi-cluster `Kind` Sources for your controllers,
+   - starts emitting `mcreconcile.Request` items with `ClusterName = clusterName`.
+
+6. **Handles deletions**
+
+   If a `ClusterProfile` is deleted:
+
+   - the provider removes the corresponding entry from its internal maps,
+   - cancels the per-cluster context (stopping the cache),
+   - and the engaged cluster is removed from the fleet.
+
+---
+
+### Choosing a kubeconfig strategy
+
+The provider supports two mutually exclusive strategies for turning a `ClusterProfile` into a `rest.Config`:
+
+#### Credentials provider strategy (recommended)
+
+This strategy is based on **KEP‑5339** and uses the `cluster-inventory-api` credentials library.
+
+- **Configuration**
+
+  - You create one or more credentials plugins (executables) that know how to obtain credentials for your clusters (for example, via Workload Identity Federation or cloud‑native auth).
+  - You configure the library with a list of supported providers (by name and exec configuration), typically from a JSON file.
+  - Each `ClusterProfile`’s `status.credentialProviders` tells the library:
+    - which provider name to use,
+    - and what endpoint/TLS configuration to pass to the plugin.
+
+- **Provider wiring (Go)**
+
+  In your `main.go`, you typically:
+
+  - load the credentials provider configuration (for example from a JSON file),
+  - pass it into the kubeconfig strategy options:
+
+  ```go
+  credsProvider, err := credentials.NewFromFile("clusterprofile-provider-file.json")
+  if err != nil {
+      // handle error
+  }
+
+  provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+      KubeconfigStrategyOption: kubeconfigstrategy.Option{
+          CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+              Provider: credsProvider,
+          },
+      },
+  })
+  ```
+
+  The example in `examples/cluster-inventory-api` shows this pattern end‑to‑end.
+
+- **When to choose this strategy**
+
+  - you want to avoid storing long‑lived credentials in Secrets,
+  - you already use, or plan to use, workload identity / external credential flows,
+  - you want to reuse the same plugins across different controllers.
+
+#### Secret strategy (simple, not recommended for production)
+
+The Secret strategy follows the “credentials in Secret” pattern described in the ClusterProfile KEP, but is primarily intended for simple setups and demos.
+
+- **How it works**
+
+  - You deploy a ClusterInventory Consumer (your controller) with some name, for example `cluster-inventory-api-consumer`.
+  - For each managed cluster, the cluster manager creates a Secret in the hub cluster that:
+    - lives in a namespace labeled  
+      `x-k8s.io/cluster-inventory-consumer=<consumerName>`,
+    - has labels:
+      - `x-k8s.io/cluster-inventory-consumer: <consumerName>`
+      - `x-k8s.io/cluster-profile: <clusterProfileName>`
+    - contains a kubeconfig in `data["Config"]`.
+
+  - The provider’s Secret strategy:
+    - watches such Secrets and enqueues reconciles for the corresponding `ClusterProfile`,
+    - for each profile, finds the single matching Secret and parses its kubeconfig into a `rest.Config`.
+
+- **Limitations**
+
+  - credentials are stored as kubeconfigs in Secrets, which may not meet your security requirements,
+  - the cluster manager must manage Secret lifecycles and labels correctly,
+  - exactly one Secret per `(consumerName, ClusterProfile)` is expected; multiple matches are treated as an error.
+
+---
+
+### Basic usage example
+
+The following sketch shows how to combine this provider with a Multi-Cluster Manager and a simple controller:
+
+```go
+package main
+
+import (
+    "context"
+    "os"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+    "k8s.io/client-go/kubernetes/scheme"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/log/zap"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    clusterinventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
+    "sigs.k8s.io/cluster-inventory-api/pkg/credentials"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    clusterinventoryapi "sigs.k8s.io/multicluster-runtime/providers/cluster-inventory-api"
+    "sigs.k8s.io/multicluster-runtime/providers/cluster-inventory-api/kubeconfigstrategy"
+)
+
+func main() {
+    // Register ClusterProfile types with the global scheme.
+    _ = clusterinventoryv1alpha1.AddToScheme(scheme.Scheme)
+
+    ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+    ctx := signals.SetupSignalHandler()
+
+    // Load credential providers for ClusterProfile.
+    creds, err := credentials.NewFromFile("clusterprofile-provider-file.json")
+    if err != nil {
+        panic(err)
+    }
+
+    // Create the Cluster Inventory API provider.
+    provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+        KubeconfigStrategyOption: kubeconfigstrategy.Option{
+            CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+                Provider: creds,
+            },
+        },
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // Create a Multi-Cluster Manager on the hub cluster.
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+    if err != nil {
+        panic(err)
+    }
+
+    // Register the provider’s controller with the manager.
+    if err := provider.SetupWithManager(mgr); err != nil {
+        panic(err)
+    }
+
+    // Register a simple multi-cluster ConfigMap controller.
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("fleet-configmaps").
+        For(&corev1.ConfigMap{}).
+        Complete(mcreconcile.Func(func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            cl, err := mgr.GetCluster(ctx, req.ClusterName)
+            if err != nil {
+                return reconcile.Result{}, err
+            }
+
+            cm := &corev1.ConfigMap{}
+            if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                if apierrors.IsNotFound(err) {
+                    return ctrl.Result{}, nil
+                }
+                return ctrl.Result{}, err
+            }
+
+            // business logic here…
+            return ctrl.Result{}, nil
+        })); err != nil {
+        panic(err)
+    }
+
+    // Start the manager and provider.
+    if err := mgr.Start(ctx); err != nil {
+        os.Exit(1)
+    }
+}
+```
+
+For a complete, runnable example (including envtest usage and index configuration), see `examples/cluster-inventory-api` in the upstream repository.
+
+---
+
+### Options and configuration reference
+
+The `cluster-inventory-api` provider is constructed via:
+
+```go
+provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{ /* … */ })
+```
+
+The `Options` type supports:
+
+- **`KubeconfigStrategyOption kubeconfigstrategy.Option` (required)**  
+  Selects how to obtain a `rest.Config` for each `ClusterProfile`:
+
+  - set **exactly one** of:
+    - `Secret *SecretStrategyOption`
+    - `CredentialsProvider *CredentialsProviderOption`
+
+  For example:
+
+  ```go
+  // Credentials plugin strategy (recommended)
+  KubeconfigStrategyOption: kubeconfigstrategy.Option{
+      CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+          Provider: credsProvider,
+      },
+  }
+
+  // Secret strategy
+  KubeconfigStrategyOption: kubeconfigstrategy.Option{
+      Secret: &kubeconfigstrategy.SecretStrategyOption{
+          ConsumerName: "my-consumer-name",
+      },
+  }
+  ```
+
+- **`ClusterOptions []cluster.Option` (optional)**  
+  Extra options passed to `cluster.New` for every member cluster.
+  Use this if you need to tweak cache options, rate limits, or schemes beyond the defaults.
+
+- **`NewCluster func(ctx context.Context, clp *clusterinventoryv1alpha1.ClusterProfile, cfg *rest.Config, opts ...cluster.Option) (cluster.Cluster, error)` (optional)**  
+  Custom factory for creating `cluster.Cluster` instances.
+  If unset, the provider uses `cluster.New(cfg, opts...)`.
+
+- **`IsReady func(ctx context.Context, clp *clusterinventoryv1alpha1.ClusterProfile) bool` (optional)**  
+  Predicate that decides whether a `ClusterProfile` is “ready” to be engaged.
+  The default implementation returns true only when the `ControlPlaneHealthy` condition is present and `True`.
+  Override this if you want to:
+
+  - gate on custom conditions (for example `Joined`),
+  - or temporarily bypass readiness checks in tests.
+
+---
+
+### Operational notes
+
+- **Cluster names**
+
+  - Clusters are exposed to your controllers under the name `"<namespace>/<name>"` of the `ClusterProfile` (for example `default/member`).
+  - Use this as an opaque identifier in logs and metrics; avoid making assumptions about its structure.
+
+- **Kubeconfig rotation**
+
+  - When the underlying kubeconfig for a `ClusterProfile` changes (Secret update or plugin output), the provider:
+    - tears down the existing `cluster.Cluster`,
+    - starts a new one with the updated `rest.Config`,
+    - re-applies all registered field indexes.
+  - This allows secure rotation of credentials without restarting the manager.
+
+- **Field indexes**
+
+  - Use `mgr.GetFieldIndexer().IndexField(...)` as usual.
+  - The Multi-Cluster Manager forwards this to the provider, which:
+    - stores the index definitions,
+    - applies them to all current clusters,
+    - and ensures new clusters receive the same indexes when they are engaged.
+
+- **Error handling**
+
+  - If `GetCluster` returns `multicluster.ErrClusterNotFound` (for example, because a `ClusterProfile` was deleted), the default controller wrapper treats this as a **non-fatal** condition and drops the work item.
+  - If kubeconfig retrieval fails or readiness conditions are not met, reconcile failures are retried with exponential backoff; no cluster is engaged until the profile and credentials are valid.
+
+With this provider in place, any controller built on `multicluster-runtime` can treat a fleet of clusters described by `ClusterProfile` objects as a single, dynamic target—without needing to know how those clusters are provisioned, identified, or authenticated.
+

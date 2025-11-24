@@ -1,0 +1,309 @@
+---
+title: Reconcile ループ
+---
+
+この章では、`multicluster-runtime` における **Reconcile ループ** の動きを説明します。  
+controller-runtime に慣れている読者は、これを「おなじみの `Reconcile(ctx, req)` パターンに、**クラスターという次元** を 1 つ追加したもの」と捉えると理解しやすいでしょう。
+
+ここでは次の点を扱います。
+
+- マルチクラスタ用の `mcreconcile.Request` が `reconcile.Request` とどう違うか
+- `ClusterName` がどこから入ってくるのか
+- クラスターごとの Client を正しく選ぶ Reconciler の書き方
+- 既存のシングルクラスター Reconciler をどのように適応させるか
+- クラスターの追加・削除がある環境でのエラーとリトライの扱い
+
+---
+
+### シングルクラスターからマルチクラスターへの Reconcile
+
+シングルクラスターの controller-runtime アプリケーションでは、典型的な Reconciler は次のようになります。
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // r.Client や mgr.GetClient() を通じて「1 つのクラスター」に対してのみ話す。
+    var obj myv1alpha1.MyResource
+    if err := r.Client.Get(ctx, req.NamespacedName, &obj); err != nil {
+        // ...
+    }
+    // ビジネスロジック...
+    return ctrl.Result{}, nil
+}
+```
+
+ここで重要なのは:
+
+- `NamespacedName` というキーは **1 つのクラスターの中でのみ意味を持つ** こと、
+- Reconciler が利用する Client / Cache も **1 つの API サーバーにのみ結びついている** ことです。
+
+`multicluster-runtime` では、これを **クラスター付きの Work Item** に拡張します。
+
+- 各リクエストは `ClusterName` という **クラスター識別子** を持ち、
+- Reconciler は、その名前に応じて **正しいクラスターの Client** を使う必要があります。
+
+それ以外の部分──キュー、リトライ、`ctrl.Result` の意味──は基本的に controller-runtime と同じです。
+
+---
+
+### マルチクラスター用 Request 型
+
+マルチクラスターコントローラーの中心となる Request 型が `mcreconcile.Request` です（`pkg/reconcile/request.go`）。
+
+- **フィールド**
+  - `ClusterName string`  
+    この Work Item が属するクラスター名。  
+    空文字列（`""`）は常に **ローカル（ホスト）クラスター** を表します。
+  - `Request reconcile.Request`  
+    そのクラスター **内** での対象オブジェクトを表す、通常の `reconcile.Request`（`NamespacedName`）です。
+
+直感的には:
+
+- `ClusterName` で **どのクラスターに対して動くか** を決め、
+- `Request.NamespacedName` で **そのクラスター内のどのオブジェクトか** を決めます。
+
+利便性のために、パッケージでは次のエイリアスも提供しています。
+
+- **`type Reconciler = reconcile.TypedReconciler[mcreconcile.Request]`**  
+  マルチクラスター Request を受け取る Reconciler の型エイリアス。
+- **`type Func = reconcile.TypedFunc[mcreconcile.Request]`**  
+  関数から Reconciler を定義するためのヘルパー。Builder からよく使われます。
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("multicluster-configmaps").
+    For(&corev1.ConfigMap{}).
+    Complete(mcreconcile.Func(
+        func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            // ...
+            return ctrl.Result{}, nil
+        },
+    ))
+```
+
+`mcreconcile.Request` は `String()` も実装しており、クラスター付きのキー（例: `cluster://cluster-a/ns/name`）としてログに出力できるため、デバッグがしやすくなっています。
+
+#### ClusterAware な汎用 Request
+
+内部的には、マルチクラスター対応のコントローラーは次のようなジェネリック制約を利用しています。
+
+- **`ClusterAware[request]`**  
+  次を満たす Request 型のためのインターフェース:
+  - `comparable` であること
+  - `fmt.Stringer` を実装していること
+  - `Cluster()` / `WithCluster(string)` メソッドを持つこと
+
+`mcreconcile.Request` はこのインターフェースを実装していますが、もし独自のキー構造が必要な場合は、
+`WithCluster[request]` ヘルパーを使って自前の ClusterAware Request 型を定義することもできます。  
+多くのコントローラーでは、標準の `mcreconcile.Request` を利用するだけで十分です。
+
+---
+
+### `ClusterName` はどこから来るのか
+
+`ClusterName` は、Reconciler が呼び出される **前** に設定されます。流れを整理すると次のようになります。
+
+1. **Provider** がフリートを構成する `cluster.Cluster` を発見・生成し、それらを Multi-Cluster Manager に対して **Engage** する。
+2. Engage 済みの各クラスターに対して、マルチクラスタ対応の **Source**（例: `mcsource.Kind`） がそのクラスターの Cache / Informer にイベントハンドラーを登録する。
+3. 対象リソースでイベント（作成 / 更新 / 削除）が起きると:
+   - クラスターごとの Source が `ClusterAware` を実装した `request` 値を作り、
+   - その `ClusterName` をクラスター名で埋め、
+   - 内側の `Request`（`mcreconcile.Request` の場合は `reconcile.Request`）に NamespacedName を埋め、
+   - コントローラーが持つ共通の Workqueue に enqueue する。
+4. コントローラーのワーカーがキューから Work Item を取り出し、`mcreconcile.Request` を引数に Reconciler を呼び出す。
+
+`pkg/controller/controller.go` に定義されているコントローラー実装は、この流れを支えるためにマルチクラスタ対応になっています。
+
+- 自身が `multicluster.Aware` を実装しており、Manager / Provider から `Engage(ctx, name, cluster)` が呼ばれる。
+- Engage 済みの `{clusterName → cluster.Cluster}` を内部に保持する。
+- `MultiClusterWatch` を通じて、各クラスターに対応する Source を `ForCluster` し、クラスターごとにイベントを監視する。
+
+その結果として:
+
+- 各クラスターは、それぞれ固有の Cache / Informer グラフを持ちつつ、
+- すべての Work Item は **共通のキュー** に流れ込み、
+- 各リクエストが「どのクラスターから来たものか」を `ClusterName` で識別できるようになります。
+
+---
+
+### クラスター対応 Reconciler の書き方
+
+Reconciler 作者の視点では、基本パターンは次の 3 ステップです。
+
+1. Request 型として `mcreconcile.Request` を受け取る。
+2. Multi-Cluster Manager を使って、正しい `cluster.Cluster` を解決する。
+3. そのクラスターの Client / Cache を、シングルクラスターと同じ要領で利用する。
+
+たとえば、全クラスターに対して `ConfigMap` を単純にログ出力する「均一（Uniform）」な Reconciler は次のように書けます。
+
+```go
+func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+    log.Info("Reconciling ConfigMap")
+
+    // 1. このリクエストが対象とするクラスターを解決する。
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return reconcile.Result{}, err
+    }
+
+    // 2. そのクラスター専用の Client を使ってオブジェクトを取得する。
+    cm := &corev1.ConfigMap{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+        if apierrors.IsNotFound(err) {
+            // 既に削除されていれば何もしない。
+            return ctrl.Result{}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 3. ビジネスロジック（ログ、Event 発行、状態の更新など）。
+    log.Info("ConfigMap found",
+        "namespace", cm.Namespace,
+        "name", cm.Name,
+        "cluster", req.ClusterName,
+    )
+
+    return ctrl.Result{}, nil
+}
+```
+
+ポイント:
+
+- `req.ClusterName` が **どのクラスターを対象にするか** を表します。
+- `req.Request.NamespacedName` はそのクラスター内のキーです。
+- クラスターが削除されたあとに残っていた Work Item を処理しようとすると、`GetCluster` がエラーになる可能性があります（後述）。
+
+上流リポジトリの `examples/*/main.go` では、Kind / File / Kubeconfig / Cluster API / Cluster Inventory API / Namespace など各 Provider で、このパターンを使った `ConfigMap` Reconciler のサンプルを確認できます。
+
+---
+
+### クラスター消滅と `ErrClusterNotFound` の扱い
+
+動的なフリートでは、クラスターが削除されたあとでも、キューにそのクラスター向けの Work Item が残っていることがあります。  
+その場合、`mgr.GetCluster(ctx, req.ClusterName)` は `multicluster.ErrClusterNotFound` を返すかもしれません。
+
+`multicluster-runtime` は、これを **正常終了扱い** で捨てられるようにヘルパーを提供しています。
+
+- `pkg/builder` の Builder は、特に指定しない限り Reconciler を **`ClusterNotFoundWrapper`** でラップします。
+- このラッパーは:
+  - まず元の Reconciler を実行し、
+  - 返ってきたエラーが `multicluster.ErrClusterNotFound`（あるいはそれを内包するエラー）であれば、
+    - Reconcile を **成功** と見なし、
+    - **再キューしません**。
+  - それ以外のエラーや Result はそのまま返します。
+
+これにより、「既に存在しないクラスター」向けの Work Item を延々とリトライし続ける事態を防げます。
+
+自分でこのケースを扱いたい場合（メトリクスを増やしたり、特定の Event を出したりしたい場合など）は、次のようにできます。
+
+- コントローラーを登録するときにラッパーを無効化する:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    WithClusterNotFoundWrapper(false).
+    // ...
+    Complete(myReconciler)
+```
+
+- Reconciler の中で、`multicluster.ErrClusterNotFound` を明示的に判定して自前の処理を行う。
+
+それ以外のエラー処理とリトライの意味は、controller-runtime と同じです。
+
+- エラーを返すと、RateLimitingQueue による再キューが行われます。
+- `ctrl.Result{RequeueAfter: ...}` を返すと、指定時間後に再キューされます。
+- `ctrl.Result{}` と `nil` エラーを返すと、その Work Item は正常完了と見なされます。
+
+---
+
+### Context ベースでのクラスター認識
+
+既存の Reconciler が、まだ **シングルクラスター向けの `reconcile.Request`** を前提としており、
+Client を Manager やグローバル変数から取得している場合、そのままマルチクラスター対応にするのは少し難しいことがあります。
+
+このようなケースに対応するため、`pkg/context/cluster.go` には次のようなブリッジが定義されています。
+
+- **`context.WithCluster(ctx, clusterName)` / `context.ClusterFrom(ctx)`**  
+  `context.Context` にクラスター名を埋め込み、後から取り出すためのヘルパーです。
+- **`context.ReconcilerWithClusterInContext(r reconcile.Reconciler) mcreconcile.Reconciler`**  
+  もともと `reconcile.Request` を引数に取るシングルクラスター Reconciler をラップし、
+  - 多クラスター版の `mcreconcile.Request` を受け取り、
+  - `req.ClusterName` を `WithCluster` で context に注入し、
+  - 元の Reconciler には内側の `req.Request` を渡す、というアダプタを生成します。
+
+Manager 側では、次のメソッドを使って context からクラスターを解決できます。
+
+- **`mgr.ClusterFromContext(ctx)`**  
+  Context に埋め込まれたクラスター名を元に、対応する `cluster.Cluster` を取得します。
+
+このパターンは主に次のような場面で有用です。
+
+- 既存のシングルクラスターコードを段階的にマルチクラスターへ移行したいとき
+- 「どのクラスターを使うか」の解決ロジックを context に寄せたいとき
+
+一方で、新規コードを書く場合は、次のようなスタイルを採るのがシンプルです。
+
+- Reconciler で `mcreconcile.Request` を直接受け取る
+- `mgr.GetCluster(ctx, req.ClusterName)` をそのまま呼び出す
+- 「どのクラスターに対して動くのか」をコード上で明示する
+
+---
+
+### Uniform / Multi-Cluster-Aware な Reconcile ループ
+
+`multicluster-runtime` 上のビジネスロジックは、大きく次の 2 パターンに分類できます。
+
+- **Uniform Reconciler（均一な Reconcile）**
+  - すべてのクラスターで **同じロジック** を独立に実行します。
+  - Reconciler は:
+    - `req.ClusterName` で指定されたクラスターからだけ読み書きする。
+  - 例:
+    - 全クラスターで共通の `ConfigMap` / RBAC / ポリシーを強制する
+    - 各クラスターのヘルスや状態を収集する
+
+- **Multi-Cluster-Aware Reconciler（マルチクラスター認識型）**
+  - クラスター間の関係性を意識したロジックを実装します。
+  - Reconciler は:
+    - あるクラスター（例: 管理クラスターやインベントリ）から読み取り、
+    - 別のクラスターに対して書き込みを行ったり、
+    - 複数クラスター間の状態を調整したりする。
+  - 例:
+    - ClusterSet 全体に対して負荷やロケーションに基づいてワークロードを配置する
+    - 中央の CA クラスターからメンバークラスターへ証明書を配布する
+    - 多数のクラスターから状態を収集し、単一の集約先に反映する
+
+どちらのパターンでも、Reconcile ループの API 自体は同じであり、違いは **「どのクラスターに対して読み書きするか」** だけです。  
+「コントローラーパターン」の章では、これら 2 パターンに特化した設計やコード構造をより詳しく解説します。
+
+---
+
+### Builder が Reconcile ループをどのように配線するか
+
+`mcbuilder` パッケージ（`pkg/builder`）は、マルチクラスターコントローラーを登録するための主要なエントリーポイントです。  
+controller-runtime の Builder を薄くラップし、次のような点をマルチクラスター対応にしています。
+
+- Request 型として `mcreconcile.Request`（あるいはその他の `ClusterAware` な型）を利用する
+- マルチクラスター対応の `Kind` Source などを、Engage 済みのすべてのクラスターに対して自動的に配線する
+- `WithEngageWithLocalCluster` / `WithEngageWithProviderClusters` などの `EngageOptions` を
+  `For` / `Owns` / `Watches` それぞれに一貫して適用する
+- 特に指定しない限り、Reconciler を `ClusterNotFoundWrapper` で自動的にラップする
+
+利用者から見たコードは、シングルクラスターの controller-runtime とよく似ています。
+
+- これまでどおり:
+  - `ControllerManagedBy(mgr)` を呼び、
+  - `For` / `Owns` / `Watches` をチェインし、
+  - 最後に `Complete(...)` で Reconciler を登録します。
+- ただし生成されるコントローラーは:
+  - Engage 済みのすべてのクラスターで対象リソースを監視し、
+  - `ClusterName` 付きの `mcreconcile.Request` をキューに積み、
+  - 適切なクラスターごとの Cache / Client を通じて Reconcile を実行します。
+
+これにより、Reconcile ループ全体は次のようにつながります。
+
+- **Provider** がクラスターを発見し、Multi-Cluster Manager に対して Engage する
+- **Source** が各クラスターのイベントを監視し、マルチクラスター Request を enqueue する
+- **Controller / Builder** がそれら Source を共有キューへ配線する
+- **Reconciler** が `mcreconcile.Request` を受け取り、Multi-Cluster Manager を使って正しいクラスターに対して処理を行う
+
+こうして、従来どおりの controller-runtime の Reconcile ループのシンプルさを保ちながら、
+フリート全体へスケールアウトできるようになっています。

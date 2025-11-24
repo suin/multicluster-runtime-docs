@@ -1,0 +1,344 @@
+---
+title: マルチクラスターマネージャー
+---
+
+この章では、`multicluster-runtime` における **Multi-Cluster Manager（マルチクラスターマネージャー）**、すなわち `mcmanager.Manager` を詳しく見ていきます。  
+controller-runtime に慣れている読者は、これを次のようなものだと考えると理解しやすいでしょう。
+
+- **ホストクラスター向けの通常の `manager.Manager`** に、
+- Provider を通じて管理される **複数クラスター（フリート）** へのアクセス機能を追加したもの。
+
+「アーキテクチャ」や「主要な概念」の章では高レベルな位置付けを説明しましたが、ここでは主に次の点にフォーカスします。
+
+- `controller-runtime` の Manager と何が違うのか
+- Provider と連携してフリートをどのように管理するのか
+- コントローラーや Reconciler から、具体的にどう使うべきか
+
+---
+
+### 1つの Manager で多くのクラスターを扱う
+
+シングルクラスターの controller-runtime アプリケーションでは、通常は次のような構成です。
+
+- `manager.New` で生成した **1 つの `manager.Manager`**
+- その Manager に紐づく Cache / Webhook / Health Check / Runnable 群
+- すべてのコントローラーは **1 つの Kubernetes API サーバー** を対象とする
+
+`multicluster-runtime` でもプロセスとしては 1 つの **ホストマネージャー** ですが、このプロセスは次のことができます。
+
+- `multicluster.Provider` 経由で **複数のメンバークラスター** を発見する
+- クラスターごとに **専用の Client と Cache** を持つ
+- それらすべてのイベントを **共通のコントローラーパイプライン** に流し込む
+
+Multi-Cluster Manager 自体は次のような役割を担います。
+
+- ホストクラスター向けの通常の `manager.Manager` を **埋め込む**
+- フリート全体を管理するための `multicluster.Provider`（任意）を保持する
+- Provider からの通知を受け取るために `multicluster.Aware` を **実装** する
+- コントローラーが利用するためのヘルパー
+  - `GetCluster`
+  - `GetManager`
+  - `ClusterFromContext`
+  - `GetFieldIndexer`
+  を公開する
+
+Provider が設定されていない（`provider == nil`）場合、Multi-Cluster Manager は **ほぼ通常の controller-runtime Manager と同じ振る舞い** をしつつ、将来的なマルチクラスタ対応のための API を先取りして利用できる、という位置付けになります。
+
+---
+
+### controller-runtime の Manager との違い
+
+`pkg/manager/manager.go` に定義されている `mcmanager.Manager` は、通常の Manager をラップしつつ、マルチクラスタ向けの機能を追加したインターフェースです。
+
+- **ローカルクラスター名**
+  - `const LocalCluster = ""`  
+    **空文字列 (`""`) は常にローカル（ホスト）クラスター** を表します。
+
+- **クラスターの取得**
+  - `GetCluster(ctx, clusterName) (cluster.Cluster, error)`  
+    - `clusterName == LocalCluster` の場合、埋め込まれたホスト `manager.Manager` を `cluster.Cluster` として返します。
+    - Provider が設定されている場合は `provider.Get(ctx, clusterName)` に委譲します。
+    - Provider が無い状態で空でない `clusterName` が指定された場合はエラーになります。
+
+- **マネージャーの取得**
+  - `GetManager(ctx, clusterName) (manager.Manager, error)`  
+    指定したクラスター専用にスコープされた **scoped manager** を返します。
+    - グローバルな振る舞い（Runnable や Leader Election など）はホストマネージャーと共有しつつ、
+    - データアクセスにはそのクラスター固有の Client / Cache / FieldIndexer を利用します。
+  - `GetLocalManager() manager.Manager`  
+    ホストクラスターの Manager をそのまま返します（`GetManager(ctx, LocalCluster)` と同等）。
+
+- **Context からのクラスター解決**
+  - `ClusterFromContext(ctx) (cluster.Cluster, error)`  
+    `pkg/context` のヘルパー経由で `context.Context` に埋め込まれたクラスター名を取り出し、その上で `GetCluster` を呼び出します。  
+    Reconciler 呼び出し前にコンテキストへクラスター名を注入するようなヘルパーと組み合わせて利用します。
+
+- **Provider と Field Indexer**
+  - `GetProvider() multicluster.Provider`  
+    設定されている Provider（なければ `nil`）を返します。
+  - `GetFieldIndexer() client.FieldIndexer`  
+    以下のように動作する FieldIndexer を返します。
+    - Provider がある場合:
+      - インデックス定義を内部に記録し、
+      - `provider.IndexField(...)` を呼び出して、
+        - 既存のクラスターすべてにインデックスを適用し、
+        - 今後追加されるクラスターにも同じインデックスが適用されるようにする。
+    - Provider が無い場合:
+      - 通常どおりホストマネージャーの FieldIndexer に委譲する。
+
+- **マルチクラスタ対応 Runnable**
+  - Multi-Cluster Manager には、`manager.Runnable` と `multicluster.Aware` の両方を実装する `Runnable` 型が定義されています。
+  - `Add(r Runnable)` を呼び出すと:
+    - その Runnable を内部の `mcRunnables` リストに保持し、
+    - 同時にホストマネージャーの `Add` にも委譲して、`Start` のタイミングで起動されるようにします。
+  - 新しいクラスターが Engage されると、Manager はすべての `mcRunnables` に対して `r.Engage(ctx, name, cluster)` を呼び出します。
+
+これらの拡張点を除けば、Multi-Cluster Manager は依然として **通常の controller-runtime Manager とほぼ同じインターフェースとライフサイクル** を持ちます。  
+つまり、Health/Ready チェックや Webhook Server などもそのまま利用でき、他の controller-runtime ベースのライブラリにも自然に渡すことができます。
+
+---
+
+### Provider を使った Manager の初期化
+
+Multi-Cluster Manager を構築する最も一般的な方法は、`mcmanager.New` を呼び出すことです。
+
+```go
+import (
+    ctrl "sigs.k8s.io/controller-runtime"
+    metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+    // 1. Provider の作成（例: 名前が "fleet-" で始まる Kind クラスターを検出）。
+    provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+    // 2. ホストマネージャーのオプションを通常どおり設定。
+    opts := mcmanager.Options{
+        Metrics: metricsserver.Options{
+            BindAddress: ":8080",
+        },
+    }
+
+    // 3. Provider を渡して Multi-Cluster Manager を作成。
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, opts)
+    if err != nil {
+        // エラー処理
+    }
+
+    // 4. mcbuilder でコントローラーを登録し、Manager を起動する。
+    _ = mcbuilder.ControllerManagedBy(mgr)
+}
+```
+
+ここで重要なのは次の点です。
+
+- **`*rest.Config` と `manager.Options` は、通常の Manager と同じように指定する** だけです。
+- 追加の引数 `provider` が、メンバークラスターをどこから検出するかを決定します。
+- Provider が `multicluster.ProviderRunnable` を実装している場合、`mgr.Start(ctx)` を呼ぶだけで Manager と Provider の両方が Runnable として起動されます。
+- `provider == nil` を渡すと、`mcmanager.New` は通常の Manager をラップするだけのモードになります。
+  - `GetCluster(ctx, LocalCluster)` はホストマネージャーを返し、
+  - `GetCluster(ctx, 非空文字列)` はエラーを返し、
+  - `GetFieldIndexer()` はホストマネージャーの FieldIndexer に委譲します。
+
+この性質により、次のような移行が可能です。
+
+- 最初は **純粋なシングルクラスターアプリケーション** として:
+  - `mcmanager.New(config, nil, opts)` を使い、
+  - `mcbuilder.ControllerManagedBy(mgr)` でコントローラーを登録し、
+  - Reconciler には `mcreconcile.Request` を受け取るシグネチャを使う（`ClusterName` は常に空文字列）。
+- 後からフリート対応にしたくなったとき:
+  - Kind / File / Kubeconfig / Cluster API / Cluster Inventory API などの Provider を導入し、
+  - `mcmanager.New(config, provider, opts)` に差し替え、
+  - Reconciler のビジネスロジックはほとんどそのまま活かす。
+
+すでに作成済みの `manager.Manager` をラップしたい場合は、`WithMultiCluster(mgr, provider, ...)` を使うことで、既存のホストマネージャーをそのまま利用しつつ Multi-Cluster Manager に変換することもできます。
+
+---
+
+### クラスターライフサイクルと `Engage`
+
+Multi-Cluster Manager はあくまで「フリートのビュー」を提供する存在であり、**メンバークラスターのライフサイクルそのものは Provider 側が管理** します。
+
+各 Provider 実装は次のような役割を担います。
+
+- どのようにクラスターを検出するかを決める
+  - 例: CAPI の `Cluster` リソース、`ClusterProfile`（KEP‑4322）、Secrets、ファイル、Kind、Namespace-as-Cluster など
+- クラスターの追加・更新・削除を検知し、フリートの状態を更新する
+- 各メンバークラスターに対する `cluster.Cluster`（Client / Cache / FieldIndexer）を構築する
+
+Provider と Manager の間のコントラクトは次のとおりです。
+
+- Provider 側が **実装するインターフェース**
+  - `Get(ctx, clusterName)`  
+    クラスター名から `cluster.Cluster` を取得する。
+  - （任意）`Start(ctx, aware)`（`multicluster.ProviderRunnable`）  
+    ウォッチループを実行し、クラスターが有効になったタイミングで `aware.Engage(...)` を呼び出す。
+
+- Manager 側が **実装するインターフェース**
+  - `Engage(ctx, name, cl cluster.Cluster) error`  
+    `multicluster.Aware` インターフェースの一部として、クラスターを「エンゲージ」する。
+
+Provider がクラスターの追加・更新を検出して `Engage` を呼ぶと、Multi-Cluster Manager は次の処理を行います。
+
+- 内部に登録されているすべてのマルチクラスタ対応 Runnable（Source やコントローラーなど）を列挙し、
+- 各 Runnable に対して `r.Engage(ctx, name, cl)` を呼び出す。
+- その途中でエラーが発生した場合は、全体の Engage を失敗として呼び出し元に返す。
+
+一方で Provider は、通常次のような処理を担います。
+
+- `cl.Start(ctx)` を呼び出してクラスター固有の Cache / Informer ループを起動する
+- クラスター削除時に専用のコンテキストをキャンセルし、関連する監視を安全に停止する
+
+多くの Provider 実装は、`pkg/clusters/clusters.go` にある `clusters.Clusters` ヘルパーを利用します。
+
+- `{clusterName → cluster.Cluster}` と Cancel 関数のマップをスレッドセーフに管理する
+- 各 `cluster.Cluster` をゴルーチンで起動し、エラー発生時にはクリーンアップする
+- これまでに登録されたすべての Field Index を保持し、新たに追加されるクラスターにも同じインデックスを適用する
+
+コントローラー作者の視点では、自分で `Engage` を呼び出すことは通常ありません。  
+代わりに次のようにします。
+
+- Provider を構築または設定する
+- それを `mcmanager.New` に渡す
+- あとは Provider が時間の経過とともにクラスターのライフサイクルを駆動してくれるのに任せる
+
+---
+
+### コントローラー / Reconciler からの利用方法
+
+多くのコントローラーは、Multi-Cluster Manager を次の 2 つの場面で利用します。
+
+- `mcbuilder.ControllerManagedBy(mgr)` を通じて **コントローラーを登録する** とき
+- Reconciler やその他のコンポーネントから **クラスターごとの Client / Manager を取得する** とき
+
+典型的な Reconciler 内での利用例は次のようになります。
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    // 1. このリクエストが対象とするクラスターを特定する。
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 2. そのクラスター専用の Client / Cache を使って、シングルクラスター時と同様にオブジェクトへアクセスする。
+    obj := &myv1alpha1.MyResource{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+        // NotFound などのハンドリング
+    }
+
+    // 3. あとはビジネスロジックを実装するだけ。
+    return ctrl.Result{}, nil
+}
+```
+
+ポイント:
+
+- `req.ClusterName` はマルチクラスター対応の Source によって設定されます（詳細は Reconcile Loop の章を参照）。
+- `req.Request` は、そのクラスター内での通常の `reconcile.Request` です。
+- クラスターが削除されたあとにキューに残っていた Work Item を処理しようとすると、`GetCluster` は `ErrClusterNotFound` を返す場合があります。
+  - その場合は、再キューせずにリクエストを捨てるのが一般的です。
+  - あるいは、`pkg/reconcile` に用意されている `ClusterNotFound` ラッパーを使って、自動的に握りつぶすこともできます。
+
+既存のライブラリなど、**通常の `manager.Manager` を想定しているコンポーネント** をマルチクラスタ環境で使いたい場合は、次のようにします。
+
+- `GetManager(ctx, clusterName)` を呼び出して、そのクラスター専用の **scoped manager** を取得する。
+  - `GetClient` / `GetCache` / `GetFieldIndexer` はそのクラスター専用のものを返し、
+  - `Add` や `Start` はホストマネージャーに委譲されるため、コントロールループが二重に起動されることはありません。
+
+これにより、既存の controller-runtime ベースのコードを、最小限の変更でマルチクラスター環境に持ち込むことができます。
+
+---
+
+### フリート全体に対する Field Indexing
+
+効率的なコントローラーには Field Index が欠かせませんが、マルチクラスタ環境では次のような課題があります。
+
+- インデックス登録後に新しいクラスターが検出された場合、そのクラスターにも同じインデックスを適用する必要がある。
+
+これをシンプルに扱うため、Multi-Cluster Manager の `GetFieldIndexer()` は次のように動作します。
+
+- Provider が設定されている場合:
+  - インデックス定義を内部に記録し、
+  - `provider.IndexField(...)` を呼び出して、
+    - 既に存在するすべてのクラスターにインデックスを適用し、
+    - 今後追加されるクラスターにも同じインデックスが適用されるようにする。
+- Provider がない場合:
+  - 通常のシングルクラスターと同じく、ホストマネージャーの FieldIndexer に委譲する。
+
+`pkg/clusters.Clusters` を利用している Provider は、次のことも自動的に行います。
+
+- これまでに登録されたすべてのインデックスを記録しておき、
+- 新しく追加されたクラスターに対しても、その一覧を再適用する。
+
+コントローラー作者としては、次のように考えておけば十分です。
+
+- これまでどおり `mgr.GetFieldIndexer().IndexField(...)` を `SetupWithManager` などから呼び出すだけでよい。
+- クラスターが増減しても、自分でクラスターを列挙したり、インデックスを再適用したりする必要はない。
+
+---
+
+### どのクラスターを監視するかを選択する
+
+`mcbuilder.ControllerManagedBy(mgr)` でコントローラーを登録するとき、そのコントローラーがどのクラスターに対して監視・リコンサイルを行うかを細かく制御できます。
+
+典型的には、次の 3 パターンがあります。
+
+- **ホストクラスターのみ** を対象とする
+- **Provider が管理するクラスターのみ** を対象とする
+- **両方** を対象とする
+
+これを制御するのが、`pkg/builder/multicluster_options.go` にある `EngageOptions` です。
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - コントローラーが **ローカル（ホスト）クラスター**（クラスター名 `""`）にもアタッチするかどうかを制御します。
+  - デフォルト値は次のとおりです。
+    - Provider が設定されている場合: `false`（フリートのみに集中）
+    - Provider が無い場合: `true`（シングルクラスターとして振る舞う）
+
+- **`WithEngageWithProviderClusters(bool)`**
+  - コントローラーが **Provider が管理するすべてのクラスター** にアタッチするかどうかを制御します。
+  - Provider が設定されているときにだけ意味を持ちます。
+
+これらの設定は、次のすべてに対して一貫して適用されます。
+
+- `For`（プライマリリソース）
+- `Owns`（所有するセカンダリリソース）
+- `Watches`（その他の任意の Source）
+
+これにより、次のようなコントローラーを簡単に構成できます。
+
+- ホストクラスターを無視して **フリートだけを対象にするポリシーコントローラー**
+- ホストクラスター上の CRD を監視しながら、リモートクラスターに対してリソースを作成する **ハイブリッドなコントローラー**
+- 実際にはシングルクラスターで動かしつつ、将来のマルチクラスタ対応のために Multi-Cluster Manager / Request 型を利用する **後方互換なコントローラー**
+
+より詳細な使い方やパターンについては、「Builder の使用」の章を参照してください。
+
+---
+
+### シングルクラスター互換性と移行
+
+`multicluster-runtime` の設計目標の 1 つは、既存のシングルクラスターコントローラーからの移行をできるだけ滑らかにすることです。
+
+実際の移行ステップは次のようになります。
+
+- まずはシングルクラスターとして:
+  - `mcmanager.New(config, nil, opts)` で Manager を作成し（Provider なし）、
+  - `mcbuilder.ControllerManagedBy(mgr)` でコントローラーを登録し、
+  - Reconciler のシグネチャだけ `mcreconcile.Request` にしておく（`ClusterName` は常に `""`）。
+- その後、フリート対応したくなったときに:
+  - Kind / File / Kubeconfig / Cluster API / Cluster Inventory API など、環境に適した Provider を導入し、
+  - Manager の生成部分だけ `mcmanager.New(config, provider, opts)` に差し替え、
+  - Reconciler 内では `req.ClusterName` を読むようにし、`mgr.GetCluster(ctx, req.ClusterName)` で正しい Client を取得する。
+
+Multi-Cluster Manager は内部で通常の controller-runtime Manager をそのまま利用しているため、
+
+- 既存のエコシステム（テスト・ログ・メトリクス・ツール類）と **高い互換性を保ちつつ**、
+- 必要になったときだけスケールアウトしてフリート全体を扱えるようにする、
+
+という設計になっています。

@@ -1,0 +1,295 @@
+---
+title: Quickstart
+---
+
+This chapter walks you through building and running your **first multi-cluster controller** with `multicluster-runtime`, using the **Kind provider** and a small local fleet of Kind clusters.  
+By the end, you will have a single controller process that watches `ConfigMap` objects across multiple clusters and emits events when it finds them.
+
+You should already have:
+- read the **Introduction** chapters, especially **Overview**, **Architecture**, and **Key Concepts**,
+- completed **Prerequisites** and **Installation**, and
+- installed `kind`, `kubectl`, Docker (or another container runtime), and Go.
+
+---
+
+### What you will build
+
+In this Quickstart you will:
+
+- **Create a small Go project** that depends on `multicluster-runtime` and the **Kind provider**.
+- **Configure a Multi-Cluster Manager** that discovers Kind clusters whose names start with `fleet-`.
+- **Write a simple, uniform Reconciler** that:
+  - watches `ConfigMap` objects in all discovered clusters,
+  - logs which cluster and namespace each `ConfigMap` belongs to,
+  - emits a Kubernetes `Event` in the corresponding cluster.
+- **Create two Kind clusters** (`fleet-alpha` and `fleet-beta`) and observe the controller reacting to `ConfigMap` creation in both.
+
+This example uses the **uniform reconciler** pattern: the controller runs the *same* logic in every cluster independently. More advanced multi-cluster-aware patterns are covered later in the documentation.
+
+---
+
+### Step 0. Start from a prepared module
+
+If you have just finished the **Installation** chapter, you already have a Go module that:
+
+- uses Go **1.24+**,
+- depends on:
+  - `sigs.k8s.io/multicluster-runtime@v0.22.0-beta.0`,
+  - `sigs.k8s.io/controller-runtime@v0.22.0`,
+- and (optionally) includes the Kind provider module:
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kind@v0.22.0-beta.0
+```
+
+If you have not created a module yet, follow **Getting Started — Installation** first, then return here.
+
+---
+
+### Step 1. Create `main.go`
+
+In the root of your module, create a file `main.go` with the following contents:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	"sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+	// Set up structured logging.
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	entryLog := ctrllog.Log.WithName("kind-quickstart")
+	ctx := signals.SetupSignalHandler()
+
+	// 1. Create a Kind provider that discovers clusters whose names start with "fleet-".
+	provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+	// 2. Create a Multi-Cluster Manager that uses the provider.
+	mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+	if err != nil {
+		entryLog.Error(err, "unable to create manager")
+		os.Exit(1)
+	}
+
+	// 3. Register a controller that watches ConfigMaps across all discovered clusters.
+	err = mcbuilder.ControllerManagedBy(mgr).
+		Named("multicluster-configmaps").
+		For(&corev1.ConfigMap{}).
+		Complete(mcreconcile.Func(
+			func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+				log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+				log.Info("Reconciling ConfigMap")
+
+				// Resolve the cluster for this request.
+				cl, err := mgr.GetCluster(ctx, req.ClusterName)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+
+				// Fetch the ConfigMap from the target cluster.
+				cm := &corev1.ConfigMap{}
+				if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+					if apierrors.IsNotFound(err) {
+						// Object was deleted before we could read it; nothing to do.
+						return ctrl.Result{}, nil
+					}
+					return ctrl.Result{}, err
+				}
+
+				// Emit a Kubernetes Event in the member cluster.
+				cl.GetEventRecorderFor("kind-multicluster-configmaps").Event(
+					cm,
+					corev1.EventTypeNormal,
+					"ConfigMapFound",
+					"ConfigMap found in cluster "+req.ClusterName,
+				)
+
+				// Log which ConfigMap we saw and in which cluster.
+				log.Info("ConfigMap found",
+					"namespace", cm.Namespace,
+					"name", cm.Name,
+					"cluster", req.ClusterName,
+				)
+
+				return ctrl.Result{}, nil
+			},
+		))
+	if err != nil {
+		entryLog.Error(err, "unable to create controller")
+		os.Exit(1)
+	}
+
+	// 4. Start the manager. This starts the Kind provider and all controllers.
+	if err := mgr.Start(ctx); ignoreCanceled(err) != nil {
+		entryLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+}
+
+// ignoreCanceled treats context cancellation as a clean shutdown.
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+```
+
+This is a complete, runnable multi-cluster controller:
+
+- **Manager**: `mcmanager.New` wraps a standard controller-runtime manager and ties it to the Kind provider.
+- **Provider**: `kind.New(kind.Options{Prefix: "fleet-"})` discovers Kind clusters with names starting with `fleet-`.
+- **Builder**: `mcbuilder.ControllerManagedBy(mgr)` registers a controller that watches `ConfigMap` objects in all engaged clusters.
+- **Reconciler**: receives `mcreconcile.Request` (with `ClusterName` and an inner `reconcile.Request`), resolves the correct `cluster.Cluster`, and then reads from that cluster’s API server.
+
+---
+
+### Step 2. Create a local Kind fleet
+
+Next, create two Kind clusters that will form your fleet:
+
+```bash
+kind create cluster --name fleet-alpha
+kind create cluster --name fleet-beta
+```
+
+Kind will:
+- create the clusters `fleet-alpha` and `fleet-beta`, and
+- configure `kubectl` contexts:
+  - `kind-fleet-alpha`
+  - `kind-fleet-beta`
+
+You can verify that both clusters are up:
+
+```bash
+kind get clusters
+```
+
+The Kind provider will discover these clusters automatically when the manager starts, because their names match the `Prefix: "fleet-"` option.
+
+---
+
+### Step 3. Run the controller
+
+With the clusters running and `main.go` in place, run your controller from the project root:
+
+```bash
+go run ./...
+```
+
+You should see logs similar to:
+
+```text
+INFO  kind-quickstart  Starting manager
+INFO  provider-kind     discovered cluster {"name": "fleet-alpha"}
+INFO  provider-kind     discovered cluster {"name": "fleet-beta"}
+INFO  controller        Starting Controller {"controller": "multicluster-configmaps"}
+```
+
+Behind the scenes:
+
+- The **Kind provider** enumerates existing Kind clusters whose names start with `fleet-`.
+- For each cluster, it creates a `cluster.Cluster` with its own client and cache and **engages** it with the Multi-Cluster Manager.
+- The `multicluster-configmaps` controller then:
+  - registers a multi-cluster `Kind` source for `ConfigMap`,
+  - receives `mcreconcile.Request` items tagged with `ClusterName` for each cluster.
+
+---
+
+### Step 4. Create ConfigMaps and watch reconcilers fire
+
+Open a second terminal to create test `ConfigMap` objects in both clusters.
+
+- **In `fleet-alpha`:**
+
+```bash
+kubectl --context kind-fleet-alpha create configmap demo-alpha \
+  --from-literal=message="hello from alpha"
+```
+
+- **In `fleet-beta`:**
+
+```bash
+kubectl --context kind-fleet-beta create configmap demo-beta \
+  --from-literal=message="hello from beta"
+```
+
+Back in the controller’s terminal, you should see log lines like:
+
+```text
+INFO  Reconciling ConfigMap {"cluster": "fleet-alpha", "name": "demo-alpha", "namespace": "default"}
+INFO  ConfigMap found {"cluster": "fleet-alpha", "namespace": "default", "name": "demo-alpha"}
+INFO  Reconciling ConfigMap {"cluster": "fleet-beta", "name": "demo-beta", "namespace": "default"}
+INFO  ConfigMap found {"cluster": "fleet-beta", "namespace": "default", "name": "demo-beta"}
+```
+
+You can also watch the generated Events in each cluster:
+
+```bash
+# Terminal 1: watch events in fleet-alpha
+kubectl --context kind-fleet-alpha get events -A --watch
+
+# Terminal 2: watch events in fleet-beta
+kubectl --context kind-fleet-beta get events -A --watch
+```
+
+For each `ConfigMap` you created, you should see an Event with reason `ConfigMapFound` and the message `"ConfigMap found in cluster <cluster-name>"`.
+
+This demonstrates the **One Pod, Many Clusters** model:
+
+- The reconciler implementation is written once.
+- The Multi-Cluster Manager and Kind provider ensure it runs for each cluster in the fleet.
+
+---
+
+### Step 5. Clean up
+
+Stop the controller by pressing `Ctrl+C` in the terminal where `go run` is running.
+
+Then delete the Kind clusters:
+
+```bash
+kind delete cluster --name fleet-alpha
+kind delete cluster --name fleet-beta
+```
+
+This will remove the local clusters and free up resources on your machine.
+
+---
+
+### Where to go next
+
+From here you can:
+
+- **Customize the controller**:
+  - change the watched type from `ConfigMap` to your own CRD,
+  - add `Owns` and `Watches` relationships using `mcbuilder`,
+  - use `EngageOptions` to decide whether to include the local (host) cluster or only provider-managed clusters.
+- **Try other providers**:
+  - swap the Kind provider for the **File provider** (kubeconfig files),
+  - or for the **Kubeconfig provider** (kubeconfig Secrets in a management cluster),
+  - or experiment with the **Cluster API** and **Cluster Inventory API** providers when you have those environments available.
+- **Deepen your understanding**:
+  - Multi-Cluster Manager in depth: [03-core-concepts--the-multi-cluster-manager.md](03-core-concepts--the-multi-cluster-manager)
+  - Providers: [03-core-concepts--providers.md](03-core-concepts--providers)
+  - Controller patterns and the `mcbuilder` API: [04-controller-patterns--using-the-builder.md](04-controller-patterns--using-the-builder)
+
+With this Quickstart complete, you have a working baseline for building richer, production-grade multi-cluster controllers on top of `multicluster-runtime`.

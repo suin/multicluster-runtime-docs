@@ -1,0 +1,331 @@
+---
+title: File Provider
+---
+
+**File Provider** は、ローカルファイルシステム上の kubeconfig ファイルからクラスターを検出し、`multicluster-runtime` のフリートとして扱えるようにするプロバイダーです。  
+すでに kubeconfig が存在している環境で、「とりあえずこの kubeconfig 群をフリートとして扱いたい」というケースに適しています。
+
+この章では次の内容を説明します。
+
+- **File Provider の用途とユースケース**
+- **ディスカバリ・クラスター名・ライブリロードの仕組み**
+- **`file.Options` による設定方法**
+- `examples/file` に基づく **利用例**
+
+プロバイダーの概念全体については、まず **「コアコンセプト — プロバイダー」** を読んでおくと理解しやすくなります。
+
+---
+
+### どんなときに File Provider を使うか
+
+次のような場合に File Provider の利用が向いています。
+
+- **すでに kubeconfig ベースでクラスターを管理している**
+  - 1 つ以上の kubeconfig ファイルが Git リポジトリ、プロビジョニングツール、もしくは手動運用で用意されている。
+  - Cluster API や ClusterProfile API などを用意せず、まずはそれらの kubeconfig をそのままマルチクラスターコントローラーのフリートとして使いたい。
+- **非常に軽量なインベントリが欲しい**
+  - PoC やラボ環境で、「このディレクトリにある kubeconfig 群 = フリート」というモデルで十分。
+- **既存の kubeconfig ベースのツールから徐々に移行したい**
+  - すでに `~/.kube/config` や特定ディレクトリ配下の kubeconfig を前提にしているツールがあり、そのレイアウトをそのまま活かして `multicluster-runtime` を試したい。
+
+一方で次のようなケースでは他のプロバイダーがより適切です。
+
+- すでに **Kubernetes ネイティブなインベントリ** を持っている場合
+  - Cluster API の `Cluster` からフリートを作りたい → **Cluster API Provider**
+  - ClusterProfile API (`ClusterProfile`) を使いたい → **Cluster Inventory API Provider**
+- kubeconfig をハブクラスター上の **Secret** として管理したい → **Kubeconfig Provider**
+- ローカル開発で Kind クラスターを使いたい → **Kind Provider**
+- 単一クラスター上でマルチクラスター挙動をシミュレートしたい → **Namespace Provider**
+
+---
+
+### File Provider がクラスターを検出・管理する仕組み
+
+File Provider の実装は `providers/file` にあり、次の 2 つのインターフェースを実装しています。
+
+- `multicluster.Provider`
+- `multicluster.ProviderRunnable`
+
+実行時には、**ファイルシステムをインベントリのソース・オブ・トゥルース** とするプロバイダーとして動作します。
+
+- **kubeconfig の入力元**
+  - 次の 3 つを通じて kubeconfig を指定します。
+    - `KubeconfigFiles`: 明示的な kubeconfig ファイルパスのリスト
+    - `KubeconfigDirs`: 検索対象ディレクトリ
+    - `KubeconfigGlobs`: ディレクトリ内でマッチさせるグロブパターン
+  - `KubeconfigFiles` / `KubeconfigDirs` の両方が空の場合、次のデフォルトが適用されます。
+    1. 環境変数 `$KUBECONFIG` が有効なファイルパスなら、そのパスを使う
+    2. そうでなく、`$HOME/.kube/config` が存在すればそれを使う
+    3. どちらもなければ、カレントディレクトリを検索対象ディレクトリとする
+
+- **kubeconfig からのクラスター生成**
+  - Provider はまず、すべての kubeconfig ファイルパスを集約します。
+    - `KubeconfigFiles` に指定されたすべての既存ファイル
+    - 各 `KubeconfigDir` について、各 `KubeconfigGlobs` にマッチするファイル
+      （デフォルトでは `kubeconfig.yaml`, `kubeconfig.yml`, `*.kubeconfig`, `*.kubeconfig.yaml`, `*.kubeconfig.yml`）
+  - 各 kubeconfig ファイルに対して:
+    - `clientcmd.LoadFromFile` で kubeconfig を読み込み、
+    - その kubeconfig に含まれる **すべての context** を列挙し、
+    - 各 context ごとに:
+      - `clientcmd.NewNonInteractiveClientConfig(...).ClientConfig()` で `*rest.Config` を生成し、
+      - `cluster.New(restConfig, opts.ClusterOptions...)` で `cluster.Cluster` を作成します。
+  - これにより、「指定された kubeconfig 群に含まれる全 context」の集合が、`map[string]cluster.Cluster` として得られます。
+
+- **クラスター名の付け方**
+  - 各 context は、次の形式のクラスター名で識別されます。
+    - `ClusterName = "<ファイルパス><Separator><context 名>"`  
+  - `Separator` のデフォルトは `"+"` です。
+  - 例えば:
+    - ファイル: `/home/user/.kube/config`
+    - context: `kind-dev`
+    - separator: `"+"`
+    - のとき:
+      - `ClusterName = "/home/user/.kube/config+kind-dev"`
+  - この方式により、同じファイルパスと context 名の組み合わせを再利用しない限り、クラスター名は:
+    - **一意** であり、
+    - ファイルシステムの状態から **決定的に再現** できます。
+  - Reconciler 側では、`ClusterName` をあくまで **不透明な文字列** として扱うのが推奨です。
+    - ログやメトリクスのラベルには用いる
+    - ただしパス構造に依存したパースロジックは避ける
+    - 長期的・グローバルなクラスター ID が必要な場合は、各メンバークラスター内の About API / `ClusterProperty`（`cluster.clusterset.k8s.io` など、KEP‑2149 参照）を利用します。
+
+- **初回同期と更新**
+  - Provider の `Start(ctx, aware)` が呼ばれると、まず初回の `run` が実行されます。
+    1. kubeconfig 群からクラスター集合を計算し、
+    2. `pkg/clusters.Clusters` の `AddOrReplace` を使って各クラスターを登録します。
+       - `AddOrReplace` は内部で:
+         - クラスター専用のコンテキストを作成し、
+         - `cl.Start(clusterCtx)` を別ゴルーチンで起動し、
+         - `cl.GetCache().WaitForCacheSync(clusterCtx)` 完了後、
+         - `aware.Engage(clusterCtx, clusterName, cl)` を呼び出します。
+    3. その時点のクラスター名リストを「既知のフリート」として保持します。
+  - その後の更新（次節参照）でも同様に:
+    - ディスク上の kubeconfig 群から **現在あるべきクラスター集合** を再計算し、
+    - 新規・更新クラスターには `AddOrReplace` を呼び、
+    - 以前は存在していたが現在は見えなくなったクラスターには `Remove(clusterName)` を呼び出して、フリートから外します。
+
+このパターンは、「カスタムプロバイダー」章で説明している典型的な Provider 実装と同じであり、**ファイルシステム上の kubeconfig 群 = インベントリ** として扱っています。
+
+---
+
+### ファイルシステム監視によるライブリロード
+
+File Provider は kubeconfig を一度読み込むだけでなく、関連ディレクトリを **fsnotify で監視** し、ファイルの変更に応じてフリートを自動的に更新します。
+
+- **ウォッチャーのセットアップ**
+  - 初回の `run` 実行後、`fsnotify` のウォッチャーを作成します。
+  - `KubeconfigFiles` に指定された各ファイルに対しては:
+    - ファイル自身ではなく、その **親ディレクトリ** を監視します（ツールやエディタがファイルを入れ替えるパターンに対応するため）。
+  - `KubeconfigDirs` に指定された各ディレクトリに対しては:
+    - そのディレクトリを監視対象に追加します。
+
+- **イベント処理**
+  - Provider は次のようなループに入ります。
+    - `ctx.Done()` が閉じられたら終了。
+    - ファイルシステムイベントを受け取ったら:
+      - `"received fsnotify event"` ログを出力し、
+      - 再度 `run(ctx, aware)` を呼び出してフリートを再計算・反映します。
+    - ウォッチャーエラーを受け取ったら:
+      - `"file watcher error"` をログ出力し、エラーチャネルが閉じられるまで処理を継続します。
+
+- **検知できる変化の例**
+  - Provider は毎回「全 kubeconfig 群からクラスター集合を再計算」するため、次のようなイベントに追従できます。
+    - 監視対象ディレクトリに新しい kubeconfig ファイルが追加され、グロブにマッチした
+    - 既存の kubeconfig ファイルの内容（context や認証情報）が変更された
+    - kubeconfig ファイルやディレクトリが削除された
+
+結果として:
+
+- 新しい kubeconfig や context を追加すると、そのクラスターが **自動で Engage** されます。
+- kubeconfig や context を削除すると、そのクラスターは **自動でフリートから除外** されます。
+- kubeconfig 内のエンドポイントや認証情報を更新すると、`AddOrReplace` を通じてクラスタークライアントが **作り直される / 置き換えられる** ことが期待されます。
+
+---
+
+### 設定: `file.Options`
+
+File Provider は次のように構築します。
+
+```go
+provider, err := file.New(file.Options{
+	KubeconfigFiles: []string{"/path/to/kubeconfig"},
+	KubeconfigDirs:  []string{"/path/to/kubeconfig-dir"},
+	KubeconfigGlobs: []string{"*.kubeconfig"},
+	Separator:       "+",
+	ClusterOptions:  []cluster.Option{/* ... */},
+})
+```
+
+`Options` は次のフィールドを持ちます。
+
+```go
+type Options struct {
+	// 明示的に指定する kubeconfig ファイルパス群。
+	KubeconfigFiles []string
+
+	// kubeconfig ファイルを探索するディレクトリ群。
+	KubeconfigDirs []string
+
+	// ディレクトリ内で kubeconfig ファイルを探すときのグロブパターン。
+	// デフォルトは一般的なファイル名パターンのセット。
+	KubeconfigGlobs []string
+
+	// ClusterName を構成するとき、ファイルパスと context 名の間に挟む文字列。
+	// デフォルトは "+"。
+	Separator string
+
+	// controller-runtime の cluster.New に渡すオプション。
+	ClusterOptions []cluster.Option
+}
+```
+
+- **`KubeconfigFiles`**
+  - 「このファイルをインベントリとして必ず使う」と決まっている場合に利用します。
+  - 1 つの kubeconfig に複数の context が含まれていれば、各 context は別々のクラスターとして扱われます。
+  - 存在しないファイルは Info ログを出してスキップされます。`os.Stat` でその他のエラーが出た場合は同期処理自体を中断します。
+
+- **`KubeconfigDirs` + `KubeconfigGlobs`**
+  - 「このディレクトリ配下の kubeconfig 群をすべてフリートに含める」ような用途で使います。
+  - 各ディレクトリに対して `filepath.Glob(filepath.Join(dir, glob))` を実行し、マッチしたファイルを kubeconfig 候補とします。
+  - `Options` 上で `KubeconfigGlobs` が空の場合、デフォルトで次のパターンが使われます。
+    - `kubeconfig.yaml`, `kubeconfig.yml`
+    - `*.kubeconfig`, `*.kubeconfig.yaml`, `*.kubeconfig.yml`
+  - 存在しないディレクトリは Info ログを出してスキップされます。その他のエラーは同期処理を中断します。
+
+- **`Separator`**
+  - ファイルパスと context 名を結合して `ClusterName` を生成する際の区切り文字です。
+  - デフォルトの `"+"` は通常のファイルパス文字と衝突しにくく、見分けもつきやすくなっています。
+  - 既存のメトリクスやログの命名規則と合わせたい場合などは、`"#"` など任意の文字列に変更できます。
+
+- **`ClusterOptions`**
+  - すべてのクラスターに共通して渡される `cluster.New` のオプションです。
+  - 用途の例:
+    - 追加の Scheme を登録する
+    - Cache の設定や再同期間隔を調整する
+    - Client の QPS / Burst を増やす
+
+`file.New` に対して `KubeconfigFiles` / `KubeconfigDirs` をどちらも空で渡した場合には、前述の `defaultKubeconfigPaths` が使われ、ローカル開発では多くの場合 `~/.kube/config` が自動的に利用されます。
+
+---
+
+### マルチクラスターコントローラーへの組み込み例
+
+`examples/file/main.go` には、File Provider を使って:
+
+- kubeconfig ファイル／ディレクトリからクラスターを検出し、
+- 各クラスターで `ConfigMap` を監視する **均一（Uniform）な Reconciler** を動かし、
+- 見つかった `ConfigMap` をログ出力する
+
+という一連のフローが実装されています。
+
+ざっくりした流れは次のとおりです。
+
+1. **コマンドラインフラグから kubeconfig の場所を受け取る**
+
+   - `-kubeconfigs`: カンマ区切りの kubeconfig ファイルパスリスト
+   - `-kubeconfig-dirs`: カンマ区切りのディレクトリリスト
+   - `-globs`: カンマ区切りのグロブパターンリスト（任意）
+
+2. **フラグ値を整形する**
+
+   - 空文字列のみが入っている場合は空スライスに変換するなど。
+
+3. **File Provider を構築する**
+
+   ```go
+   provider, err := file.New(file.Options{
+   	KubeconfigFiles: kubeconfigFiles,
+   	KubeconfigDirs:  kubeconfigDirs,
+   	KubeconfigGlobs: strings.Split(*fGlobs, ","),
+   })
+   ```
+
+4. **Provider を渡して Multi-Cluster Manager を作成する**
+
+   ```go
+   mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+   ```
+
+5. **`ConfigMap` を対象とするマルチクラスターコントローラーを登録する**
+
+   ```go
+   if err := mcbuilder.ControllerManagedBy(mgr).
+   	Named("multicluster-configmaps").
+   	For(&corev1.ConfigMap{}).
+   	Complete(mcreconcile.Func(func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+   		log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+   		log.Info("Reconciling ConfigMap")
+
+   		cl, err := mgr.GetCluster(ctx, req.ClusterName)
+   		if err != nil {
+   			return reconcile.Result{}, err
+   		}
+
+   		cm := &corev1.ConfigMap{}
+   		if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+   			if apierrors.IsNotFound(err) {
+   				return ctrl.Result{}, nil
+   			}
+   			return ctrl.Result{}, err
+   		}
+
+   		log.Info("ConfigMap found", "namespace", cm.Namespace, "name", cm.Name, "cluster", req.ClusterName)
+   		return ctrl.Result{}, nil
+   	})); err != nil {
+   	// セットアップ時のエラー処理
+   }
+   ```
+
+6. **Manager を起動する**
+
+   ```go
+   if err := mgr.Start(ctx); ignoreCanceled(err) != nil {
+   	entryLog.Error(err, "unable to start")
+   }
+   ```
+
+実行時のイメージ:
+
+- Provider は指定された kubeconfig ファイル／ディレクトリからクラスターを検出し、
+- `/home/user/.kube/config+kind-kind` のような名前でクラスターを Engage し、
+- Reconciler は各クラスターの `ConfigMap` に対するイベントを `mcreconcile.Request` 経由で受け取ります。
+
+構造としては、**Quickstart** で紹介されている Kind Provider の例とほぼ同じであり、**フリートのソースが「ファイル」になった** だけです。
+
+---
+
+### 運用上の注意点とベストプラクティス
+
+- **クラスター ID とファイルレイアウトの関係**
+  - File Provider の `ClusterName` は「ファイルパス＋ context 名」から導出されるため、プロバイダー間で共有されるような長期的 ID ではありません。
+  - 将来的に About API (`ClusterProperty`) や ClusterProfile API（KEP‑2149, KEP‑4322）と併用する場合は:
+    - `ClusterName` を `multicluster-runtime` 内部のルーティングキーとみなし、
+    - `cluster.clusterset.k8s.io` や `clusterset.k8s.io` を、ツール横断で安定したクラスター ID / ClusterSet ID として利用する、という使い分けがおすすめです。
+
+- **セキュリティの観点**
+  - File Provider は、指定された kubeconfig をそのまま利用します。
+    - kubeconfig 内に cluster-admin 相当の認証情報が含まれていれば、コントローラーも同じ権限を持つことになります。
+  - ベストプラクティスとして:
+    - マルチクラスターコントローラー専用の ServiceAccount と kubeconfig を用意し、
+    - 各クラスターの RBAC を必要最小限に絞り、
+    - ファイルパーミッションや OS レベルの秘密管理で kubeconfig を保護することを推奨します。
+
+- **フリート変化とエラーハンドリング**
+  - kubeconfig ファイルが壊れていたり読めなくなった場合:
+    - Provider はエラーをログに出し、該当ファイルをスキップして処理を続行します。
+  - すでにフリートから外れたクラスターに対して `Get` が呼ばれた場合:
+    - 埋め込みの `Clusters` ヘルパーを通じて `multicluster.ErrClusterNotFound` が返されます。
+    - 既定のラッパー付きコントローラーでは、このエラーは「非致命・再キューなし」として扱われます。
+
+- **CI や自動化との相性**
+  - File Provider は次のような CI ジョブとの組み合わせに適しています。
+    - kind やマネージドクラスターをジョブ内で動的に作成し、
+    - kubeconfig を決め打ちディレクトリに書き出し、
+    - そのディレクトリをインベントリとしてマルチクラスターの E2E テストを実行する。
+  - **Multi Provider** と組み合わせれば:
+    - あるディレクトリの kubeconfig 群を 1 つの Provider で扱いつつ、
+    - 別の Provider（Cluster API / Cluster Inventory API など）と同時に利用し、
+    - 1 つのマルチクラスターコントローラー群から複数のフリートを横断的に操作できます。
+
+まとめると、File Provider は「kubeconfig ファイル群」から **動的なマルチクラスターフリート** を構築するためのシンプルな仕組みを提供し、ライブリロードやインデックスの挙動も他の Provider と同じモデルに統一されています。  
+既存の kubeconfig 運用を活かしつつ `multicluster-runtime` を試したい場合の出発点として、特に有用です。

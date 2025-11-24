@@ -1,0 +1,670 @@
+---
+title: Contributing & Development Guide
+---
+
+### Contributing & Development Guide
+
+This chapter explains how to **develop with and contribute to `multicluster-runtime`**.  
+It focuses on the core codebase (Manager, Builder, Providers, Sources) rather than on this documentation repository itself.
+
+You will learn:
+
+- how the **repository is structured** and where to look when you change something,
+- how to **set up your development environment** and run tests,
+- how to **iterate on controllers and providers** using the patterns described in earlier chapters,
+- what to keep in mind when **changing public APIs** and submitting pull requests upstream.
+
+---
+
+### Who this guide is for
+
+This guide is aimed at three overlapping groups:
+
+- **Controller authors**  
+  You are building controllers for your own project and want to use `multicluster-runtime` as a library (for example, using the Kind, Kubeconfig, Cluster API, or Cluster Inventory API providers).
+- **Provider authors**  
+  You want to implement or extend a `multicluster.Provider` to integrate your inventory system or platform (for example, a new ClusterProfile implementation, a custom registry, or a SaaS control plane).
+- **Upstream contributors**  
+  You intend to modify the core library or the built-in providers and send pull requests to the `kubernetes-sigs/multicluster-runtime` repository.
+
+Most sections apply to all three audiences; provider‑specific and upstream‑specific guidance is called out explicitly.
+
+---
+
+### Repository layout
+
+The `multicluster-runtime` codebase follows controller-runtime’s conventions and keeps related concepts together.  
+At a high level:
+
+- **Root**
+  - `go.mod`, `go.sum`: main module definition.
+  - `Makefile`: standard entry point for tests, linting, and release tooling.
+  - `CONTRIBUTING.md`, `README.md`, `SECURITY.md`, `RELEASE.md`: project guidelines and meta‑documents.
+- **Core library (`pkg/`)**
+  - `pkg/manager`: the multi-cluster `Manager` interface and implementation; wraps a controller-runtime `manager.Manager` and a `multicluster.Provider`.
+  - `pkg/multicluster`: core interfaces (`Aware`, `Provider`, `ProviderRunnable`) used by managers and providers.
+  - `pkg/builder`: multi-cluster controller builder (`mcbuilder`), a fork of controller-runtime’s builder adapted for `mcreconcile.Request` and multi-cluster Sources.
+  - `pkg/reconcile`: types like `mcreconcile.Request` and helpers such as the `ClusterNotFound` wrapper.
+  - `pkg/source`: multi-cluster Sources such as the multi-cluster `Kind` source.
+  - `pkg/clusters`, `pkg/context`, `pkg/controller`, `pkg/handler`: helper packages for managing fleets, cluster‑scoped managers, and event handlers.
+- **Providers (`providers/`)**
+  - `providers/kind`: Kind provider for local development.
+  - `providers/file`: file‑based kubeconfig provider.
+  - `providers/kubeconfig`: kubeconfig‑Secret‑based provider for management clusters.
+  - `providers/cluster-api`: Cluster API provider that reconciles CAPI `Cluster` objects and uses their kubeconfig Secrets.
+  - `providers/cluster-inventory-api`: Cluster Inventory API provider implementing the ClusterProfile/credentials design from KEP‑4322 and KEP‑5339.
+  - `providers/namespace`: namespaces‑as‑clusters provider.
+  - `providers/multi`, `providers/clusters`, `providers/single`, `providers/nop`: composition and utility providers.
+  - Many providers have their own `go.mod` and `OWNERS` files; they are maintained as **reference implementations**.
+- **Examples (`examples/`)**
+  - `examples/kind`, `examples/kubeconfig`, `examples/file`, `examples/cluster-api`, `examples/cluster-inventory-api`, `examples/namespace`, …  
+    Each directory is a standalone Go module with a `main.go` that demonstrates a concrete controller plus provider wiring.
+- **Hack / tooling (`hack/`, `hack/tools/`)**
+  - `hack/check-everything.sh`: runs verification scripts, tests, and compiles all examples.
+  - `hack/test-all.sh`: runs `go test` (with envtest) across all modules.
+  - `hack/verify.sh`: runs `make modules`, `make imports`, `make lint`, and (in CI) `make verify-modules`.
+  - `hack/tools/`: pinned versions of tools such as `golangci-lint`, `controller-gen`, and `go-apidiff`.
+
+When you are unsure where a concept is implemented, it is often easiest to:
+
+- skim the relevant documentation chapter (for example, Providers, Manager, Builder),
+- then jump into the corresponding `pkg/` or `providers/` package to see the code.
+
+---
+
+### Setting up your development environment
+
+`multicluster-runtime` is developed as if it were part of `controller-runtime`: it follows the same Go, testing, and linting standards.
+
+- **Prerequisites**
+  - Go **1.24.9** or newer (matching the version pinned in the Makefile; run `make go-version` to confirm).
+  - A POSIX shell environment (Linux, macOS, or WSL).
+  - Optionally, Docker or another container runtime if you want to run Kind‑based examples.
+
+- **Cloning the repository**
+
+```bash
+git clone https://github.com/kubernetes-sigs/multicluster-runtime.git
+cd multicluster-runtime
+
+# Check the Go toolchain version the project expects
+make go-version
+```
+
+- **Installing and tidying modules**
+
+```bash
+# Ensure all go.mod/go.sum files are up-to-date
+make modules
+
+# Format imports consistently across modules
+make imports
+```
+
+- **Running the full test + verification suite**
+
+```bash
+# Runs hack/check-everything.sh:
+# - verifies modules and formatting
+# - runs go test ./... (with envtest) across all modules
+# - verifies that examples build
+make test
+```
+
+Under the hood, `make test`:
+
+- sets up `setup-envtest` and downloads Kubernetes binaries for integration tests,
+- runs `go test -race ./...` across all modules (with Ginkgo flags wired where applicable),
+- builds each `examples/*` module with `go install` to ensure examples stay compilable.
+
+For quick feedback during development you can run a narrower test set:
+
+```bash
+# Run tests only in a specific module
+WHAT=./providers/kind make test
+
+# Or invoke Go directly while iterating on a package
+cd providers/kind
+go test ./...
+```
+
+- **Linting and formatting**
+
+```bash
+# Run golangci-lint across all modules
+make lint
+
+# Run golangci-lint with auto-fixers where supported
+make lint-fix
+```
+
+Running `make test` and `make lint` before sending a pull request is strongly recommended; CI will run similar checks.
+
+---
+
+### Running and modifying examples
+
+The `examples/` directory contains small, self-contained programs that show how to:
+
+- construct a **multi-cluster Manager** with a specific Provider,
+- register controllers using `mcbuilder.ControllerManagedBy`,
+- write reconcilers that consume `mcreconcile.Request` and call `mgr.GetCluster`.
+
+Typical workflow:
+
+```bash
+# Kind provider example
+cd examples/kind
+
+# Create some local Kind clusters (see the Quickstart for details)
+kind create cluster --name fleet-alpha
+kind create cluster --name fleet-beta
+
+# Run the example controller
+go run ./main.go
+```
+
+You can modify these examples to experiment with:
+
+- different Providers (for example, swap Kind for File or Kubeconfig),
+- different primary resources and reconcile logic,
+- `EngageOptions` on the builder to control whether controllers watch the host cluster, provider clusters, or both.
+
+When you change examples as part of a pull request, keep them focused and pedagogical: they are intended as **living documentation** for controller authors.
+
+---
+
+### Developing controllers with multicluster-runtime
+
+Most controllers start as normal controller-runtime projects and then **opt in to multi-cluster support** with a few mechanical changes:
+
+- **1. Switch to the multi-cluster Manager and Builder**
+  - Replace controller-runtime imports with their multi-cluster equivalents:
+
+```go
+import (
+    mcbuilder  "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager  "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind" // or kubeconfig, cluster-api, ...
+)
+```
+
+  - Create a `mcmanager.Manager` with a chosen Provider:
+
+```go
+provider := kind.New()
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+```
+
+  - Register controllers using `mcbuilder.ControllerManagedBy(mgr)` instead of the controller-runtime builder.
+
+- **2. Change your reconciler to accept `mcreconcile.Request`**
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // Use the per-cluster client
+    obj := &myv1alpha1.MyResource{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+        // ...
+    }
+
+    // business logic
+}
+```
+
+The rest of your reconciliation logic usually remains unchanged; you still aim for idempotent, per‑key reconcile functions and use the same result and error semantics as in controller-runtime.
+
+- **3. Decide which clusters a controller should watch**
+
+Use `EngageOptions` on the builder to configure whether a controller attaches to:
+
+- the **local (host) cluster**,
+- the **provider-managed clusters**, or
+- both (for hybrid hub‑and‑spoke patterns).
+
+See the **Controller Patterns — Uniform Reconcilers** and **Multi-Cluster-Aware Reconcilers** chapters for detailed patterns and migration guides.
+
+---
+
+### Developing providers and integrating with inventories
+
+Providers are where `multicluster-runtime` meets your platform’s notion of cluster inventory, identity, and credentials.  
+If you are building or extending a Provider, keep these principles in mind:
+
+- **Implement the core interfaces**
+  - All providers implement:
+    - `multicluster.Provider` (mandatory),
+    - optionally `multicluster.ProviderRunnable` if they need a long‑running discovery loop.
+  - Simple providers (for tests or static fleets) can implement `Provider` only and rely on pre‑constructed `cluster.Cluster` instances.
+
+- **Use controller-runtime patterns when watching APIs**
+  - Providers that integrate with Kubernetes resources (for example, Cluster API or ClusterProfile) are themselves controllers:
+    - they use `builder.ControllerManagedBy(localMgr).For(&MyInventoryType{}).Complete(provider)`,
+    - they reconcile inventory objects into `cluster.Cluster` instances,
+    - they call `Engage` on the multi-cluster Manager when a new cluster is ready.
+
+- **Follow SIG-Multicluster standards where applicable**
+  - **KEP‑2149 (ClusterId)** for stable cluster identity via `ClusterProperty` resources.
+  - **KEP‑4322 (ClusterProfile API)** for expressing inventory and cluster status.
+  - **KEP‑5339 (Plugin for Credentials in ClusterProfile)** for obtaining `rest.Config` via external credential plugins.
+  - The `cluster-inventory-api` provider is a concrete reference implementation that ties these pieces together.
+
+- **Make it composable**
+  - Prefer small, focused providers that can be:
+    - combined with the `multi` provider (prefix‑based composition),
+    - reused in tests (via the `clusters` or `single` providers),
+    - configured through an `Options` struct rather than global variables.
+
+For a deeper conceptual overview, see **Core Concepts — Providers** and the **Providers Reference** chapters; for concrete patterns, study `providers/cluster-api` and `providers/cluster-inventory-api`.
+
+---
+
+### Testing strategy
+
+`multicluster-runtime` uses a mix of:
+
+- **unit tests**, often in core packages and small helpers,
+- **envtest-based integration tests**, especially for providers that watch Kubernetes APIs,
+- **compilation tests** for examples, enforced by `hack/check-everything.sh`.
+
+When adding new functionality:
+
+- aim for **fast unit tests** that exercise the majority of your logic,
+- add **integration tests** where behaviour depends on controller-runtime caches, envtest clusters, or multiple modules,
+- keep example programs compiling and, if they demonstrate your feature, cover them in docs.
+
+Running `make test` locally before sending a PR ensures that your changes pass the same checks CI will run.
+
+---
+
+### API design and compatibility
+
+`multicluster-runtime` is intended to track controller-runtime releases closely and may eventually donate functionality upstream.  
+To keep that possible:
+
+- **Prefer idiomatic controller-runtime APIs**
+  - Mirror naming, option patterns, and error handling from controller-runtime where appropriate.
+  - Avoid introducing new concepts if existing controller-runtime abstractions can be extended.
+
+- **Be careful when changing exported types**
+  - Public types and functions in `pkg/` and `providers/` are part of the library surface.
+  - The `go-apidiff` tool (via `make verify-apidiff`) is used to check for accidental breaking changes against `origin/main`.
+  - When you intentionally change a public API, document the rationale and migration path in your PR and, if needed, in this documentation.
+
+- **Keep providers conservative**
+  - Built-in providers are **reference implementations**, not the only supported way to integrate with a given system.
+  - Avoid baking environment‑specific assumptions into their APIs; rely on Options and configuration where possible.
+
+---
+
+### Contributing upstream
+
+`multicluster-runtime` is a SIG‑Multicluster subproject and follows the broader Kubernetes community processes.
+
+- **Community and conduct**
+  - All contributors and maintainers abide by the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md).
+  - See the upstream `CONTRIBUTING.md` for links to the Kubernetes Contributor Guide and mentoring programs.
+
+- **Before opening a pull request**
+  - Discuss substantial new features or design changes in SIG‑Multicluster first (for example, in the `#sig-multicluster` Slack channel or via KEPs).
+  - Run `make test` (and ideally `make lint`) locally.
+  - Add or update tests to cover your change.
+  - Update documentation (this site) if your change affects user‑facing behaviour or patterns.
+
+- **Submitting a PR**
+  - Open a PR against `kubernetes-sigs/multicluster-runtime` on GitHub.
+  - Ensure your commits are easy to review: small, focused changes with clear commit messages.
+  - Be responsive to reviewer feedback; it is normal for PRs to go through several iterations.
+
+By following these guidelines—and the controller patterns described in earlier chapters—you can confidently extend `multicluster-runtime` itself, or build robust multi-cluster controllers and providers on top of it.
+
+### Contributing — Development Guide
+
+This chapter explains how to set up a local development environment for **multicluster-runtime**, run tests and linters, and contribute changes that fit well into the existing codebase.  
+It is intended for contributors to the library and built‑in providers, as well as advanced users who want to understand how the project is structured under the hood.
+
+multicluster-runtime is a Kubernetes SIG subproject and follows the CNCF code of conduct and the broader Kubernetes contributor guidelines:
+
+- **Code of Conduct**: Contributions must follow the CNCF Code of Conduct.
+- **Kubernetes contributor docs**: See the upstream `CONTRIBUTING.md` and the Kubernetes Contributor Guide for expectations around issues, PRs, and review.
+
+---
+
+### Repository layout (high level)
+
+The upstream repository is organized into a small set of core packages, provider implementations, and runnable examples:
+
+- **Core runtime**
+  - `pkg/manager`: The multi-cluster `Manager` abstraction that wraps a controller-runtime manager and wires in a `multicluster.Provider`.
+  - `pkg/multicluster`: Interfaces for providers and multi-cluster–aware components (`Provider`, `ProviderRunnable`, `Aware`).
+  - `pkg/builder`: A multi-cluster version of controller-runtime’s builder (`mcbuilder`).
+  - `pkg/reconcile`, `pkg/source`, `pkg/handler`, `pkg/controller`, `pkg/clusters`, `pkg/context`: Multi-cluster variants of the corresponding controller-runtime concepts.
+- **Providers**
+  - `providers/kind`, `providers/kubeconfig`, `providers/file`, `providers/cluster-api`, `providers/cluster-inventory-api`, `providers/namespace`, `providers/multi`, `providers/clusters`, `providers/single`, `providers/nop`.
+  - Each provider is its **own Go module** (with its own `go.mod`/`go.sum`) and has focused tests and, in some cases, example code.
+- **Examples**
+  - `examples/kind`, `examples/kubeconfig`, `examples/file`, `examples/cluster-api`, `examples/cluster-inventory-api`, `examples/namespace`, and others.
+  - Each example is a self-contained main program that demonstrates a particular provider and controller pattern.
+- **Hack and tooling**
+  - `hack/` contains shared scripts for testing, verification, and release tooling.
+  - `hack/tools` holds small Go utilities used in CI (for example, API diffing and module verification).
+
+When adding new functionality, try to keep changes localized: core abstractions in `pkg/...`, provider-specific logic in a provider module, and usage examples under `examples/...`.
+
+---
+
+### Prerequisites
+
+- **Go toolchain**
+  - The project pins a specific Go version in its top-level `Makefile`.  
+    You can print the expected version with:
+    ```bash
+    make go-version
+    ```
+  - Use that version (or a compatible newer patch release) for local development. The `hack/check-everything.sh` script exports `GOTOOLCHAIN` so that Go 1.x toolchain selection is consistent.
+- **Kubernetes tooling for tests and examples**
+  - `kubectl` to interact with clusters.
+  - `kind` and Docker if you want to run the Kind-based examples or local multi-cluster scenarios.
+  - Internet access to download `envtest` binaries and Go module dependencies.
+- **Familiarity**
+  - Comfortable with `controller-runtime` (managers, controllers, reconcilers).
+  - Basic understanding of the related KEPs:
+    - Cluster identity (`ClusterProperty`, ClusterSets).
+    - Cluster inventory (`ClusterProfile`).
+    - Credential plugins for `ClusterProfile`.
+
+---
+
+### Cloning the repository
+
+Clone the upstream project and change into the repository root:
+
+```bash
+git clone https://github.com/kubernetes-sigs/multicluster-runtime.git
+cd multicluster-runtime
+```
+
+From here, all `make` and `hack/...` commands referred to in this chapter assume the repository root as the working directory.
+
+---
+
+### Running tests
+
+The recommended entry point for tests and basic verification is the `test` Make target:
+
+- **Run the full verification and test suite**
+
+```bash
+make test
+```
+
+This target:
+
+- calls `hack/check-everything.sh`, which
+  - runs `hack/verify.sh` (code-generation, formatting, and repository hygiene checks), and
+  - runs `hack/test-all.sh` to execute tests for the root module and all nested Go modules.
+- compiles every example under `examples/` with `go install` to ensure they still build.
+
+If you want to limit testing to a specific module:
+
+- **Run tests for a single module**
+
+```bash
+# From the repository root
+WHAT=./providers/kind hack/test-all.sh
+```
+
+`hack/test-all.sh`:
+
+- discovers modules via `go.mod` files,
+- uses the `WHAT` environment variable (when set) to restrict the set of modules it runs `go test ./...` against,
+- configures `envtest` assets (Kubernetes API server and etcd binaries) via `setup-envtest`.
+
+You can choose a different Kubernetes version for envtest by setting:
+
+```bash
+export ENVTEST_K8S_VERSION=1.30.0   # or another supported version
+```
+
+and then re-running the tests.
+
+---
+
+### Linting and formatting
+
+The project uses `golangci-lint` with a shared configuration. The Makefile will build and cache the correct version of the linter in `hack/tools/bin`.
+
+- **Run all linters across all modules**
+
+```bash
+make lint
+```
+
+- **Lint a single module**
+
+```bash
+make lint WHAT=./providers/file
+```
+
+- **Apply auto-fixers where supported**
+
+```bash
+make lint-fix
+```
+
+For import grouping and formatting, use:
+
+- **Normalize imports (per module or whole repo)**
+
+```bash
+# Entire repo
+make imports
+
+# Single module
+make imports WHAT=./pkg/manager
+```
+
+Running `make lint` and `make imports` before sending a PR helps keep diffs small and consistent with the rest of the codebase.
+
+---
+
+### Managing Go modules
+
+multicluster-runtime is a multi-module repository: the root, each provider, and many examples have their own `go.mod` and `go.sum`.
+
+- **Update `go.mod` / `go.sum` for all modules**
+
+```bash
+make modules
+```
+
+- **Update a single module**
+
+```bash
+make modules WHAT=./providers/cluster-api
+```
+
+To ensure no module has uncommitted dependency changes:
+
+- **Verify modules are tidy**
+
+```bash
+make verify-modules
+```
+
+This target:
+
+- runs `go mod tidy` where needed, and
+- uses an internal `gomodcheck` tool to flag stray/unused dependencies.
+
+If `verify-modules` fails, run `make modules` locally, inspect the resulting diffs, and include them in your PR.
+
+---
+
+### Cleaning the workspace
+
+To clear local tool caches and generated binaries:
+
+```bash
+make clean
+```
+
+This removes the `golangci-lint` cache and the `hack/tools/bin` directory. You can also remove just the generated binaries with:
+
+```bash
+make clean-bin
+```
+
+Running `make clean` periodically helps ensure you are using the current toolchain and configuration.
+
+---
+
+### Running examples locally
+
+The `examples/` directory contains ready-to-run programs that exercise providers and controller patterns. They are useful both as integration tests and as documentation of best practices.
+
+Examples assume you have appropriate clusters and credentials available; see the `README.md` files in each example directory for detailed instructions.
+
+- **Kind provider example**
+  - Create a couple of Kind clusters:
+    ```bash
+    kind create cluster --name fleet-alpha
+    kind create cluster --name fleet-beta
+    ```
+  - Run the example:
+    ```bash
+    cd examples/kind
+    go run ./main.go
+    ```
+  - Watch events or resources in each cluster to see the multi-cluster controller in action.
+
+- **Kubeconfig provider example**
+  - Use the helper script under `examples/kubeconfig/scripts/` to generate kubeconfig secrets and RBAC in a management cluster.
+  - Then run:
+    ```bash
+    cd examples/kubeconfig
+    go run ./main.go
+    ```
+
+Other examples (file-based provider, Cluster API provider, Cluster Inventory API provider, namespace provider, etc.) follow a similar pattern:
+
+1. Prepare the underlying clusters or CRDs (for example, CAPI `Cluster` objects or `ClusterProfile` objects).
+2. Run the example binary.
+3. Observe that the same reconciler code runs across the discovered fleet.
+
+---
+
+### Design guidelines and invariants
+
+Contributions are much easier to review when they align with multicluster-runtime’s design principles.
+
+#### Stay close to controller-runtime
+
+- Most abstractions are **thin, typed layers** on top of controller-runtime.
+- New APIs should:
+  - reuse controller-runtime types where possible,
+  - mirror existing naming and patterns (e.g., `Builder`, `Manager`, `Reconciler`),
+  - degrade gracefully to **single-cluster mode** when no provider is configured.
+
+If you find yourself re-implementing a large part of controller-runtime, consider whether the change belongs there instead of in multicluster-runtime.
+
+#### Multi-cluster manager and providers
+
+The multi-cluster manager (`pkg/manager`) wraps a normal controller-runtime manager and adds:
+
+- methods to obtain a `cluster.Cluster` by name (`GetCluster` and `ClusterFromContext`), and
+- a `multicluster.Provider` that discovers clusters and keeps them engaged.
+
+When working on providers or the manager, keep these invariants in mind:
+
+- **Provider.Get**
+  - Returns the same `cluster.Cluster` instance for the same logical cluster name, as long as that cluster is engaged.
+  - Returns a well-defined `ErrClusterNotFound` when a cluster is unknown or has been removed.
+- **Provider.IndexField**
+  - Must apply indexes to **all currently engaged clusters** and to clusters that are engaged in the future.
+  - Should be efficient and thread-safe, as it may be called from different controllers.
+- **ProviderRunnable.Start**
+  - Blocks until the provider is done (usually when the context is cancelled).
+  - Uses the passed `multicluster.Aware` instance to call `Engage(ctx, name, cluster)` when new clusters become ready.
+  - Cleans up any per-cluster goroutines or caches when clusters are removed.
+
+For example, the Cluster API provider watches `Cluster` resources, waits for them to reach the “provisioned” phase, then:
+
+1. Obtains a kubeconfig for the child cluster.
+2. Creates a controller-runtime `cluster.Cluster` using that config.
+3. Starts the cluster’s internal cache and client.
+4. Calls `Engage` on the multi-cluster manager so controllers begin receiving events for that cluster.
+
+#### Respect identity, inventory, and credentials models
+
+Some providers integrate with broader multi-cluster APIs:
+
+- **Cluster identification (ClusterProperty)**: Use stable cluster identifiers that align with the cluster identity KEP when driving cross-cluster logic.
+- **Cluster inventory (ClusterProfile)**: Treat inventory as the source of truth for which clusters exist and how they are grouped.
+- **Credential plugins**: Do not hard-code credentials in providers; instead, delegate credential resolution to the standard plugin model where applicable.
+
+When a change interacts with these areas, cross-check it against the relevant KEPs and ensure the behavior is consistent with those specifications.
+
+---
+
+### Adding tests for new code
+
+Every non-trivial change should come with tests:
+
+- **Unit tests**
+  - Prefer small, focused tests that exercise new logic in isolation.
+  - For providers, test:
+    - correct handling of cluster lifecycle events (add, update, delete),
+    - error paths when kubeconfigs or credentials are missing or invalid,
+    - correct behavior of `Get` and `IndexField`.
+- **Integration / envtest-based tests**
+  - For changes that depend on Kubernetes API machinery (controllers, caches, webhooks), use the existing envtest patterns in the repo.
+  - Provider suites under `providers/...` show how to spin up in-memory control planes and exercise controllers end to end.
+
+You can use `WHAT=...` with `hack/test-all.sh` (or `make test`) to iterate quickly on a specific provider or package.
+
+---
+
+### Opening a pull request
+
+When you are ready to contribute your changes upstream:
+
+- **Align with project scope**
+  - Check existing issues and discussions to see if there is prior art or design context.
+  - For larger features, file or reference a design document (often a KEP or a subproject design doc) before writing a large patch.
+- **Keep PRs focused**
+  - Prefer small, cohesive PRs over broad refactors.
+  - Avoid mixing mechanical changes (renames, formatting) with behavioral changes.
+- **Run checks locally**
+  - At minimum, run:
+    ```bash
+    make test
+    make lint
+    make verify-modules
+    ```
+  - Fix any issues reported by these commands before pushing.
+- **Follow Kubernetes contributor process**
+  - Ensure you have signed the required Contributor License Agreement.
+  - Use clear commit messages and PR descriptions.
+  - Be responsive to review feedback; it is normal for multi-cluster behavior or API shape to go through a few iterations.
+
+For contributions that add or evolve providers, also consult the **Provider Ecosystem** chapter for guidance on ownership, hosting, and when a provider belongs in this repository versus its own dedicated project.
+
+---
+
+### Where to go next
+
+If you are interested in contributing beyond local development:
+
+- **Provider Ecosystem**: See the companion chapter on how providers are structured, when to contribute a new provider, and where production-ready providers typically live.
+- **Advanced Topics**: The chapters on Event Handling, Authentication, Cluster Identification, and Testing give additional context that is often relevant when designing new multi-cluster features.
+
+The project welcomes contributions ranging from documentation and small bug fixes to new providers and controller patterns. Starting with tests and examples is often the easiest way to become familiar with the codebase before proposing larger changes.
+
+

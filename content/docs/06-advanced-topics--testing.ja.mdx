@@ -1,0 +1,334 @@
+---
+title: テスト
+---
+
+この章では、`multicluster-runtime` を用いて構築した **コントローラーやプロバイダーのテスト方法** を解説します。  
+`controller-runtime` のテスト手法（envtest、fake client など）を前提に、**複数クラスタと Provider を扱う際の追加パターン** を説明します。
+
+この章で扱う内容:
+
+- **何をテストするか**: マルチクラスタにおけるユニットテストと統合テストの役割。
+- **ユニットテスト**: fake な Manager / Cluster を用いた Reconciler のテスト。
+- **envtest を用いた統合テスト**: 1 個または複数の API サーバーを立ち上げて、実際の Provider とコントローラーを検証する。
+- **Provider 向けテストパターン**: 独自 Provider とクラスタライフサイクルのテスト。
+- **ベストプラクティス**: 速度・再現性・クラスタ消滅などのシナリオのテスト方法。
+
+---
+
+### マルチクラスター・コントローラーで何をテストするか
+
+テストの観点から見ると、`multicluster-runtime` ベースのシステムには 3 つの主要なレイヤーがあります:
+
+- **ビジネスロジック（あなたの Reconciler）**  
+  - 引数は `context.Context` と `mcreconcile.Request`。  
+  - 「どのオブジェクトをどう変更するか」「どのクラスタを対象にするか」といった **振る舞い** を決めます。
+
+- **マルチクラスターの配線（Manager + Provider + Source）**  
+  - `mcmanager.Manager`、`multicluster.Provider`、マルチクラスタ対応の `Source`（`mcsource.Kind` など）。  
+  - **どのクラスタが存在するか**、イベントに付与される **`ClusterName`**、キャッシュやインデックスの動作を決めます。
+
+- **実際のクラスタ（または envtest クラスタ）**  
+  - `cluster.Cluster` 経由でアクセスされる API サーバー。  
+  - Admission / Validation / CRD など、**Kubernetes ネイティブの挙動** を提供します。
+
+多くのプロジェクトでは、次の 3 種類のテストを組み合わせることになります:
+
+- **Reconciler のユニットテスト**  
+  - fake な Manager / Client を用いて **ビジネスロジックを直接テスト**。  
+  - 高速・密結合度が低い・エッジケースやエラーハンドリングの検証に向いています。
+- **envtest を用いた統合テスト**  
+  - 1 つ以上の **envtest API サーバー** に対して、実際の Manager とコントローラーを起動。  
+  - Watch / Provider / Reconcile ループが期待どおりに連携するかを検証します。
+- **Provider のテスト**  
+  - 独自の `multicluster.Provider` を実装する場合のテスト。  
+  - クラスタの発見・参加（Engage）・離脱（Disengage）・インデックス付けなどを確認します。
+
+以降の節では、それぞれのテスト種別の推奨パターンを説明していきます。
+
+---
+
+### Reconciler のユニットテスト
+
+ユニットテストのレイヤーでは、マルチクラスタ対応であっても Reconciler は単なる関数です:
+
+- **シグネチャ**: `Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error)`  
+- **違いは 1 点だけ**: `req.ClusterName` が「どのクラスタを対象にするか」を表します。
+
+テストしやすくするためには、Reconciler の依存関係を **小さく・注入可能（DI しやすく）** 保つのが重要です。
+
+#### テスタビリティを意識した Reconciler の設計
+
+Reconciler がグローバルな `mcmanager.Manager` に直接アクセスするのではなく、必要なメソッドだけを持つ
+小さなインターフェイスを定義しておくとテストが容易になります:
+
+```go
+type ClusterGetter interface {
+    GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
+}
+
+type AnimalReconciler struct {
+    Clusters ClusterGetter
+}
+
+func (r *AnimalReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Clusters.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // cl.GetClient(), cl.GetCache() などを使ったビジネスロジック
+    return ctrl.Result{}, nil
+}
+```
+
+本番では `mcmanager.Manager`（すでに `GetCluster` を実装している）を渡し、  
+テストでは次のような小さな fake を渡せます:
+
+```go
+type fakeClusterGetter struct {
+    clusters map[string]cluster.Cluster
+}
+
+func (f *fakeClusterGetter) GetCluster(_ context.Context, name string) (cluster.Cluster, error) {
+    cl, ok := f.clusters[name]
+    if !ok {
+        return nil, multicluster.ErrClusterNotFound
+    }
+    return cl, nil
+}
+```
+
+各 `cluster.Cluster` をどの程度「本物」に近づけるかは用途次第です:
+
+- **純粋なユニットテスト**  
+  - controller-runtime の `fake.Client` と、それをラップした最小限の `cluster.Cluster` 実装を使います。  
+  - テストをミリ秒レベルで動作させたい場合や、API サーバーに依存したくない場合に向いています。
+
+- **軽量な統合テスト寄りユニットテスト**  
+  - `envtest` や `cluster.New` で本物の `cluster.Cluster` を作りつつ、テスト全体は最小限に保ちます。  
+  - OwnerReference やサーバーサイドの defaulting など、Kubernetes の振る舞いに依存するロジックを検証したい場合に有用です。
+
+#### クラスタ認識ロジックのテスト
+
+マルチクラスタ対応特有のユニットテスト対象は、主に次のようなものです:
+
+- **クラスタごとの分岐ロジック**  
+  - 例: 「`eu` リージョンのクラスタではこのアノテーションを付けるが、それ以外では別の値を使う」など。  
+  - `ClusterName` が異なる複数の `mcreconcile.Request` を用意し、それぞれについて:
+    - 正しいクライアントが使われていること、
+    - 想定したオブジェクトがそのクラスタの状態に作成 / 更新されること、
+    を検証します。
+
+- **クラスタライフサイクル由来のエラーパス**  
+  - 例: `GetCluster` が `multicluster.ErrClusterNotFound` を返す場合の挙動。  
+  - fake の `ClusterGetter` がこのエラーを返すようにしてシミュレーションできます。  
+  - `ClusterNotFoundWrapper`（後述）に依存する場合は、
+    - Reconciler がこのエラーを返すこと、
+    - Wrapper がそれを「再キューなしの成功」として扱うこと、
+    を別途テストできます。
+
+こうした振る舞いを **小さなユニットテスト** でカバーしておくと、  
+統合テストは「マルチクラスタの配線が正しいかどうか」の検証に集中できます。
+
+---
+
+### envtest（単一 API サーバー & 複数「クラスタ」）を用いた統合テスト
+
+多くのマルチクラスタ・シナリオは、**1 つの Kubernetes API サーバー** に対して  
+**Namespace Provider**（`providers/namespace`）を使うことで効率よくテストできます:
+
+- **アイデア**: 1 つの envtest API サーバーを立て、各 Namespace を仮想的な `cluster.Cluster` として扱う。  
+- **利点**: 実際の controller-runtime の cache / watch / reconcile を利用しつつ、
+  起動する API サーバーは **1 つだけ** のため高速です。
+
+`providers/namespace` のテストや `namespace` サンプルから抽出した典型的なパターンは次の通りです:
+
+- **1. envtest 環境を起動する**  
+  - `envtest.Environment{}` を作成し、その `*rest.Config` を保持します。  
+  - メトリクスサーバーが不要であれば、`metricsserver.DefaultBindAddress = "0"` で無効化できます。
+
+- **2. ベースとなる `cluster.Cluster` と Namespace Provider を作成する**  
+  - `cluster.New(cfg)` で 1 つの `cluster.Cluster` を作成します。  
+  - そのクラスタを使って `namespace.New(cl)` を呼び出します。  
+    - Provider はホストクラスタ上の `Namespace` を watch し、
+    - Namespace 名を `ClusterName` として公開し、
+    - すべての読み書きをその Namespace にスコープされた形でルーティングします。
+
+- **3. マルチクラスタ Manager とコントローラーを配線する**  
+  - `mcmanager.New(cfg, provider, mcmanager.Options{...})` で Manager を作成します。  
+  - `mcbuilder.ControllerManagedBy(mgr)...Complete(...)` で実際のコントローラーを登録し、
+    Reconciler は本番同様 `mcreconcile.Request` を受け取る形にします。  
+  - 必要に応じて `mgr.GetFieldIndexer().IndexField(...)` を呼び出し、
+    **マルチクラスタ・インデックス** の動作もテストします。
+
+- **4. テストデータを投入し、システムを起動する**  
+  - `client.New(cfg, ...)` で通常の `client.Client` を作り:
+    - `zoo` / `jungle` / `island` などの Namespace を作成し、
+    - それぞれに `ConfigMap` 等のテスト用オブジェクトを作成します。  
+  - Provider が利用する `cluster.Cluster` と `mcmanager.Manager` を  
+    `errgroup` などでバックグラウンド起動します。
+
+- **5. Eventually などを用いて挙動を検証する**  
+  - `Eventually`（またはシンプルなポーリングループ）を用いて:
+    - Reconciler が実行されてリソースが期待どおりに更新されること、
+    - `mgr.GetCluster(ctx, "zoo").GetCache().List(...)` のように、
+      クラスタ単位でキャッシュを問い合わせた結果が期待どおりであること、
+    - マルチクラスタ・インデックスや `ClusterName` によるルーティングが
+      仕様どおりに動作していること、
+    を確認します。
+
+このパターンは次のような場合に特に有効です:
+
+- **マルチクラスタ・コントローラーパターン**（Uniform / Multi-Cluster-Aware）をテストしたいが、
+- まだクラスタごとに別の API サーバーを立ち上げるほどではない場合、
+- テストスイートの **スループットと実行時間** を重視したい場合。
+
+---
+
+### 複数 API サーバーを用いた統合テスト
+
+より現実的なエンドツーエンドテスト、特に  
+**File / Kubeconfig / Cluster API / Cluster Inventory API** などの Provider を使う場合は、  
+**クラスタごとに 1 つの envtest.Environment** を起動する構成が適しています。
+
+上流のテストで用いられている代表的なパターンは次の通りです:
+
+- **Hub + Member クラスタ（Cluster Inventory API Provider）**  
+  - `ClusterProfile` オブジェクトが存在する **Hub クラスタ用に 1 つの envtest** を起動します。  
+  - 管理対象の **各 Member クラスタごとに envtest** を起動します。  
+  - `cluster-inventory-api` Provider を作成し:
+    - Hub 上の `ClusterProfile` を読み取り（KEP‑4322, KEP‑2149, KEP‑5339）、
+    - Secret や Credential Plugin を通じて Member クラスタの認証情報を取得し、
+    - 各 Member を `cluster.Cluster` として公開します。  
+  - Hub の `*rest.Config` と Provider を用いて `mcmanager.Manager` を作成し、  
+    `mcbuilder` でコントローラーを登録して Manager を起動します。  
+  - テストでは:
+    - Hub に `ClusterProfile` と Secret を作成し、
+    - Member 側に `ConfigMap` 等のワークロードを作成し、
+    - Reconciler / インデックス / 再エンゲージ（再接続）ロジックが
+      期待どおりに動作することを確認します。
+
+- **ローカル + リモートクラスタ（Kubeconfig / File Provider）**  
+  - Manager をホストする **ローカルクラスタ用 envtest** を 1 つ起動します。  
+  - 管理対象の **リモートクラスタごとに envtest** を起動します。  
+  - それぞれの kubeconfig を:
+    - ファイルとして書き出し（File Provider 向け）、または
+    - Secret としてローカルクラスタに保存し（Kubeconfig Provider 向け）、  
+    Provider から読み込ませます。  
+  - その Provider で `mcmanager.Manager` を構成し、統合テストでは次を確認します:
+    - kubeconfig の追加・削除に応じてクラスタが参加 / 離脱すること、
+    - コントローラーがすべてのクラスタからのイベントを受け取ること、
+    - Reconciler が `req.ClusterName` を用いて正しいクラスタに対して処理を行うこと。
+
+- **複数 Provider を束ねたフリート（Multi Provider）**  
+  - 複数の Provider を 1 つの `multi.Provider` の下にまとめます。  
+  - 各 Provider ごとに envtest を起動し（例: 異なるクラウド環境を模したクラスタ群）、  
+  - クラスタ名に Provider 名のプレフィックスが付与されること、  
+    そして `mgr.GetCluster` がそのプレフィックスに応じて正しい Provider にルーティングすることを検証します。
+
+Namespace Provider ベースのテストより重いものの、これらのテストは  
+実運用に最も近い形でシステム全体を検証できます:
+
+- **クラスタライフサイクル**（認証情報の変更・切断・入れ替え）を含めて動作をテストでき、  
+- **Provider 実装とコントローラーロジックの両方** を一度に検証でき、  
+- 本番で見つかったバグを再現し、回帰テストとして残すのに最適です。
+
+---
+
+### 独自 Provider とクラスタライフサイクルのテスト
+
+独自の `multicluster.Provider` を実装する場合、多くは `pkg/clusters` にある  
+`clusters.Clusters` を組み込み、そこに独自のディスカバリーロジックを追加します。
+
+そのような Provider 向けの推奨テストは、概ね次のようになります:
+
+- **Member クラスタを表す envtest クラスタを起動する**  
+  - `envtest.Environment` と `cluster.New(cfg)` で `cluster.Cluster` を作成します。  
+  - `Clusters.Add` / `AddOrReplace` で安定した名前のクラスタとして登録します。
+
+- **テスト内で本物のマルチクラスタ Manager を動かす**  
+  - その Provider を用いて `mcmanager.Manager` を作成し、バックグラウンドで起動します。  
+  - 次のような点を検証します:
+    - `mgr.GetCluster(ctx, name)` が、`Add` したクラスタを返すこと、
+    - `Clusters.Remove(name)` 後には Manager からそのクラスタが見えなくなり、
+      Reconciler がそれを利用しようとすると `multicluster.ErrClusterNotFound` が返ること。
+
+- **インデックスとディスカバリの挙動を検証する**  
+  - `mgr.GetFieldIndexer().IndexField(...)` を呼び出し:
+    - 既存の全クラスタにインデックスが作成されること、
+    - 後から追加されたクラスタにも同じインデックスが適用されること、  
+    を確認します。  
+  - 各クラスタのキャッシュに対して `List` を発行し、  
+    クロスクラスタなフィールドインデックスが仕様どおりに動作することを検証します。
+
+`clusters` Provider のテストは、これらを最小構成で実践している例です:
+
+- envtest クラスタを 1 つ起動し Provider に追加し、
+- `mcmanager.Manager` 経由で取得できることを検証し、
+- 最後に削除してライフサイクルとクリーンアップの正しさを確認しています。
+
+---
+
+### エラーハンドリングとクラスタ消滅のテスト
+
+動的なフリートでは、クラスタが削除された後も、そのクラスタ向けの
+Reconcile リクエストがキューに残っていることがあります。  
+`multicluster-runtime` は、テストと本番の両方でこのケースを安全に扱うための仕組みを提供しています:
+
+- **`multicluster.ErrClusterNotFound`**  
+  - `clusterName` が未知、あるいはすでに削除された場合に返されるエラーです。  
+  - テストでは次のようにシミュレートできます:
+    - Reconcile 前に `provider.Remove(name)` を呼ぶ、
+    - または fake の `ClusterGetter` が意図的にこのエラーを返すようにする。
+
+- **`ClusterNotFoundWrapper`**  
+  - `reconcile.TypedReconciler`（`mcreconcile.Request` を含む）をラップするヘルパーです。  
+  - Reconciler が `errors.Is(err, multicluster.ErrClusterNotFound)` となるエラーを返した場合、
+    - それを **「再キューなしの成功」** として扱い、
+    - フリートから離脱したクラスタ向けに無限リトライが続くことを防ぎます。
+
+この挙動に依存するコントローラーをテストする際は、次の 2 点を意識するとよいでしょう:
+
+- **Reconciler が適切な場面で `ErrClusterNotFound` を返すことを検証する**  
+  - 例: Provider がクラスタを削除した後、`mgr.GetCluster(ctx, req.ClusterName)` が
+    このエラーを返すケースなど。
+
+- **必要に応じて Wrapper 自体の挙動も個別にテストする**  
+  - 小さなダミー Reconciler を `NewClusterNotFoundWrapper` でラップし、  
+    `Reconcile` の結果が「エラーなし・再キューなし」になることを検証します。
+
+これらのテストにより、フリートの再構成やクラスタ削除、認証情報ローテーションなどが
+発生した際にも、コントローラーが **予測可能な挙動** を維持できることを確認できます。
+
+---
+
+### マルチクラスター・ロジックをテストする際のベストプラクティス
+
+テストスイートを高速・信頼性高く・情報量豊富に保つために、次の点を推奨します:
+
+- **ビジネスロジックはユニットテストでカバーする**  
+  - 可能な限りロジックを小さなインターフェイスの背後に閉じ込め（`ClusterGetter` や型付きクライアントなど）、
+    fake client やインメモリ構造で安価にエッジケースを検証します。
+
+- **envtest は必要なところにだけ使う**  
+  - **Namespace Provider + 単一 envtest** は、マルチクラスタテストのデフォルトとして非常に有用です。  
+  - Provider 固有の挙動や認証フローをテストする必要が出てきたときだけ、
+    複数 envtest クラスタを導入するようにします。
+
+- **テストでも `ClusterName` を明示的に扱う**  
+  - ログやメトリクス、テストの失敗メッセージには常に `ClusterName` を含めます。  
+  - オブジェクトの検証では、**クラスタ** と **NamespacedName** の両方をチェックします。
+
+- **テストは決定的・有限なものに保つ**  
+  - `Eventually` のタイムアウトは現実的な値に設定し、1 回の Reconcile で行う仕事量を小さく保ちます。  
+  - 外部サービスへの依存を避け、Kubernetes API サーバーとしては envtest だけを使うようにします。
+
+- **「ハッピーパス」とライフサイクルの境界条件の両方をテストする**  
+  - たとえば次のようなシナリオを含めます:
+    - クラスタがフリートに参加・離脱する、
+    - kubeconfig や認証情報が変わり、Reconciler がクラスタに再接続する、
+    - 複数クラスタにまたがるインデックスが、クラスタの追加・削除後も正しく機能し続ける。
+
+これらのパターンに従うことで、**マルチクラスタ・コントローラーロジック** と  
+それを支える **Provider 実装** の両方について高い信頼性を得つつ、  
+既存の controller-runtime のテスト体験にできるだけ近い形を維持できます。

@@ -1,0 +1,151 @@
+---
+title: Key Concepts
+---
+
+This chapter introduces the core abstractions you will use when building multi-cluster controllers with `multicluster-runtime`: the **Multi-Cluster Manager**, **Providers**, **Cluster objects**, and **Reconcilers**.  
+If you already know controller-runtime, you can think of these as small, focused extensions of the Manager / Builder / Reconciler concepts you are familiar with.
+
+---
+
+### The Multi-Cluster Manager
+
+At the centre of `multicluster-runtime` is `mcmanager.Manager`, the **Multi-Cluster Manager**.  
+It wraps the standard controller-runtime `manager.Manager` and adds awareness of a fleet of clusters.
+
+Conceptually, the Multi-Cluster Manager:
+
+- **embeds a normal Manager** for the “host” cluster (often a management or hub cluster),
+- **connects to a Provider** that knows how to discover and reach member clusters,
+- **exposes helper methods** to retrieve per-cluster clients and managers,
+- **implements `multicluster.Aware`** so Providers can dynamically “engage” and “disengage” clusters at runtime.
+
+From your code, the most important methods are:
+
+- **`GetCluster(ctx, clusterName)`**:  
+  Returns a `cluster.Cluster` for the given name. The **empty string (`""`) always refers to the local/host cluster**.
+- **`GetManager(ctx, clusterName)`**:  
+  Returns a scoped `manager.Manager` that operates against a specific member cluster, which is useful for plugging in existing controller-runtime components.
+- **`ClusterFromContext(ctx)`**:  
+  Resolves the default cluster from a `context.Context` when you use helpers that inject the cluster name.
+- **`GetProvider()` / `GetFieldIndexer()`**:  
+  Provide access to the underlying Provider and a field indexer that applies indexes across the fleet.
+
+In a typical `main` function you:
+
+1. construct a Provider,
+2. create the Multi-Cluster Manager with `mcmanager.New`,
+3. register controllers with `mcbuilder.ControllerManagedBy(mgr)`.
+
+The rest of your code continues to look like normal controller-runtime, just with cluster awareness added.
+
+---
+
+### Providers: where your fleet comes from
+
+A **Provider** answers two questions:
+
+- *Which clusters exist in my fleet right now?*
+- *How do I connect to each of them?*
+
+The core interface, `multicluster.Provider`, is intentionally small:
+
+- **`Get(ctx, clusterName) (cluster.Cluster, error)`**:  
+  Returns (or lazily constructs) a `cluster.Cluster` for a given name, or `ErrClusterNotFound` if the name is unknown.
+- **`IndexField(ctx, obj, field, extractValue)`**:  
+  Registers a field index across **all engaged clusters**, including clusters that will be discovered in the future.
+
+Many Providers also implement `multicluster.ProviderRunnable`:
+
+- **`Start(ctx, aware multicluster.Aware) error`**:  
+  A long-running discovery loop that:
+  - observes some external system (Cluster API, ClusterProfile inventory, Kind, kubeconfig files, namespaces, …),
+  - creates or updates `cluster.Cluster` instances,
+  - calls `aware.Engage(ctx, name, cluster)` when clusters become active,
+  - cancels the per-cluster context when clusters are removed.
+
+`multicluster-runtime` ships a set of reference Providers that cover common sources of truth:
+
+- **Kind Provider**: discovers local Kind clusters for development and testing.
+- **Kubeconfig Provider**: reads kubeconfig-bearing Secrets or files.
+- **Cluster API Provider**: discovers clusters from CAPI `Cluster` resources.
+- **Cluster Inventory API Provider**: consumes `ClusterProfile` objects (KEP‑4322), aligned with ClusterID and ClusterSet properties (KEP‑2149) and credential plugins (KEP‑5339).
+- **File / Namespace / Multi / Single / Nop Providers**: utilities for file-based fleets, namespaces-as-clusters simulations, composing multiple Providers, or testing.
+
+Because fleets are provider-driven, you can usually change how clusters are discovered **without touching reconciler logic**.
+
+---
+
+### Cluster objects: per-cluster clients, caches, and identity
+
+A **Cluster object** represents one member cluster in the fleet and encapsulates everything controller-runtime needs to talk to it.
+
+`multicluster-runtime` reuses controller-runtime’s `cluster.Cluster` type, which exposes:
+
+- **`GetClient()`**:  
+  A `client.Client` for CRUD operations in that cluster.
+- **`GetCache()`**:  
+  A shared informer cache for efficient list/watch access.
+- **`GetFieldIndexer()`**:  
+  A per-cluster field indexer.
+- **`Start(ctx)`**:  
+  A long-running loop that keeps the cache in sync (usually started by the Provider).
+
+When you call `mgr.GetCluster(ctx, "cluster-a")`, you get the `cluster.Cluster` instance for `"cluster-a"`.  
+The Manager and Sources ensure that:
+
+- each engaged cluster has its own client, cache, and informers,
+- field indexes are applied consistently across all clusters,
+- contexts are cancelled and per-cluster components shut down when a cluster is removed.
+
+From a reconciler’s point of view, this means each member cluster behaves almost like an independent single-cluster installation, while the Multi-Cluster Manager and Provider hide the lifecycle and wiring details.
+
+---
+
+### Reconcilers and multi-cluster requests
+
+Your business logic still lives in **Reconcilers**.  
+With `multicluster-runtime` you continue to implement a `Reconcile(ctx, req)` method, but the request type carries cluster identity.
+
+- **`mcreconcile.Request`** wraps a normal `reconcile.Request` and adds:
+  - `ClusterName string`: which cluster this work item belongs to.
+  - `Request reconcile.Request`: the usual `NamespacedName` key *within* that cluster.
+
+A typical multi-cluster reconciler:
+
+1. Reads `req.ClusterName` and fetches the right cluster (for example, `cl, err := mgr.GetCluster(ctx, req.ClusterName)`).
+2. Uses `cl.GetClient()` (and optionally `cl.GetCache()` or `cl.GetEventRecorderFor`) to read and write objects.
+3. Implements logic in one of two patterns:
+   - **Uniform**: act only within `req.ClusterName` (e.g. enforce policies or maintain baseline resources per cluster).
+   - **Multi-cluster-aware**: read from one or more clusters and write to others, implementing cross-cluster orchestration.
+
+Because the request carries the cluster name, the **same reconciler implementation can safely handle work for many clusters**, and helpers such as the `ClusterNotFound` wrapper make it easy to drop stale work items when clusters disappear.
+
+---
+
+### How the concepts fit together
+
+Putting these concepts together, the flow looks like this:
+
+- A **Provider** discovers clusters and manages their lifecycle, surfacing them as `cluster.Cluster` objects.
+- The **Multi-Cluster Manager** embeds a normal Manager, integrates the Provider, and exposes helpers to obtain per-cluster managers and clients.
+- For each engaged **Cluster**, multi-cluster **Sources** watch Kubernetes objects and enqueue `mcreconcile.Request` items tagged with the appropriate `ClusterName`.
+- Your **Reconcilers** consume these requests and execute business logic using the correct per-cluster client, following either uniform or multi-cluster-aware patterns.
+
+The rest of this documentation builds on these key concepts:
+
+- Multi-Cluster Manager in depth:  
+  [`03-core-concepts--the-multi-cluster-manager.md`](03-core-concepts--the-multi-cluster-manager)
+- Providers in depth:  
+  [`03-core-concepts--providers.md`](03-core-concepts--providers)
+- The Cluster object in depth:  
+  [`03-core-concepts--the-cluster-object.md`](03-core-concepts--the-cluster-object)
+- The Reconcile loop in depth:  
+  [`03-core-concepts--the-reconcile-loop.md`](03-core-concepts--the-reconcile-loop)
+
+For a broader view of the project, see also:
+
+- Overview: [`01-introduction--overview.md`](01-introduction--overview)  
+- Architecture: [`01-introduction--architecture.md`](01-introduction--architecture)  
+- Why multicluster-runtime?: [`01-introduction--why-multicluster-runtime.md`](01-introduction--why-multicluster-runtime)
+
+

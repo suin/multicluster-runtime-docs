@@ -1,0 +1,384 @@
+---
+title: Provider Ecosystem
+---
+
+This chapter explains how the **provider ecosystem** around `multicluster-runtime` is organised and how you can **contribute new providers**—either to this repository, to your own project, or as a separate community extension.
+
+You will learn:
+
+- **What kinds of providers exist today** and how they map to real-world inventory systems.
+- **Where a new provider should live** (in-tree vs. out-of-tree).
+- **Design and maintenance expectations** for any provider.
+- **How to get your provider discovered** by users of `multicluster-runtime`.
+
+This chapter is aimed primarily at **provider authors** and **platform owners** who want to integrate their fleet or control plane with `multicluster-runtime`.
+
+---
+
+### 1. The role of providers in the ecosystem
+
+From an architectural perspective (see **Introduction — Architecture** and **Core Concepts — Providers**), providers are the **bridge** between:
+
+- the **Multi-Cluster Manager** and reconcilers, which expect a uniform view of a fleet, and
+- the many different ways the world models **cluster identity, inventory, and credentials**.
+
+`multicluster-runtime` intentionally keeps the provider interface small:
+
+- **Discovery**: know **which clusters exist** and when they are ready.
+- **Connectivity**: create and manage a `cluster.Cluster` for each member.
+- **Indexes**: propagate field indexes across **all engaged clusters** (current and future).
+
+This lets the ecosystem grow along several axes:
+
+- **Standardised inventories** such as:
+  - **Cluster API** (`Cluster` resources),
+  - **ClusterProfile API** (KEP‑4322) with credential plugins (KEP‑5339),
+  - **About API / ClusterProperty** (KEP‑2149) for stable IDs and ClusterSets.
+- **Platform‑specific inventories**:
+  - multi-tenant control planes (for example kcp),
+  - cluster registries or SaaS fleet managers,
+  - cloud‑specific fleet APIs (for example Gardener shoot clusters).
+- **Local and synthetic fleets**:
+  - Kind clusters,
+  - filesystem kubeconfigs,
+  - namespaces-as-clusters for simulation.
+
+The provider ecosystem is the place where these integrations live, evolve, and become discoverable.
+
+---
+
+### 2. Types of providers
+
+At a high level, providers fall into three categories.
+
+- **Built‑in reference providers (this repository)**
+  - **Kind provider**: local Kind clusters for development and testing.
+  - **File provider**: kubeconfigs from the filesystem (single files or directories with glob patterns).
+  - **Kubeconfig provider**: kubeconfig‑bearing Secrets in a management cluster.
+  - **Cluster API provider**: CAPI `Cluster` resources and their kubeconfig Secrets.
+  - **Cluster Inventory API provider**: `ClusterProfile` resources and credentials plugins as defined in KEP‑4322 and KEP‑5339.
+  - **Namespace provider**: namespaces-as-clusters, backed by a single control plane.
+  - **Multi / Clusters / Single / Nop providers**: composition and utility providers used for testing and advanced patterns.
+  - These are **reference implementations**:
+    - they demonstrate how to implement `multicluster.Provider`,
+    - they cover common, spec‑driven APIs maintained by Kubernetes SIGs,
+    - they are kept relatively small and focused.
+
+- **Out‑of‑tree providers in related projects**
+  - Hosted in other GitHub organisations and repositories, often next to the system they integrate with.
+  - Examples from the README:
+    - **kcp-dev/multicluster-provider** — providers for [kcp](https://kcp.io)’s logical clusters,
+    - **gardener/multicluster-provider** — provider for [Gardener](https://gardener.cloud/) shoot clusters.
+  - These providers:
+    - can evolve and release on the same cadence as the owning project,
+    - can carry project‑specific dependencies and opinions,
+    - expose a stable `multicluster.Provider` surface to controller authors.
+
+- **Custom / private providers**
+  - Built by end‑users or vendors for:
+    - proprietary cluster registries or management planes,
+    - internal databases or APIs,
+    - specialised test harnesses.
+  - Often start life in a private or organisation‑local repository.
+  - May or may not be published; if they are, they can still participate in the ecosystem by documenting how to use them with `multicluster-runtime`.
+
+This chapter focuses on **where your provider should live** and how to make it a good citizen in this ecosystem.
+
+---
+
+### 3. Where should my provider live?
+
+The most important decision for a new provider is **hosting**:
+
+- should it be added to `kubernetes-sigs/multicluster-runtime` as a built‑in provider,
+- or live in its **own repository**, possibly next to a larger project,
+- or remain a **private extension** with only local audiences?
+
+#### 3.1 Providers in the `multicluster-runtime` repository
+
+The `multicluster-runtime` project is **provider‑agnostic**, but it does ship a small number of built‑in providers with their own `go.mod` files and `OWNERS` files. These are best thought of as **reference implementations** and **spec examples**, not as the only or final solutions.
+
+When considering a new in‑tree provider, ask:
+
+- **Is this provider primarily a reference for a cross‑SIG or spec‑driven API?**
+  - Good candidates:
+    - an implementation of a SIG‑owned API (such as ClusterProfile or About API),
+    - a thin adapter over a widely used SIG‑maintained system (for example Cluster API).
+  - Less suitable:
+    - deeply vendor‑specific APIs or control planes,
+    - multi‑component platforms that already have their own repositories and release cycles.
+- **Can the provider stay small and focused?**
+  - In‑tree providers should:
+    - have a clear delineated scope,
+    - avoid pulling in heavy, platform‑specific dependencies,
+    - be reasonably maintainable by SIG‑Multicluster maintainers.
+- **Is there an active owner willing to maintain it?**
+  - Every provider under `providers/` should:
+    - have an `OWNERS` file with clear reviewers/approvers,
+    - have tests that are kept up to date as core APIs evolve,
+    - be covered by CI (via `make test`, envtest suites, and linting).
+
+If your provider:
+
+- encodes **Kubernetes‑wide concepts**,
+- is useful across multiple projects,
+- and can be maintained by the SIG‑Multicluster community,
+
+then proposing it as an in‑tree provider can make sense—especially if it is the **reference implementation** for a KEP or shared API.
+
+#### 3.2 Providers in external projects
+
+For many integrations, the right home is the **project that owns the inventory or control plane**. This is the pattern used by:
+
+- `kcp-dev/multicluster-provider` for kcp logical clusters,
+- `gardener/multicluster-provider` for Gardener shoot clusters.
+
+Hosting a provider in the external project is a good fit when:
+
+- **The project already has its own release cadence and compatibility matrix.**
+  - You want to version the provider alongside:
+    - CRD schemas,
+    - control plane APIs,
+    - cloud‑specific behaviours.
+- **The provider depends on project‑specific APIs or libraries.**
+  - For example:
+    - a custom CRD set outside Kubernetes SIGs,
+    - SDKs or clients that are out of scope for `multicluster-runtime` itself.
+- **The project’s maintainers are the natural owners.**
+  - They understand the long‑term evolution of the APIs,
+  - they can document and test the provider in the context of their ecosystem.
+
+The integration surface still follows the same pattern:
+
+- public Go module that exposes a `multicluster.Provider` implementation,
+- documentation that shows:
+  - how to construct the provider with options,
+  - how to wire it into `mcmanager.New`,
+  - any CRDs, RBAC, or cluster bootstrap steps required.
+
+Once the provider is reasonably stable, you can submit a small PR here to **add it to the “Provider Ecosystem” list in the README**, so `multicluster-runtime` users can discover it.
+
+#### 3.3 Custom and private providers
+
+Not every provider needs to be published.
+
+It is perfectly valid to:
+
+- keep a provider as **internal infrastructure** inside a company or platform,
+- build it on top of `pkg/clusters.Clusters` and the guidelines in **Custom Providers**,
+- treat it as an implementation detail behind your own APIs.
+
+Even if you do not publish the code, you may still:
+
+- document how to use `multicluster-runtime` against your platform,
+- contribute bug reports or improvements to the core libraries that providers rely on,
+- align your concepts (cluster IDs, inventories, credentials) with the KEPs described in this documentation to ease interoperability later.
+
+---
+
+### 4. Design and maintenance expectations for providers
+
+Regardless of where a provider lives, there are some **shared expectations** that make it easier to integrate with controllers and to reason about behaviour.
+
+#### 4.1 API and semantics
+
+- **Implement the core interfaces correctly**
+  - `multicluster.Provider`:
+    - `Get(ctx, clusterName)` must:
+      - return a `cluster.Cluster` for known names,
+      - return `multicluster.ErrClusterNotFound` when a cluster is unknown or has left the fleet.
+    - `IndexField(ctx, obj, field, extract)` must:
+      - apply the index to all currently engaged clusters,
+      - remember the index so that future clusters receive it as well.
+  - `multicluster.ProviderRunnable` (if applicable):
+    - `Start(ctx, aware)` must:
+      - block for the lifetime of the provider,
+      - use `aware.Engage(clusterCtx, name, cluster)` to attach clusters,
+      - respect `ctx.Done()` for shutdown.
+
+- **Define clear identity and readiness semantics**
+  - Cluster names should be:
+    - **stable** over the lifetime of a cluster (or at least its membership in a ClusterSet),
+    - **unique** within the provider’s domain.
+  - Whenever possible, align cluster identity with:
+    - **KEP‑2149 (ClusterId)** using `ClusterProperty` resources,
+    - or properties embedded in `ClusterProfile` objects (KEP‑4322).
+  - Readiness conditions should be explicit:
+    - for example, CAPI `Cluster` in `Provisioned` phase,
+    - or `ClusterProfile.status.conditions["ControlPlaneHealthy"] == True`.
+
+- **Manage lifecycle deterministically**
+  - For each cluster:
+    - create a dedicated context (`clusterCtx`) and cancel it when the cluster leaves the fleet,
+    - start caches and wait for sync **before** calling `Engage`,
+    - ensure that reconcilers can receive `ErrClusterNotFound` after a cluster is gone.
+
+#### 4.2 Testing
+
+- **Unit tests**
+  - Test:
+    - inventory → `AddOrReplace` / `Remove` translations,
+    - `Get` and `IndexField` behaviour,
+    - corner cases (invalid kubeconfigs, missing credentials, etc.).
+- **Integration tests**
+  - For Kubernetes‑backed inventories, use envtest suites similar to existing providers:
+    - spin up a local API server,
+    - install CRDs (for example, CAPI or ClusterProfile),
+    - exercise the provider’s Reconcile loop end‑to‑end.
+- **Examples as living documentation**
+  - Provide small `examples/<provider-name>` modules that:
+    - show how to wire your provider into a Multi-Cluster Manager,
+    - run at least one concrete multi-cluster controller.
+  - Ensure these examples build as part of CI (similar to how `hack/check-everything.sh` builds core examples).
+
+#### 4.3 Security and credentials
+
+- **Keep credentials out of controller code**
+  - Providers should:
+    - obtain `*rest.Config` via well‑defined mechanisms (kubeconfigs, credential plugins, workload identity),
+    - avoid hard-coding tokens or secrets in Go code,
+    - defer authentication details to:
+      - ClusterProfile credential providers (KEP‑5339),
+      - cloud‑native identity systems,
+      - or dedicated configuration files/secrets.
+- **Support rotation**
+  - It should be possible to rotate credentials without changing `ClusterName`.
+  - For example:
+    - Kubeconfig provider: detect kubeconfig Secret changes and recreate clusters as needed.
+    - Cluster Inventory API provider: compare new and old kubeconfigs, tear down and recreate clusters when necessary.
+
+#### 4.4 Observability
+
+- **Logs**
+  - Include `clusterName` (and, if available, ClusterSet IDs) in all important log entries.
+- **Metrics**
+  - Expose or integrate metrics that help answer:
+    - “Which clusters are currently engaged?”
+    - “How many clusters did this provider create, update, or remove?”
+    - “What are typical errors for this provider (inventory, credentials, connectivity)?”
+- **Docs**
+  - Document:
+    - required CRDs, Secrets, or external dependencies,
+    - configuration options and defaults,
+    - typical failure modes and how to debug them.
+
+---
+
+### 5. Contributing a provider to the ecosystem
+
+There are two main ways to contribute to the provider ecosystem:
+
+- publishing an **out‑of‑tree** provider, and
+- proposing a **new in‑tree** provider.
+
+#### 5.1 Publishing an out‑of‑tree provider
+
+If your provider lives in its own repository (or in a larger project’s repository), you can still make it discoverable to `multicluster-runtime` users.
+
+- **1. Stabilise the basic API**
+  - Provide a Go package that exports:
+    - a constructor (for example, `func New(opts Options) (*Provider, error)`),
+    - a type that implements `multicluster.Provider` (and optionally `ProviderRunnable`),
+    - a small `Options` struct for configuration.
+- **2. Add documentation**
+  - At minimum:
+    - a README section that explains:
+      - how to install any CRDs or controllers,
+      - how to construct and wire the provider into `mcmanager.New`,
+      - how to configure inventories and credentials,
+      - expected cluster naming and readiness semantics.
+- **3. Add yourself to the README’s Provider Ecosystem list**
+  - Open a PR against `kubernetes-sigs/multicluster-runtime`:
+    - update the **Provider Ecosystem** section in the root `README.md`,
+    - add a short description and a link to your repository.
+  - This is the lightest-weight way to integrate with the ecosystem: it does not couple your release cycle to this repository, but makes the provider discoverable.
+
+#### 5.2 Proposing a new in‑tree provider
+
+If you believe a provider belongs directly in the `multicluster-runtime` repository:
+
+- **1. Start with a design discussion**
+  - Open an issue or discussion under `kubernetes-sigs/multicluster-runtime`:
+    - describe the user problem and why it is common enough to warrant an in‑tree provider,
+    - explain how it relates to existing KEPs or SIG‑owned APIs,
+    - outline where it would live (for example `providers/<name>`).
+  - For spec‑level features, you may also need a KEP under the relevant SIG.
+
+- **2. Implement it as a standalone module**
+  - Create `providers/<name>` with:
+    - its own `go.mod` / `go.sum`,
+    - an `OWNERS` file,
+    - tests and (optionally) an example under `examples/<name>`.
+  - Follow the patterns used by existing providers:
+    - `cluster-api`,
+    - `cluster-inventory-api`,
+    - `kubeconfig`,
+    - `file`,
+    - `kind`.
+
+- **3. Integrate with docs and tooling**
+  - Add:
+    - a **Providers Reference** chapter under `docs/05-providers-reference--<name>-provider.md`,
+    - references from:
+      - **Core Concepts — Providers**,
+      - any relevant **Advanced Topics**.
+  - Ensure:
+    - `make test`,
+    - `make lint`,
+    - and `make verify-modules`
+    pass with your provider enabled.
+
+- **4. Iterate with reviewers**
+  - Expect feedback on:
+    - API shape and naming consistency with controller-runtime,
+    - alignment with KEPs and SIG scope,
+    - test coverage and failure modes.
+  - Keep changes small and well‑scoped; provider implementations can be large, so splitting PRs (types, controller wiring, tests, docs) can help.
+
+---
+
+### 6. Examples of provider ecosystem integration
+
+The current ecosystem already demonstrates several integration patterns:
+
+- **Spec‑driven, in‑tree references**
+  - **Cluster Inventory API provider**:
+    - lives in this repository,
+    - implements ClusterProfile from KEP‑4322 and credential plugins from KEP‑5339,
+    - serves as a **reference implementation** for SIG‑Multicluster standards.
+  - **Cluster API provider**:
+    - lives in this repository,
+    - integrates with CAPI `Cluster` resources from SIG‑Cluster‑Lifecycle.
+
+- **Out‑of‑tree, project‑owned providers**
+  - **kcp-dev/multicluster-provider**:
+    - lives next to kcp,
+    - follows kcp’s release and compatibility policy,
+    - exposes kcp logical clusters as `multicluster-runtime` clusters.
+  - **gardener/multicluster-provider**:
+    - lives under the Gardener organisation,
+    - models shoot clusters as a fleet for `multicluster-runtime`.
+
+These examples are good templates when you decide where your provider should live and how closely it should track another project’s lifecycle.
+
+---
+
+### 7. Where to go next
+
+If you are designing or implementing a provider:
+
+- read **Custom Providers** in the Providers Reference for concrete implementation patterns,
+- study the code of one or two built‑in providers that are closest to your use case,
+- align your identity, inventory, and credentials model with:
+  - **KEP‑2149 (ClusterId / ClusterProperty)**,
+  - **KEP‑4322 (ClusterProfile API)**,
+  - **KEP‑5339 (Credentials Plugin)** where applicable.
+
+When you have a usable provider, consider:
+
+- publishing it as a separate module and linking it from the README’s **Provider Ecosystem** section, or
+- if it is spec‑level and cross‑SIG, proposing it as a new in‑tree provider following the guidelines above.
+
+In all cases, consistent semantics, good tests, and clear documentation will make your provider easier to adopt and maintain—both for you and for the broader `multicluster-runtime` community.
+
+

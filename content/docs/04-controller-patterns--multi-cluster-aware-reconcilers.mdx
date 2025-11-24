@@ -1,0 +1,381 @@
+---
+title: Multi-Cluster Aware Reconcilers
+---
+
+This chapter focuses on **multi-cluster-aware reconcilers**: controllers whose logic
+explicitly reasons about **relationships between clusters**, not just about resources
+inside a single cluster.
+
+Where **Uniform Reconcilers** run the same logic independently in every cluster,
+multi-cluster-aware reconcilers typically:
+
+- read desired state or inventory from one cluster (often a **management / hub cluster**),
+- read actual state from **many member clusters**,
+- and then **coordinate changes across those clusters**.
+
+This chapter builds on:
+
+- the **Multi-Cluster Manager** (`mcmanager.Manager`),
+- **Providers** and how they engage clusters,
+- and the **Reconcile Loop** (`mcreconcile.Request`),
+
+to show concrete patterns for writing such reconcilers.
+
+---
+
+### What “multi-cluster-aware” means in practice
+
+- **Uniform Reconciler**
+  - Reads and writes within **one cluster at a time**.
+  - Uses `req.ClusterName` only to select the right client.
+  - Does **not** coordinate decisions across clusters.
+
+- **Multi-Cluster-Aware Reconciler**
+  - Makes decisions that depend on **multiple clusters at once**.
+  - Typical behaviours:
+    - reads control-plane or inventory objects in a **hub cluster**,
+    - fans out workloads or configuration into **many member clusters**,
+    - aggregates status from member clusters back into the hub,
+    - or moves workloads between clusters based on health, region, or capacity.
+
+The APIs you use (`mcmanager.Manager`, `mcreconcile.Request`, `cluster.Cluster`) are
+the same in both cases; the difference is in **how many clusters a single reconcile
+cycle considers** and **where the source of truth lives**.
+
+---
+
+### Typical topologies and use-cases
+
+- **Hub-driven fan‑out**
+  - A controller runs in a **management cluster** and watches CRDs such as:
+    - a “fleet deployment” resource describing which clusters should run a workload,
+    - Cluster API `Cluster` objects,
+    - or Cluster Inventory API `ClusterProfile` objects.
+  - For each desired placement, the reconciler:
+    - determines the **target cluster names** (for example from `ClusterProfile` or ClusterID),
+    - calls `mgr.GetCluster(ctx, clusterName)` to obtain a `cluster.Cluster`,
+    - and ensures the right Kubernetes objects exist in those clusters.
+
+- **Central configuration, distributed enforcement**
+  - Policy or configuration is authored in one cluster (for example, a hub), but
+    enforced in many member clusters.
+  - The reconciler:
+    - watches policy CRDs in the hub,
+    - writes `ConfigMap`, RBAC, or CRDs into all (or selected) member clusters,
+    - optionally aggregates per-cluster compliance back into status on the hub CRD.
+
+- **Cross-cluster aggregation**
+  - A controller observes resources in many clusters and writes **summaries** into a
+    single cluster for reporting, dashboards, or higher-level automation.
+  - Examples:
+    - aggregate `ConfigMap` or `Deployment` state across a ClusterSet,
+    - compute capacity, version skew, or feature support across the fleet.
+
+- **Virtual multi-cluster on a single API server**
+  - With the **Namespace Provider**, each namespace is exposed as a separate
+    `cluster.Cluster`.
+  - Multi-cluster-aware reconcilers can then:
+    - treat namespaces as “virtual clusters” (`ClusterName == namespace name`),
+    - still use the same cross-cluster orchestration patterns,
+    - while only talking to a single Kubernetes API server.
+
+These patterns can also be combined, for example by using the **Multi Provider**
+to stitch together multiple underlying Providers (Kind, Cluster API, Cluster Inventory
+API, kubeconfig, …) into a single fleet.
+
+---
+
+### Building blocks from multicluster-runtime
+
+Multi-cluster-aware reconcilers reuse the same primitives introduced in previous
+chapters:
+
+- **Requests:** `mcreconcile.Request`
+  - `ClusterName` selects the cluster to act on (empty string for the host cluster).
+  - `Request.NamespacedName` selects the object **within that cluster**.
+
+- **Per-cluster clients and caches:** `cluster.Cluster`
+  - Obtained via `mgr.GetCluster(ctx, req.ClusterName)`.
+  - Provides `GetClient()`, `GetCache()`, `GetFieldIndexer()`, and
+    `GetEventRecorderFor(...)`.
+
+- **Multi-Cluster Manager:** `mcmanager.Manager`
+  - Wraps the host `manager.Manager`.
+  - Delegates to a `multicluster.Provider` for member clusters.
+  - Can also return **scoped managers** for individual clusters (`GetManager`).
+
+- **Providers**
+  - Answer “which clusters exist and how do I connect to them?”.
+  - Implement `multicluster.Provider` and often `ProviderRunnable`.
+  - Examples in this repository:
+    - Cluster API Provider (`providers/cluster-api`),
+    - Cluster Inventory API Provider (`providers/cluster-inventory-api`),
+    - File, Kind, Kubeconfig, Namespace, Multi, …
+
+The **controller pattern** is about how you wire these together and **where you
+place your business logic**, not about new framework types.
+
+---
+
+### Pattern 1 — Hub-driven fan‑out (deploying to many clusters)
+
+In a hub-driven pattern, you typically:
+
+- run the controller in a **hub cluster**,
+- watch hub-side resources that describe **desired multi-cluster state**,
+- use a Provider (Cluster API, Cluster Inventory API, File, Kind, Kubeconfig, …)
+  to connect to member clusters,
+- and push workloads or configuration into those clusters.
+
+Conceptually, a reconcile loop for a “fleet deployment” might look like:
+
+```go
+func (r *FleetDeploymentReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // 1. Read the desired multi-cluster state from the hub (local) cluster.
+    var fleet appv1alpha1.FleetDeployment
+    if err := r.HubClient.Get(ctx, req.NamespacedName, &fleet); err != nil {
+        // handle NotFound, etc.
+    }
+
+    // 2. Derive the list of target clusters.
+    targetClusters := r.selectClustersFromInventory(ctx, &fleet)
+
+    // 3. For each target cluster, reconcile the workload.
+    for _, clusterName := range targetClusters {
+        cl, err := r.Manager.GetCluster(ctx, clusterName)
+        if err != nil {
+            // Cluster might have disappeared; decide whether to ignore or record it.
+            continue
+        }
+
+        if err := r.ensureWorkloadInCluster(ctx, cl, &fleet); err != nil {
+            // record error and continue, or stop early depending on your guarantees
+        }
+    }
+
+    return ctrl.Result{}, nil
+}
+```
+
+Key ideas:
+
+- **Hub-side source of truth**
+  - The hub cluster stores CRDs such as `FleetDeployment`, `ClusterProfile`,
+    or other inventory.
+  - The reconciler may use a **normal single-cluster client** (for example
+    `manager.Manager.GetLocalManager().GetClient()`) for those objects.
+
+- **Cluster naming and inventory**
+  - The mapping from inventory objects to `clusterName` strings is Provider-specific:
+    - Cluster API Provider uses keys like `"namespace/name"` for CAPI `Cluster`s.
+    - Cluster Inventory API Provider often uses `ClusterProfile` names or
+      properties such as `cluster.clusterset.k8s.io` (KEP‑2149).
+  - Your reconciler should treat `clusterName` as an **opaque string** and only
+    rely on the Provider and its documentation to construct it.
+
+- **Batching work across clusters**
+  - You can fan out in a single reconcile as shown, or spread the work across
+    multiple reconciles (for example, one work item per cluster) by using
+    additional queues or hub-side status.
+
+This pattern is a natural fit for **“control-plane in one place, workloads in many
+places”** architectures.
+
+---
+
+### Pattern 2 — Cross-cluster aggregation (many clusters → one summary)
+
+The inverse pattern is **aggregation**: a controller collects state from many
+clusters and writes a summary into a single cluster.
+
+In multicluster-runtime, this usually means:
+
+- one or more **uniform** reconcilers that emit per-cluster status, and
+- a **multi-cluster-aware** reconciler that combines those signals.
+
+For example:
+
+- A uniform `ConfigMap` reconciler running in every cluster could:
+  - ensure a standard `ConfigMap` exists,
+  - write per-cluster status into a central namespace in the same cluster.
+- A multi-cluster-aware reconciler running on the hub cluster could:
+  - watch those per-cluster status objects (for example via a Namespace Provider),
+  - build an aggregated view (for example, a `FleetConfigMapStatus` CR),
+  - expose it to users or other automation.
+
+Because each `mcreconcile.Request` carries `ClusterName`, aggregation logic can
+tag inputs by cluster and build summaries without guessing.
+
+---
+
+### Pattern 3 — Combining multiple Providers with the Multi Provider
+
+The **Multi Provider** (`providers/multi`) lets you combine several Providers
+under a single `multicluster.Provider` interface:
+
+- each underlying Provider is registered under a **provider name**,
+- cluster names are prefixed with that provider name and a configurable
+  **separator** (by default `#`),
+- `Get(ctx, "kind#dev-cluster")` is routed to the `kind` Provider,
+  `Get(ctx, "capi#prod/cluster-1")` to the Cluster API Provider, and so on.
+
+This is useful for multi-cluster-aware reconcilers that:
+
+- need to manage clusters coming from **different inventory systems**,
+- or that want to treat test clusters (for example, Kind) and production clusters
+  (for example, Cluster API or Cluster Inventory API) in a single fleet.
+
+From the reconciler’s perspective:
+
+- `req.ClusterName` is just a string such as `"kind#dev-a"` or `"fleet#cluster-1"`,
+- you still call `mgr.GetCluster(ctx, req.ClusterName)` as usual,
+- and the Multi Provider handles routing and index propagation internally.
+
+---
+
+### Pattern 4 — Virtual clusters with the Namespace Provider
+
+The **Namespace Provider** (`providers/namespace`) exposes each namespace in a
+single cluster as a **virtual cluster**:
+
+- it watches `Namespace` objects via a shared `cluster.Cluster`,
+- for each namespace it engages a `NamespacedCluster` that:
+  - maps all operations into that namespace,
+  - is exposed under `clusterName == namespace.Name`.
+
+This is especially useful for:
+
+- **local development and testing** of multi-cluster-aware logic without a real fleet,
+- multi-tenant setups where each tenant gets its own namespace but controllers
+  want to reason about them as “clusters”.
+
+From the reconciler’s point of view:
+
+- `ClusterName` is a namespace name (`"zoo"`, `"jungle"`, …),
+- the code still calls `mgr.GetCluster(ctx, req.ClusterName)` and then
+  `cl.GetClient().Get(...)`,
+- but all reads and writes are transparently scoped to the corresponding namespace.
+
+---
+
+### Wiring controllers with the Builder
+
+Multi-cluster-aware reconcilers are usually wired using the multi-cluster
+`mcbuilder` package, which mirrors the controller-runtime builder:
+
+- **Choosing which clusters to watch**
+  - Use **EngageOptions** to control whether a controller:
+    - attaches to the **local (host) cluster**,
+    - attaches to **provider-managed clusters**,
+    - or both.
+  - `WithEngageWithLocalCluster(bool)`:
+    - default: `false` when a Provider is configured, `true` otherwise.
+  - `WithEngageWithProviderClusters(bool)`:
+    - default: `true` when a Provider is set.
+
+For example, a hub-driven controller that:
+
+- watches a CRD only in the **hub** cluster, and
+- still wants to react to changes in member clusters (via `Watches`),
+
+might be wired like:
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-deployer").
+    // Only watch the hub cluster for the primary CRD.
+    For(&appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+    ).
+    // Optionally, watch workloads in member clusters as well.
+    Watches(
+        &corev1.Deployment{},
+        handler.EnqueueRequestForOwner(&appv1alpha1.FleetDeployment{}),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(r)
+```
+
+Engage options are applied consistently to:
+
+- **`For`**: the primary resource,
+- **`Owns`**: secondary resources owned by the primary,
+- **`Watches`**: any additional relationships.
+
+This allows you to:
+
+- build controllers that are **hub-only**, **fleet-only**, or **hybrid**,
+- and to evolve between these modes without changing your reconciler signatures.
+
+---
+
+### Error handling and disappearing clusters
+
+Because multi-cluster-aware reconcilers depend on a dynamic fleet, they must
+handle:
+
+- clusters disappearing while work items are still in the queue,
+- temporary failures to obtain credentials or establish connections.
+
+Recommended practices:
+
+- **Treat `ErrClusterNotFound` as a terminal condition**
+  - By default, the builder wraps reconcilers in a **ClusterNotFoundWrapper**:
+    - if your reconciler returns `multicluster.ErrClusterNotFound`
+      (or an error wrapping it),
+    - the wrapper treats the reconcile as **successful** and does **not requeue**.
+  - This prevents endless retries for clusters that have left the fleet.
+
+- **Resolve clusters per reconcile**
+  - Always call `mgr.GetCluster(ctx, req.ClusterName)` **inside** the reconcile
+    loop rather than caching `cluster.Cluster` references.
+  - This lets Providers replace clusters when credentials change and ensures
+    that your reconciler sees up-to-date connections.
+
+- **Use context for cancellation**
+  - Long-running fan-out operations should honour `ctx.Done()` so they return
+    promptly when:
+    - the manager stops,
+    - or a specific cluster context is cancelled.
+
+---
+
+### Performance considerations
+
+Multi-cluster-aware reconcilers can put more pressure on queues and APIs because
+they often touch many clusters per reconcile.
+
+When designing such controllers:
+
+- **Keep per-cluster work small and idempotent**
+  - Each reconcile should ideally perform a **bounded** amount of work per cluster.
+  - Break very large changes (for example, a new deployment in hundreds of clusters)
+    into multiple reconciles or background jobs.
+
+- **Avoid global locks across clusters**
+  - Do not hold shared locks while performing network I/O to member clusters.
+  - Prefer per-cluster state or hub-side CRDs for coordination.
+
+- **Be mindful of fair scheduling across clusters**
+  - A single noisy cluster should not starve others.
+  - The underlying controller-runtime workqueue is shared; future enhancements
+    such as **fair queues** can help, but good reconcile design (short, cheap,
+    idempotent operations) remains important.
+
+---
+
+### Summary
+
+Multi-cluster-aware reconcilers are the key to implementing **fleet-wide**, but
+still **Kubernetes-native**, automation:
+
+- they extend the familiar controller-runtime model with a **cluster dimension**,
+- use Providers and the Multi-Cluster Manager to talk to many clusters at once,
+- and apply clear patterns such as **hub-driven fan‑out**, **cross-cluster
+  aggregation**, **provider composition**, and **virtual clusters**.
+
+By structuring your reconcilers around these patterns, you can evolve from
+single-cluster controllers to sophisticated multi-cluster automation while
+keeping your code base aligned with controller-runtime idioms.
+
+

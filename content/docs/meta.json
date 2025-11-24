@@ -1,0 +1,42 @@
+{
+  "title": "Docs",
+  "root": true,
+  "pages": [
+    "index",
+    "---1. Introduction---",
+    "01-introduction--overview",
+    "01-introduction--architecture",
+    "01-introduction--why-multicluster-runtime",
+    "01-introduction--key-concepts",
+    "---2. Getting Started---",
+    "02-getting-started--prerequisites",
+    "02-getting-started--installation",
+    "02-getting-started--quickstart",
+    "---3. Core Concepts---",
+    "03-core-concepts--the-multi-cluster-manager",
+    "03-core-concepts--providers",
+    "03-core-concepts--the-cluster-object",
+    "03-core-concepts--the-reconcile-loop",
+    "---4. Controller Patterns---",
+    "04-controller-patterns--uniform-reconcilers",
+    "04-controller-patterns--multi-cluster-aware-reconcilers",
+    "04-controller-patterns--using-the-builder",
+    "---5. Providers Reference---",
+    "05-providers-reference--kind-provider",
+    "05-providers-reference--kubeconfig-provider",
+    "05-providers-reference--cluster-api-provider",
+    "05-providers-reference--cluster-inventory-api-provider",
+    "05-providers-reference--file-provider",
+    "05-providers-reference--custom-providers",
+    "---6. Advanced Topics---",
+    "06-advanced-topics--event-handling",
+    "06-advanced-topics--authentication",
+    "06-advanced-topics--cluster-identification",
+    "06-advanced-topics--testing",
+    "---7. Contributing---",
+    "07-contributing--development-guide",
+    "07-contributing--provider-ecosystem"
+  ]
+}
+
+

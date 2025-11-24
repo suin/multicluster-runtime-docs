@@ -1,0 +1,89 @@
+---
+title: Overview
+---
+
+multicluster-runtime is a Go library that extends Kubernetes controller-runtime to make writing controllers that operate across many Kubernetes clusters straightforward. It keeps the familiar Manager/Builder/Reconciler model, adds the notion of a cluster fleet, and lets a single controller process watch, reconcile, and act across multiple clusters.
+
+At a glance:
+- **One Pod, Many Clusters**: Run a single controller binary that connects to a dynamic set of clusters.
+- **Provider-driven discovery**: Pluggable providers discover clusters from different sources (e.g., Cluster API, kubeconfig files, Kind, inventory APIs).
+- **controller-runtime compatible**: You still use a Manager, Controllers, and Reconcilers—augmented with multi-cluster context and types like `mcreconcile.Request`.
+- **Two reconciliation patterns**: Uniform reconcilers and multi-cluster-aware reconcilers.
+
+### Why multi-cluster controllers?
+
+Modern platforms commonly span many clusters: for isolation, geography, scale, tenancy, or regulatory boundaries. Operating those clusters consistently (policy, configuration, workloads, data aggregation) calls for controllers that can:
+- discover and manage a changing fleet,
+- react to events per cluster,
+- optionally perform cross-cluster orchestration,
+- do all of the above while preserving controller-runtime ergonomics.
+
+multicluster-runtime enables this with minimal conceptual overhead on top of controller-runtime.
+
+### How it fits with controller-runtime
+
+The mental model is the same, with a few multi-cluster additions:
+- **Manager**: Starts and coordinates controllers. In multicluster-runtime, the Manager is fleet-aware and can surface per-cluster clients, caches, and recorders.
+- **Provider**: A plugin that discovers clusters and their credentials, and emits lifecycle events (add/remove/update). Providers feed the Manager with the current fleet.
+- **Cluster**: An object representing a single member cluster, exposing its client, cache, and identity.
+- **Reconciler and Request**: Reconcilers receive an `mcreconcile.Request` that includes the target cluster identity along with the object key, so the same reconciler code can run independently per cluster.
+- **Builder**: `mcbuilder` offers a fluent way to configure multi-cluster controllers and watches, mirroring controller-runtime’s builder.
+
+You retain the same patterns (watches, predicates, event handlers, work queues) while operating on many clusters.
+
+### Reconciliation patterns
+
+- **Uniform Reconcilers**: Run the same logic in each cluster independently. Useful for enforcing common policy, ensuring baseline resources, or collecting local state.
+- **Multi-Cluster-Aware Reconcilers**: Watch in one or more clusters and write to others, enabling cross-cluster orchestration such as fan-out deployments, data aggregation, or coordination workflows.
+
+### Providers (fleet discovery)
+
+Providers implement a simple interface to supply the fleet and credentials. The library ships with a provider ecosystem so you can pick what fits your environment:
+- **Kind Provider**: Discover local Kind clusters for development and testing.
+- **Kubeconfig Provider**: Use one or more kubeconfig entries as the fleet.
+- **Cluster API Provider**: Discover clusters from CAPI `Cluster` resources.
+- **Cluster Inventory API Provider**: Consume `ClusterProfile` inventory (KEP-4322) with credential plugins (KEP-5339).
+- **File Provider**: Simple file-based list of clusters for demos/tests.
+- **Namespace Provider**: Namespaces-as-clusters for fast local simulations.
+- **Multi / Clusters / Single / Nop**: Utility and composition providers for advanced scenarios and testing.
+
+These map to common sources of truth and make it easy to swap discovery strategies without changing reconciler code.
+
+### Identity and inventory (KEPs)
+
+- **Cluster identification (KEP-2149)**: Standardizes cluster identity and ClusterSets, which is foundational for stable, unambiguous targeting across a fleet.
+- **Cluster inventory (KEP-4322)**: Defines a `ClusterProfile` API for describing clusters in an inventory system.
+- **Credentials (KEP-5339)**: Introduces credential plugins for `ClusterProfile`, decoupling how credentials are obtained from how clusters are inventoried.
+
+multicluster-runtime’s providers leverage these concepts to reliably identify clusters and obtain access.
+
+### Typical use cases
+
+- Fleet-wide policy enforcement and configuration drift remediation
+- Baseline resource management (e.g., RBAC, admission policies) across clusters
+- Federated application rollout and orchestration
+- Cross-cluster data collection and health aggregation
+- Safe experimentation and testing with namespaces-as-clusters locally
+
+### What you’ll build next
+
+If you know controller-runtime, you already know most of this library. You will:
+- create a multi-cluster Manager with a chosen Provider,
+- use `mcbuilder` to register controllers and watches,
+- write reconcilers that handle `mcreconcile.Request` and read/write via the per-cluster client.
+
+For an architectural deep dive into the “One Pod, Many Clusters” model, see:
+- Architecture: [01-introduction--architecture.md](01-introduction--architecture)
+- Why multicluster-runtime?: [01-introduction--why-multicluster-runtime.md](01-introduction--why-multicluster-runtime)
+- Key Concepts: [01-introduction--key-concepts.md](01-introduction--key-concepts)
+
+When you’re ready to try it out, continue to Getting Started:
+- Prerequisites: [02-getting-started--prerequisites.md](02-getting-started--prerequisites)
+- Installation: [02-getting-started--installation.md](02-getting-started--installation)
+- Quickstart: [02-getting-started--quickstart.md](02-getting-started--quickstart)
+
+### Project status
+
+The project is under active development and is intended to feel idiomatic for controller-runtime users. Expect incremental improvements to providers, APIs, and developer ergonomics as the ecosystem converges on standardized inventory and identity models.
+
+

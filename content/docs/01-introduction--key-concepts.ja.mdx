@@ -1,0 +1,156 @@
+---
+title: 主要な概念
+---
+
+この章では、`multicluster-runtime` でマルチクラスターコントローラーを書くときに登場する **4 つの主要な抽象** を紹介します。  
+**Multi-Cluster Manager（マルチクラスターマネージャー）**、**Provider（プロバイダー）**、**Cluster オブジェクト**、そして **Reconciler（リコンサイラー）** です。
+
+controller-runtime に慣れている読者は、これらを「おなじみの Manager / Builder / Reconciler を、マルチクラスター向けに薄く拡張したもの」と考えると理解しやすいでしょう。
+
+---
+
+### Multi-Cluster Manager（マルチクラスターマネージャー）
+
+`multicluster-runtime` の中心にあるのが `mcmanager.Manager`、すなわち **マルチクラスターマネージャー**です。  
+これは通常の controller-runtime の `manager.Manager` をラップし、フリート（複数クラスター）の存在を理解できるようにしたものです。
+
+概念的に、マルチクラスターマネージャーは次のような役割を担います。
+
+- **ホストクラスター用の Manager を埋め込む**  
+  多くの場合、管理用またはハブクラスターを対象とする「ホスト」 `manager.Manager` を内部に持ちます。
+- **Provider と接続する**  
+  現在のフリートにどのクラスターが存在し、どう到達するかを知っているコンポーネントが Provider です。
+- **クラスターごとの Client / Manager を引き出すための API を公開する**  
+  クラスター名を指定して client や cache にアクセスできます。
+- **`multicluster.Aware` を実装し、Provider からの Engage/Disengage を受け取る**  
+  Provider が新しいクラスターを検出すると、Manager に「このクラスターを監視対象に加えてよい」と通知できます。
+
+主に意識すべきメソッドは次のとおりです。
+
+- **`GetCluster(ctx, clusterName)`**:  
+  指定した名前の `cluster.Cluster` を返します。**空文字列 (`""`) は常にローカル（ホスト）クラスター**を指します。
+- **`GetManager(ctx, clusterName)`**:  
+  特定クラスター専用にスコープされた `manager.Manager` を返します。既存の controller-runtime コンポーネントを、そのクラスターにだけ向けて動かしたいときに便利です。
+- **`ClusterFromContext(ctx)`**:  
+  コンテキストに埋め込まれたクラスター名を解決します（後述のヘルパーと組み合わせて利用）。
+- **`GetProvider()` / `GetFieldIndexer()`**:  
+  裏で使っている Provider と、フリート全体にフィールドインデックスを張るインデクサーへアクセスできます。
+
+アプリケーションコード側では、通常は `main` 関数で一度だけ:
+
+1. Provider を生成し、
+2. `mcmanager.New` に渡してマルチクラスターマネージャーを作り、
+3. `mcbuilder.ControllerManagedBy(mgr)` でコントローラーを登録します。
+
+---
+
+### Provider（プロバイダー）: フリートはどこから来るか
+
+**Provider** は次の 2 つの問いに答えるコンポーネントです。
+
+- 「いま、このフリートにはどのクラスターが存在しているか？」
+- 「それぞれのクラスターには、どうやって接続するか？」
+
+中心となるインターフェースは `multicluster.Provider` で、とても小さく設計されています。
+
+- **`Get(ctx, clusterName) (cluster.Cluster, error)`**  
+  指定した名前の `cluster.Cluster` を返します（必要に応じて遅延生成）。  
+  未知のクラスター名であれば `ErrClusterNotFound` を返します。
+- **`IndexField(ctx, obj, field, extractValue)`**  
+  すでに Engage 済みのクラスターと、今後検出されるクラスターを含め **すべてのクラスター** に対してフィールドインデックスを登録します。
+
+多くの Provider は、さらに `multicluster.ProviderRunnable` も実装します。
+
+- **`Start(ctx, aware multicluster.Aware) error`**  
+  長時間稼働する検出ループで、例えば次のような外部システムを監視します。
+  - Cluster API の `Cluster` リソース
+  - `ClusterProfile` インベントリ（KEP-4322）
+  - Kind クラスター
+  - kubeconfig ファイルや Secret
+  - Namespace をクラスターと見なすシミュレーション など
+
+そしてクラスターを見つけるたびに、`aware.Engage(ctx, name, cluster)` を呼び出し、マネージャーやコントローラーがそのクラスター向けの監視を開始できるようにします。
+
+`multicluster-runtime` には、代表的な Provider 実装がいくつか同梱されています。
+
+- **Kind Provider**: ローカルの Kind クラスターを検出して開発用フリートを構成。
+- **Kubeconfig Provider**: kubeconfig を含む Secret やファイルからクラスターを読み出し。
+- **Cluster API Provider**: CAPI の `Cluster` リソースからクラスターを動的に検出。
+- **Cluster Inventory API Provider**: `ClusterProfile`（KEP‑4322）と、ClusterID / ClusterSet（KEP‑2149）、クレデンシャルプラグイン（KEP‑5339）に沿ったインベントリを利用。
+- **File / Namespace / Multi / Single / Nop Provider**:  
+  ファイルベースのフリート、Namespaces-as-Clusters のシミュレーション、複数 Provider の合成、テスト用の極小 Provider など。
+
+フリートは Provider 駆動であるため、**Reconciler のコードをほとんど変えずに、クラスターの検出方法だけを差し替える** ことができます。
+
+---
+
+### Cluster オブジェクト: クラスター単位の Client / Cache / アイデンティティ
+
+**Cluster オブジェクト** は、フリートの中の 1 つのメンバークラスターを表現し、そのクラスターに対するあらゆる操作の窓口となります。
+
+`multicluster-runtime` では、controller-runtime の `cluster.Cluster` 型をそのまま再利用します。
+
+- **`GetClient()`**:  
+  そのクラスターに対して CRUD 操作を行う `client.Client`。
+- **`GetCache()`**:  
+  List/Watch を効率的に行うための共有インフォーマーキャッシュ。
+- **`GetFieldIndexer()`**:  
+  クラスター単位のフィールドインデクサー。
+- **`Start(ctx)`**:  
+  キャッシュを同期し続ける長時間稼働プロセス（通常は Provider 側が起動）。
+
+`mgr.GetCluster(ctx, "cluster-a")` と呼ぶと、その `"cluster-a"` に対応する `cluster.Cluster` インスタンスが返ってきます。  
+Manager と Source は次のことを保証します。
+
+- Engage された各クラスターに対して、**専用の Client / Cache / Informer** が用意される。
+- フィールドインデックスが **すべてのクラスターで一貫して適用される**。
+- クラスターが削除されたときには、そのクラスター専用のコンテキストがキャンセルされ、関連するキャッシュや watch が安全に停止する。
+
+このように Cluster オブジェクトを単位として扱うことで、**Reconciler から見ると各メンバークラスターは「ほぼ独立したシングルクラスター環境」のように振る舞い**、ライフサイクルや配線の複雑さは Manager / Provider 側に隠蔽されます。
+
+---
+
+### Reconciler とマルチクラスター Request
+
+ビジネスロジックを書く場所は、シングルクラスターと同じく **Reconciler** です。  
+`multicluster-runtime` では、依然として `Reconcile(ctx, req)` メソッドを実装しますが、`req` の型が **クラスター識別子を含む** ようになります。
+
+- **`mcreconcile.Request`** は、通常の `reconcile.Request` をラップした型で、次のフィールドを持ちます。
+  - `ClusterName string`: この Work Item が属するクラスター名。
+  - `Request reconcile.Request`: そのクラスター内での `NamespacedName`（シングルクラスター時と同じ）。
+
+典型的なマルチクラスター Reconciler は、次のような流れになります。
+
+1. `req.ClusterName` を読み取り、対象クラスターを取得する。  
+   例: `cl, err := mgr.GetCluster(ctx, req.ClusterName)`
+2. `cl.GetClient()`（必要に応じて `cl.GetCache()` や `cl.GetEventRecorderFor`）を使ってオブジェクトの読み書きを行う。
+3. 次のいずれかのパターンでビジネスロジックを実装する。
+   - **Uniform パターン**: `req.ClusterName` 内だけで完結する処理（ポリシー適用やベースラインリソースの維持など）。
+   - **Multi-Cluster-Aware パターン**: あるクラスターでのイベントをもとに、別のクラスターへ書き込みを行うなど、クロスクラスターのオーケストレーションを行う処理。
+
+Request がクラスター名を運んでくれるため、**単一の Reconciler 実装で多数のクラスターを安全に扱う** ことができます。  
+さらに `ClusterNotFound` を握りつぶすラッパーなどのヘルパーにより、クラスターが削除されたあとの古い Work Item も安全に破棄できます。
+
+---
+
+### 4 つの概念がどのように連携するか
+
+ここまでの概念をまとめると、フローは次のようになります。
+
+- **Provider** が、Cluster API や ClusterProfile、Kind、kubeconfig、Namespace などからクラスターを検出し、そのライフサイクルを管理します。
+- **Multi-Cluster Manager** は、通常の Manager を埋め込んだ上で Provider と統合し、クラスターごとの Manager / Client を取得するための API を提供します。
+- Engage された各 **Cluster** に対して、マルチクラスター対応の **Source** が Kubernetes オブジェクトを監視し、適切な `ClusterName` を付与した `mcreconcile.Request` をワークキューに積みます。
+- **Reconciler** はこれらの Request を消費し、正しいクラスターの Client を使ってビジネスロジックを実行します（Uniform / Multi-Cluster-Aware いずれのパターンも可能）。
+
+この章で紹介した概念は、後続の章でより詳細に掘り下げられます。
+
+- マルチクラスターマネージャーの詳細:  
+  [`03-core-concepts--the-multi-cluster-manager.md`](../03-core-concepts--the-multi-cluster-manager.md)
+- Provider の詳細:  
+  [`03-core-concepts--providers.md`](../03-core-concepts--providers.md)
+- Cluster オブジェクトの詳細:  
+  [`03-core-concepts--the-cluster-object.md`](../03-core-concepts--the-cluster-object.md)
+- Reconcile ループの詳細:  
+  [`03-core-concepts--the-reconcile-loop.md`](../03-core-concepts--the-reconcile-loop.md)
+
+あわせて、「概要」「アーキテクチャ」「なぜ multicluster-runtime なのか？」の各章も、全体像をつかむ際の参考にしてください。

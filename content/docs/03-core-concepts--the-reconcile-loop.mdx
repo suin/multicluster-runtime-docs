@@ -1,0 +1,310 @@
+---
+title: The Reconcile Loop
+---
+
+This chapter explains how the **Reconcile loop** works in `multicluster-runtime`.  
+If you already know controller-runtime, you can think of this as the familiar
+`Reconcile(ctx, req)` pattern, extended with a **cluster dimension** so that the
+same reconciler can safely act across a fleet of clusters.
+
+We will look at:
+
+- how a multi-cluster request (`mcreconcile.Request`) differs from `reconcile.Request`,
+- where the `ClusterName` comes from,
+- how to write Reconcilers that resolve the right cluster client,
+- how to adapt existing single-cluster Reconcilers,
+- and how errors and retries behave when clusters appear and disappear.
+
+---
+
+### From single-cluster to multi-cluster Reconcile
+
+In a single-cluster controller-runtime application, a Reconciler typically looks like:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // Implicitly talks to “the” cluster via r.Client or mgr.GetClient().
+    var obj myv1alpha1.MyResource
+    if err := r.Client.Get(ctx, req.NamespacedName, &obj); err != nil {
+        // ...
+    }
+    // business logic...
+    return ctrl.Result{}, nil
+}
+```
+
+Key properties:
+
+- The request key (`NamespacedName`) is **relative to a single cluster**.
+- The Reconciler typically uses a **single client and cache**, bound to one API server.
+
+With `multicluster-runtime`, the main change is that every work item becomes **cluster‑qualified**:
+
+- the request now carries a **`ClusterName`** in addition to the object key, and
+- the Reconciler is expected to use the **correct per-cluster client** based on that name.
+
+The rest of the Reconcile loop—queueing, retries, result semantics—remains the same as in controller-runtime.
+
+---
+
+### The multi-cluster Request type
+
+The core request type for multi-cluster controllers is `mcreconcile.Request` (`pkg/reconcile/request.go`):
+
+- **Fields**
+  - `ClusterName string`  
+    The logical name of the cluster this work item belongs to. The empty string (`""`) is reserved for the **local (host) cluster**.
+  - `Request reconcile.Request`  
+    The usual controller-runtime request containing `NamespacedName` for the object *within* that cluster.
+
+Conceptually:
+
+- `ClusterName` selects **which cluster** to talk to.
+- `Request.NamespacedName` selects **which object** to talk to in that cluster.
+
+For convenience, the package also defines:
+
+- **`type Reconciler = reconcile.TypedReconciler[mcreconcile.Request]`**  
+  A reconciler type alias for the multi-cluster request.
+- **`type Func = reconcile.TypedFunc[mcreconcile.Request]`**  
+  A helper to create Reconcilers from plain functions, often used with the Builder:
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("multicluster-configmaps").
+    For(&corev1.ConfigMap{}).
+    Complete(mcreconcile.Func(
+        func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            // ...
+            return ctrl.Result{}, nil
+        },
+    ))
+```
+
+Under the hood, `mcreconcile.Request` also implements a string representation that
+includes the cluster when present (e.g. `cluster://cluster-a/ns/name`), which simplifies logging and debugging.
+
+#### Cluster-aware generic requests
+
+Internally, multi-cluster controllers use a generic interface:
+
+- **`ClusterAware[request]`**  
+  A constraint for request types that:
+  - are comparable,
+  - implement `fmt.Stringer`,
+  - and expose `Cluster()` / `WithCluster(string)` methods.
+
+`mcreconcile.Request` implements this interface, but you can also build your own
+cluster-aware request type with the `WithCluster[request]` helper if you need a
+custom key shape. For most controllers, sticking with `mcreconcile.Request` is sufficient.
+
+---
+
+### Where `ClusterName` comes from
+
+`ClusterName` is populated before your Reconciler runs. The flow is:
+
+1. A **Provider** discovers or constructs `cluster.Cluster` objects for each member cluster and **engages** them with the Multi-Cluster Manager.
+2. For each engaged cluster, multi-cluster **Sources** (for example, `mcsource.Kind`) attach event handlers to that cluster’s cache and informers.
+3. When an event occurs (Create / Update / Delete):
+   - the cluster-specific Source builds a `request` value that implements `ClusterAware`,
+   - it sets `ClusterName` to the name of the cluster,
+   - it sets the inner `Request` (for `mcreconcile.Request`) or wraps some other key,
+   - and it enqueues that work item on the controller’s shared workqueue.
+4. The controller’s workers pop items off the queue and call your Reconciler with the fully-populated `mcreconcile.Request`.
+
+The **controller** type (`pkg/controller/controller.go`) is itself multi-cluster–aware:
+
+- it implements `multicluster.Aware` so that the Manager or Provider can call `Engage(ctx, name, cluster)` when a new cluster appears,
+- it records each engaged `{clusterName → cluster.Cluster}`,
+- for each cluster, it wires the multi-cluster Sources (via `MultiClusterWatch`) so they start injecting requests tagged with that `clusterName`.
+
+The result is:
+
+- each engaged cluster has its own cache and informers,
+- but **all** work items feed into a single logical queue,
+- and every request knows which cluster it belongs to.
+
+---
+
+### Writing a cluster-aware Reconciler
+
+From a Reconciler author’s perspective, the core pattern is:
+
+1. Use `mcreconcile.Request` as the request type.
+2. Resolve the correct `cluster.Cluster` using the Multi-Cluster Manager.
+3. Use that cluster’s client and cache just like you would in a single-cluster controller.
+
+For example, a uniform reconciler that logs `ConfigMap`s across all clusters:
+
+```go
+func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+    log.Info("Reconciling ConfigMap")
+
+    // 1. Resolve the cluster for this request.
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return reconcile.Result{}, err
+    }
+
+    // 2. Use the per-cluster client to fetch the object.
+    cm := &corev1.ConfigMap{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+        if apierrors.IsNotFound(err) {
+            // Object was deleted; nothing to do.
+            return ctrl.Result{}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 3. Business logic (log, emit events, mutate state, etc.).
+    log.Info("ConfigMap found",
+        "namespace", cm.Namespace,
+        "name", cm.Name,
+        "cluster", req.ClusterName,
+    )
+
+    return ctrl.Result{}, nil
+}
+```
+
+Notes:
+
+- `req.ClusterName` tells you **which cluster** to target.
+- `req.Request.NamespacedName` is the familiar key **inside that cluster**.
+- `GetCluster` may return an error if the cluster has been removed since the item was queued (see the next section).
+
+The examples in the upstream repository (`refs/multicluster-runtime/examples/*/main.go`)
+follow exactly this pattern for various providers (Kind, File, Kubeconfig, Cluster API, Cluster Inventory API, Namespace).
+
+---
+
+### Handling disappearing clusters and `ErrClusterNotFound`
+
+In a dynamic fleet, clusters can disappear while there are still work items in the queue.  
+When that happens, calling `mgr.GetCluster(ctx, req.ClusterName)` may fail with `multicluster.ErrClusterNotFound`.
+
+By default, `multicluster-runtime` helps you treat this as a **clean terminal condition**:
+
+- the Builder (`pkg/builder`) wraps your Reconciler in a **`ClusterNotFoundWrapper`** unless you opt out,
+- this wrapper:
+  - calls your Reconciler,
+  - checks the returned error,
+  - if the error is (or wraps) `multicluster.ErrClusterNotFound`, it treats the reconcile as **successful** and **does not requeue**,
+  - otherwise it propagates the original result and error.
+
+This prevents controllers from endlessly retrying items for clusters that no longer exist.
+
+If you want to handle this case yourself (for example, to record metrics or emit a specific Event), you can:
+
+- disable the wrapper when building the controller:
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    WithClusterNotFoundWrapper(false).
+    // ...
+    Complete(myReconciler)
+```
+
+- and in your Reconciler, explicitly detect and handle `multicluster.ErrClusterNotFound`.
+
+Apart from this multi-cluster-specific helper, error handling and retry semantics are the same as in controller-runtime:
+
+- returning an error causes a requeue using the controller’s rate-limiting queue,
+- returning `ctrl.Result{RequeueAfter: ...}` schedules a later retry,
+- returning `ctrl.Result{}` with `nil` error marks the work as successfully processed.
+
+---
+
+### Using context for cluster awareness
+
+Sometimes you want to adapt an existing Reconciler that still expects a **single-cluster** `reconcile.Request` and obtains its client from a Manager or global state.
+
+`multicluster-runtime` provides a small bridge in `pkg/context/cluster.go`:
+
+- **`context.WithCluster(ctx, clusterName)` / `context.ClusterFrom(ctx)`**  
+  Associate a cluster name with a `context.Context` and retrieve it later.
+- **`context.ReconcilerWithClusterInContext(r reconcile.Reconciler) mcreconcile.Reconciler`**  
+  Wrap a standard `reconcile.Reconciler` so that:
+  - it receives a multi-cluster `mcreconcile.Request`,
+  - the wrapper injects `req.ClusterName` into the context using `WithCluster`,
+  - then calls the original Reconciler with the inner `req.Request`.
+
+On the Manager side, you can then use:
+
+- **`mgr.ClusterFromContext(ctx)`**  
+  to resolve the current `cluster.Cluster` based on the cluster name stored in the context.
+
+This pattern is useful when:
+
+- incrementally migrating existing code to multi-cluster,
+- or when you want to centralise the “resolve cluster from context” logic rather than passing `ClusterName` around explicitly.
+
+For new code, the recommended style is usually:
+
+- accept `mcreconcile.Request`,
+- call `mgr.GetCluster(ctx, req.ClusterName)` directly,
+- and keep your business logic explicit about which cluster it is acting on.
+
+---
+
+### Uniform vs multi-cluster-aware Reconcile loops
+
+`multicluster-runtime` supports two main patterns for business logic:
+
+- **Uniform Reconcilers**
+  - The same logic runs independently in every cluster.
+  - The reconciler:
+    - reads resources in `req.ClusterName`,
+    - writes back only to that cluster.
+  - Examples:
+    - enforcing the presence of standard `ConfigMap`s, RBAC, or policies,
+    - collecting per-cluster health or metrics.
+
+- **Multi-cluster-aware Reconcilers**
+  - The logic explicitly considers relationships between clusters.
+  - The reconciler may:
+    - read from one cluster (for example, a management cluster or inventory),
+    - write to one or more other clusters,
+    - or coordinate state across many clusters.
+  - Examples:
+    - Rolling out workloads across a ClusterSet based on capacity or location,
+    - propagating certificates from a central CA cluster to member clusters,
+    - aggregating state from many clusters into a single reporting target.
+
+The Reconcile loop API is the same for both patterns; the difference is **which clusters you read and write**.  
+The “Controller Patterns” chapter dives deeper into these patterns and how to structure your code for each.
+
+---
+
+### How the Builder wires the Reconcile loop
+
+The `mcbuilder` package (`pkg/builder`) is the primary entry point for registering multi-cluster controllers. It is a thin adaptation of controller-runtime’s builder that:
+
+- uses `mcreconcile.Request` (or other `ClusterAware` request types),
+- wires multi-cluster `Kind` sources and other Sources against all engaged clusters,
+- applies `EngageOptions` (such as `WithEngageWithLocalCluster` and `WithEngageWithProviderClusters`) consistently across `For`, `Owns`, and `Watches`,
+- automatically wraps your Reconciler in `ClusterNotFoundWrapper` (unless disabled).
+
+From a user’s perspective, the code looks almost identical to single-cluster controller-runtime:
+
+- you still:
+  - call `ControllerManagedBy(mgr)`,
+  - specify `For` and optional `Owns` / `Watches`,
+  - and end with `Complete(...)`,
+- but the resulting controller:
+  - will watch the appropriate resources in all engaged clusters,
+  - will enqueue `mcreconcile.Request` values tagged with `ClusterName`,
+  - and will resolve the correct per-cluster caches and clients.
+
+This is the final piece that closes the loop:
+
+- **Providers** discover and engage clusters,
+- **Sources** observe cluster-scoped events and enqueue multi-cluster requests,
+- **Controllers and Builders** wire those Sources into a shared workqueue,
+- **Reconcilers** handle `mcreconcile.Request` and use the Multi-Cluster Manager to act on the right clusters.
+
+Together, these components let you preserve the simplicity of the controller-runtime Reconcile loop while scaling it out to fleets of clusters.
+
+

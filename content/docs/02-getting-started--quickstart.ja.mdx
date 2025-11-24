@@ -1,0 +1,313 @@
+---
+title: Kind Provider ではじめるマルチクラスターコントローラー
+---
+
+この章では、**Kind Provider** と小さな Kind クラスターフリートを使って、`multicluster-runtime` による **最初のマルチクラスターコントローラー** を動かすまでの手順を解説します。  
+最終的には、1 つのコントローラープロセスが複数のクラスターの `ConfigMap` を監視し、見つけた情報をログと Kubernetes の `Event` として出力するところまで確認します。
+
+すでに次を満たしていることを前提とします。
+
+- **Introduction** 章（特に **Overview** / **Architecture** / **Key Concepts**）を読んでいる。
+- **前提条件** と **インストール** の手順を完了している。
+- ローカル環境に `kind` / `kubectl` / Docker（もしくは同等のコンテナランタイム）/ Go がインストールされている。
+
+---
+
+### このクイックスタートで作るもの
+
+このクイックスタートでは、次のようなものを作ります。
+
+- **小さな Go プロジェクト**  
+  - 依存関係として `multicluster-runtime` と **Kind Provider** を追加します。
+- **マルチクラスターマネージャーの設定**  
+  - 名前が `fleet-` で始まる Kind クラスターを自動的に検出するように構成します。
+- **シンプルな「均一 Reconciler」**  
+  - すべてのクラスターで `ConfigMap` を監視し、
+  - どのクラスターのどの Namespace にある `ConfigMap` かをログに出力し、
+  - 対応するメンバークラスター内に Kubernetes の `Event` を発行します。
+- **2 つの Kind クラスター**（`fleet-alpha` と `fleet-beta`）を作成し、  
+  それぞれで `ConfigMap` を作成したときに、1 つのコントローラーから Reconcile が行われることを確認します。
+
+ここで扱うのは **Uniform Reconciler（均一な Reconciler）** パターンです。  
+すべてのクラスターに対して同じロジックを実行します。  
+より高度な「マルチクラスター認識型（Multi-Cluster-Aware）」パターンは、後続の章で扱います。
+
+---
+
+### ステップ 0. インストール済みのモジュールからスタートする
+
+直前に **インストール** 章を終えている場合、すでに次のような Go モジュールがあるはずです。
+
+- Go **1.24 以上** を利用している。
+- 依存関係として次を含んでいる:
+  - `sigs.k8s.io/multicluster-runtime@v0.22.0-beta.0`
+  - `sigs.k8s.io/controller-runtime@v0.22.0`
+- さらに Kind Provider モジュールを追加済み、あるいは追加できる状態になっている:
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kind@v0.22.0-beta.0
+```
+
+まだモジュールを作成していない場合や依存関係を追加していない場合は、先に **クイックスタート — インストール** を完了してからここに戻ってきてください。
+
+---
+
+### ステップ 1. `main.go` を作成する
+
+モジュールルート（例: `my-multicluster-controller/`）に `main.go` ファイルを作成し、次の内容を貼り付けます。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	"sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+	// 構造化ログを設定
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	entryLog := ctrllog.Log.WithName("kind-quickstart")
+	ctx := signals.SetupSignalHandler()
+
+	// 1. 名前が "fleet-" で始まる Kind クラスターを検出する Provider を作成
+	provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+	// 2. Provider を利用するマルチクラスターマネージャーを作成
+	mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+	if err != nil {
+		entryLog.Error(err, "unable to create manager")
+		os.Exit(1)
+	}
+
+	// 3. すべての検出済みクラスターに対して ConfigMap を監視するコントローラーを登録
+	err = mcbuilder.ControllerManagedBy(mgr).
+		Named("multicluster-configmaps").
+		For(&corev1.ConfigMap{}).
+		Complete(mcreconcile.Func(
+			func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+				log := ctrllog.FromContext(ctx).WithValues("cluster", req.ClusterName)
+				log.Info("Reconciling ConfigMap")
+
+				// このリクエストの対象クラスターを解決
+				cl, err := mgr.GetCluster(ctx, req.ClusterName)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+
+				// 対象クラスターから ConfigMap を取得
+				cm := &corev1.ConfigMap{}
+				if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+					if apierrors.IsNotFound(err) {
+						// すでに削除されている場合は何もしない
+						return ctrl.Result{}, nil
+					}
+					return ctrl.Result{}, err
+				}
+
+				// メンバークラスター内に Kubernetes Event を発行
+				cl.GetEventRecorderFor("kind-multicluster-configmaps").Event(
+					cm,
+					corev1.EventTypeNormal,
+					"ConfigMapFound",
+					"ConfigMap found in cluster "+req.ClusterName,
+				)
+
+				// どのクラスターのどの ConfigMap を見つけたかをログに出力
+				log.Info("ConfigMap found",
+					"namespace", cm.Namespace,
+					"name", cm.Name,
+					"cluster", req.ClusterName,
+				)
+
+				return ctrl.Result{}, nil
+			},
+		))
+	if err != nil {
+		entryLog.Error(err, "unable to create controller")
+		os.Exit(1)
+	}
+
+	// 4. マネージャーを起動（Kind Provider とコントローラーがまとめて起動される）
+	if err := mgr.Start(ctx); ignoreCanceled(err) != nil {
+		entryLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+}
+
+// コンテキストキャンセルを「正常終了」として扱うためのヘルパー
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+```
+
+この `main.go` は、そのまま実行可能なマルチクラスターコントローラーです。
+
+- **マネージャー**: `mcmanager.New` が通常の controller-runtime Manager をラップし、Kind Provider と結び付けます。
+- **Provider**: `kind.New(kind.Options{Prefix: "fleet-"})` が、名前が `fleet-` で始まる Kind クラスターを検出します。
+- **Builder**: `mcbuilder.ControllerManagedBy(mgr)` が、すべてのエンゲージ済みクラスターに対して `ConfigMap` を監視するコントローラーを登録します。
+- **Reconciler**: `mcreconcile.Request`（`ClusterName` と内部の `reconcile.Request` を含む）を受け取り、正しい `cluster.Cluster` を解決したうえで、そのクラスターの API サーバーからデータを取得します。
+
+---
+
+### ステップ 2. Kind クラスターフリートを作成する
+
+続いて、このコントローラーが対象とする Kind クラスターを 2 つ作成します。
+
+```bash
+kind create cluster --name fleet-alpha
+kind create cluster --name fleet-beta
+```
+
+これにより次のような状態になります。
+
+- Kind クラスター:
+  - `fleet-alpha`
+  - `fleet-beta`
+- `kubectl` コンテキスト:
+  - `kind-fleet-alpha`
+  - `kind-fleet-beta`
+
+動作確認として、次のコマンドでクラスター一覧を確認できます。
+
+```bash
+kind get clusters
+```
+
+マネージャー起動時、Kind Provider は名前が `fleet-` から始まる Kind クラスターを探索し、  
+それぞれについて `cluster.Cluster` を生成して Multi-Cluster Manager に **Engage** します。
+
+---
+
+### ステップ 3. コントローラーを実行する
+
+クラスターが起動しており、`main.go` の準備もできている状態で、  
+プロジェクトルートから次のコマンドでコントローラーを起動します。
+
+```bash
+go run ./...
+```
+
+ログにはおおよそ次のようなメッセージが出力されます（構成により細部は異なります）。
+
+```text
+INFO  kind-quickstart  Starting manager
+INFO  provider-kind     discovered cluster {"name": "fleet-alpha"}
+INFO  provider-kind     discovered cluster {"name": "fleet-beta"}
+INFO  controller        Starting Controller {"controller": "multicluster-configmaps"}
+```
+
+内部では、次のようなことが起きています。
+
+- **Kind Provider** が、名前が `fleet-` で始まる Kind クラスターを列挙します。
+- 各クラスターについて、独立した client / cache を持つ `cluster.Cluster` が作成され、Multi-Cluster Manager に Engage されます。
+- `multicluster-configmaps` コントローラーは:
+  - 各クラスターに対するマルチクラスター対応の `Kind` Source を登録し、
+  - クラスターごとに `ClusterName` が付与された `mcreconcile.Request` を受け取ります。
+
+---
+
+### ステップ 4. ConfigMap を作成して Reconcile の流れを確認する
+
+別のターミナルを開き、それぞれのクラスターでテスト用の `ConfigMap` を作成してみます。
+
+- **`fleet-alpha` 上で:**
+
+```bash
+kubectl --context kind-fleet-alpha create configmap demo-alpha \
+  --from-literal=message="hello from alpha"
+```
+
+- **`fleet-beta` 上で:**
+
+```bash
+kubectl --context kind-fleet-beta create configmap demo-beta \
+  --from-literal=message="hello from beta"
+```
+
+`go run` を実行しているコントローラー側のターミナルには、次のようなログが出力されるはずです。
+
+```text
+INFO  Reconciling ConfigMap {"cluster": "fleet-alpha", "name": "demo-alpha", "namespace": "default"}
+INFO  ConfigMap found {"cluster": "fleet-alpha", "namespace": "default", "name": "demo-alpha"}
+INFO  Reconciling ConfigMap {"cluster": "fleet-beta", "name": "demo-beta", "namespace": "default"}
+INFO  ConfigMap found {"cluster": "fleet-beta", "namespace": "default", "name": "demo-beta"}
+```
+
+さらに、各クラスター内で発行された `Event` も確認してみましょう。
+
+```bash
+# ターミナル 1: fleet-alpha 上の Event を監視
+kubectl --context kind-fleet-alpha get events -A --watch
+
+# ターミナル 2: fleet-beta 上の Event を監視
+kubectl --context kind-fleet-beta get events -A --watch
+```
+
+それぞれの `ConfigMap` に対して、次のような Event が観測できるはずです。
+
+- Reason: `ConfigMapFound`
+- Message: `"ConfigMap found in cluster <cluster-name>"`
+
+これは **One Pod, Many Clusters** モデルが動作していることを示しています。
+
+- Reconciler の実装は 1 つだけですが、
+- Multi-Cluster Manager と Kind Provider によって、フリート内のすべてのクラスターに対して同じロジックが適用されています。
+
+---
+
+### ステップ 5. クリーンアップ
+
+`go run` を実行しているターミナルで `Ctrl+C` を押し、コントローラーを停止します。
+
+続いて、作成した Kind クラスターを削除します。
+
+```bash
+kind delete cluster --name fleet-alpha
+kind delete cluster --name fleet-beta
+```
+
+これでローカルマシン上の Kind クラスターが削除され、消費していたリソースが解放されます。
+
+---
+
+### 次のステップ
+
+ここまでで、`multicluster-runtime` を用いた最小限のマルチクラスターコントローラーを動かせるようになりました。  
+次に進むためのアイデアをいくつか挙げます。
+
+- **コントローラーのカスタマイズ**
+  - 監視対象を `ConfigMap` から自作の CRD に変更する。
+  - `mcbuilder` の `Owns` / `Watches` を使って、関連リソースをまとめて扱う。
+  - `EngageOptions` を利用して、「ローカル（ホスト）クラスターも含めるか」「Provider が管理するクラスターだけに限定するか」を切り替える。
+- **別の Provider を試す**
+  - Kind Provider の代わりに **File Provider**（ローカルの kubeconfig ファイル）を使ってみる。
+  - 管理クラスター上の Secret を利用する **Kubeconfig Provider** を試してみる。
+  - Cluster API / Cluster Inventory API 環境が整っていれば、対応する Provider でフリート管理を試してみる。
+- **より深く理解する**
+  - マルチクラスターマネージャーの詳細:  
+    [03-core-concepts--the-multi-cluster-manager.md](03-core-concepts--the-multi-cluster-manager)
+  - Provider の役割と実装パターン:  
+    [03-core-concepts--providers.md](03-core-concepts--providers)
+  - Builder とコントローラーパターンの詳細:  
+    [04-controller-patterns--using-the-builder.md](04-controller-patterns--using-the-builder)
+
+このクイックスタートを土台として、`multicluster-runtime` を使ったより高度なマルチクラスターコントローラーへ発展させていくことができます。

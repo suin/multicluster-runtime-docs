@@ -1,0 +1,387 @@
+---
+title: Cluster Identification
+---
+
+This chapter dives into **cluster identification** in `multicluster-runtime`: how clusters are named, how that relates to
+**ClusterIDs** and **ClusterSets** from SIG‑Multicluster (KEP‑2149), and how to design naming schemes that remain stable
+as your fleet and inventory evolve.
+
+If you have read:
+
+- **Core Concepts — The Cluster Object** (`03-core-concepts--the-cluster-object.md`), and
+- **Core Concepts — Providers** (`03-core-concepts--providers.md`),
+
+you have already seen the basic idea: controllers work with a `ClusterName` string, while external standards such as
+**ClusterProperty**, **ClusterProfile**, and **credential plugins** define how clusters are identified and reached in a
+portable way. This chapter connects those pieces and provides concrete guidance.
+
+---
+
+### Why cluster identification matters
+
+In a single‑cluster controller, “which cluster am I talking to?” is usually implicit:
+
+- there is one API server,
+- one set of credentials,
+- and one namespace for logs and metrics.
+
+In a multi‑cluster controller:
+
+- the same process talks to **many clusters**,
+- those clusters may be part of one or more **ClusterSets**,
+- multiple systems (MCS, DNS, inventory, schedulers, observability) all need to agree on **which cluster is which**.
+
+You typically need at least two levels of identity:
+
+- **Routing identity** – the `ClusterName` you pass to `mgr.GetCluster(ctx, clusterName)` so `multicluster-runtime` can
+  find the right `cluster.Cluster` and client.
+- **Global identity** – a durable **ClusterID** that other systems (MCS, DNS, logging, inventory, placement engines)
+  also understand, often expressed via `ClusterProperty` and `ClusterProfile`.
+
+This chapter assumes:
+
+- `ClusterName` is primarily a **routing key inside your controller**,
+- ClusterID / ClusterSet information from **KEP‑2149** and **KEP‑4322** provides the globally meaningful identity,
+- good designs keep a **clear, documented mapping** between the two.
+
+---
+
+### SIG‑Multicluster model: ClusterProperty and ClusterSet (KEP‑2149)
+
+KEP‑2149 (“ClusterId for ClusterSet identification”) standardises how to describe a cluster’s identity and ClusterSet
+membership in a Kubernetes‑native way.
+
+At the core is the **`ClusterProperty`** CRD:
+
+- a **cluster‑scoped** resource (usually installed via the “About API”),
+- each object has:
+  - `metadata.name` – the property name,
+  - `spec.value` – the property value as a string (up to 128k Unicode code points).
+
+Two **well‑known properties** are defined:
+
+- **`cluster.clusterset.k8s.io`**
+  - holds a **ClusterID** string for the current cluster,
+  - **must be unique within a ClusterSet** for as long as the cluster is a member,
+  - must be a valid RFC‑1123 DNS subdomain (and should be reasonably short),
+  - is intended to be used in MCS DNS names such as  
+    `clusterA.myservice.ns.svc.clusterset.local.`.
+- **`clusterset.k8s.io`**
+  - identifies the **ClusterSet** the cluster currently belongs to,
+  - must exist for as long as the cluster is in that ClusterSet,
+  - must be removed once the cluster leaves the ClusterSet.
+
+Some important properties of this model:
+
+- **Uniqueness and lifespan**
+  - A given `cluster.clusterset.k8s.io` value must be unique *within a ClusterSet* at any point in time,
+    but may be reused later (for example after a cluster is deleted and re‑created).
+  - A cluster may move between ClusterSets, but its ClusterID must remain stable while it is a member of any given set.
+- **Consumers**
+  - may rely on the ClusterID being stable for the lifetime of ClusterSet membership,
+  - may use it as the “cluster coordinate” when enriching logs, metrics, or DNS.
+
+`multicluster-runtime` **does not create or manage ClusterProperty objects itself**, but many environments that host
+multi‑cluster controllers already deploy this CRD, especially when using the Multi‑Cluster Services (MCS) API.
+
+---
+
+### Cluster inventories and ClusterProfile (KEP‑4322)
+
+KEP‑4322 (“ClusterProfile API”) defines a **Cluster inventory** API: a portable way to describe a fleet of clusters on a
+hub cluster, independently of how those clusters are provisioned.
+
+The key ideas are:
+
+- each **member cluster** is represented by a `ClusterProfile` object on the hub,
+- `status` on that object summarises:
+  - **version** (Kubernetes version and related info),
+  - **properties** – name/value pairs that often include:
+    - `cluster.clusterset.k8s.io` (ClusterID, from KEP‑2149),
+    - `clusterset.k8s.io` (ClusterSet identity),
+  - **conditions** – such as `ControlPlaneHealthy`, `Joined`,
+  - **credentialProviders** – how to obtain credentials (see KEP‑5339).
+
+The **Cluster Inventory API Provider** in `multicluster-runtime` uses `ClusterProfile` as its source of truth:
+
+- it watches `ClusterProfile` objects,
+- decides which ones are “ready” (by default via `ControlPlaneHealthy`),
+- obtains credentials via:
+  - **credential plugins** (KEP‑5339), or
+  - labelled Secrets containing kubeconfigs,
+- builds and starts a `cluster.Cluster` for each profile,
+- engages each cluster under a `ClusterName` equal to `<namespace>/<name>` of the `ClusterProfile`.
+
+For controllers using this provider:
+
+- `ClusterName` is a **stable, opaque key** like `prod-hub/eu-cluster-1`,
+- `ClusterProfile.Status.Properties` exposes the **ClusterID** and **ClusterSet** identity in a standard way,
+- you can log or label by both (for example `clusterName` and `cluster.clusterset.k8s.io`) depending on your needs.
+
+---
+
+### Where `multicluster-runtime` gets its cluster names
+
+Within `multicluster-runtime`, a **`ClusterName`** is simply a string that identifies a `cluster.Cluster` instance.
+Providers are responsible for choosing and documenting the naming scheme they use.
+
+Some common patterns across built‑in providers:
+
+- **Local (host) cluster**
+  - The **empty string** `""` is reserved as the name of the host cluster (`LocalCluster` in the Manager API).
+  - When you run in “single‑cluster mode” (no Provider), this is the only cluster name.
+
+- **Kind Provider (`providers/kind`)**
+  - `ClusterName` is literally the **Kind cluster name** (`kind create cluster --name=<name>`),
+  - optionally filtered via `kind.Options.Prefix`.
+  - Example: `"fleet-alpha"`, `"dev-b"`.
+
+- **File Provider (`providers/file`)**
+  - Discovers kubeconfig files from a list of paths and directories.
+  - For each **file + context** combination, it creates a cluster whose name is:
+    - `<absolute-file-path><Separator><context-name>`,  
+      e.g. `"/clusters/prod/kubeconfig.yaml+eu-1"`.
+  - The separator defaults to `"+"` but can be customised via `Options.Separator`.
+
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+  - Watches Secrets in a namespace, filtered by a label such as
+    `sigs.k8s.io/multicluster-runtime-kubeconfig: "true"`.
+  - Each Secret containing a kubeconfig becomes a cluster, with:
+    - `ClusterName = <secret-name>`.
+  - You configure which namespace to watch via `Options.Namespace`.
+
+- **Cluster API Provider (`providers/cluster-api`)**
+  - Watches CAPI `Cluster` objects.
+  - For each provisioned `Cluster`, it:
+    - reads the admin kubeconfig Secret,
+    - creates a `cluster.Cluster`,
+    - exposes it under `ClusterName = "<namespace>/<name>"` (e.g. `"capi-system/workload-eu-1"`).
+
+- **Cluster Inventory API Provider (`providers/cluster-inventory-api`)**
+  - Watches `ClusterProfile` objects.
+  - For each ready profile, it:
+    - obtains a `rest.Config` via a kubeconfig strategy,
+    - creates a `cluster.Cluster`,
+    - exposes it under `ClusterName = "<namespace>/<name>"` of the `ClusterProfile`
+      (e.g. `"default/member"`).
+
+- **Namespace Provider (`providers/namespace`)**
+  - Treats each Namespace in a cluster as a **virtual cluster**.
+  - For each `Namespace`, it engages a `NamespacedCluster` under:
+    - `ClusterName = <namespace-name>` (e.g. `"team-a"`, `"sandbox-1"`).
+
+- **Single Provider (`providers/single`)**
+  - Wraps a pre‑constructed `cluster.Cluster` under a fixed name.
+  - `ClusterName` is whatever string you pass to `single.New(name, cluster)`.
+
+- **Clusters Provider (`providers/clusters`)**
+  - Exposes pre‑constructed `cluster.Cluster` instances using arbitrary names set by your code.
+  - Primarily a demonstration of how to build Providers on top of `pkg/clusters.Clusters`.
+
+- **Multi Provider (`providers/multi`)**
+  - Composes multiple Providers behind one interface.
+  - Each Provider is registered under a **provider name** like `"kind"` or `"capi"`.
+  - The outer `ClusterName` becomes:
+    - `"<providerName><Separator><innerClusterName>"`,  
+      e.g. `"kind#dev-a"`, `"capi#capi-system/workload-eu-1"`.
+  - The separator defaults to `"#"` and is configurable.
+
+- **Nop Provider (`providers/nop`)**
+  - Always returns `ErrClusterNotFound`; useful when you want to keep code multi‑cluster‑ready without actually managing a fleet.
+
+Across all of these:
+
+- **uniqueness is guaranteed per Provider instance**, not globally,
+- `ClusterName` is intentionally **opaque** to controllers—only Providers should know how they are structured.
+
+---
+
+### Mapping `ClusterName` to ClusterID and ClusterSet
+
+Given this variety of naming schemes, how should you relate `ClusterName` to the **ClusterID** and **ClusterSet**
+concepts from KEP‑2149 and KEP‑4322?
+
+Some practical guidelines:
+
+- **Treat `ClusterName` as an internal routing key**
+  - Its only hard requirement is:
+    - unique within the fleet exposed by your Provider (or `providers/multi` after prefixing),
+    - stable for as long as you want to treat a cluster as “the same” in your controller.
+  - It is fine if `ClusterName` encodes implementation details such as namespace, file path, or provider prefix.
+
+- **Treat `cluster.clusterset.k8s.io` as the canonical ClusterID**
+  - This property is designed for cross‑system identity (MCS DNS, logs, external tools).
+  - In many fleets, it is a UUID or long‑lived human‑readable ID.
+  - `ClusterName` may or may not equal this value; often it is more convenient for it not to.
+
+- **For Cluster Inventory API Provider**
+  - `ClusterName` is `<namespace>/<name>` of the `ClusterProfile`.
+  - The corresponding `ClusterID` and `ClusterSet` (if any) live in:
+    - `ClusterProfile.Status.Properties` entries named:
+      - `cluster.clusterset.k8s.io`,
+      - `clusterset.k8s.io`.
+  - Controllers can:
+    - use `req.ClusterName` to route to the correct `cluster.Cluster`,
+    - use the `ClusterProfile` (looked up by `<namespace>/<name>`) to attach or log the canonical ClusterID.
+
+- **For other Providers**
+  - CAPI, Kind, File, Kubeconfig, Namespace providers do not interpret `ClusterProperty` by themselves.
+  - You are free to:
+    - configure your provisioning or bootstrap process so that each **member cluster** has a
+      `ClusterProperty` with a stable ClusterID,
+    - use that ID inside the cluster (for DNS, logging, or membership),
+    - optionally mirror it into an inventory (for example via `ClusterProfile.Status.Properties`).
+
+- **In controllers**
+  - Store and log **both** identities when possible:
+    - `clusterName` – the key you pass to `GetCluster`,
+    - `clusterId` – from `ClusterProperty` or `ClusterProfile.Status.Properties`.
+  - Treat `clusterName` as your **operational handle** and `clusterId` as the **durable coordinate**
+    that other systems can also understand.
+
+This separation gives you flexibility: you can freely refactor how you discover clusters and how controllers are wired,
+as long as the mapping from `clusterName` to `clusterId` remains stable and documented.
+
+---
+
+### Choosing a naming scheme for custom Providers
+
+When you build your own `multicluster.Provider`, one of the early design decisions is **how to assign `ClusterName`s**.
+
+Recommended properties:
+
+- **Unique within the fleet**
+  - No two clusters managed by the same Provider (or `providers/multi` prefix) should share a `ClusterName` at the same time.
+  - This includes “virtual clusters” like Namespaces when using the Namespace Provider pattern.
+
+- **Stable over time**
+  - A physical or logical cluster should keep the same `ClusterName` for as long as it is “the same cluster” in your
+    domain model.
+  - Avoid tying `ClusterName` directly to ephemeral properties such as:
+    - IP addresses,
+    - rollout numbers,
+       - or short‑lived environment names.
+
+- **Mappable to ClusterID**
+  - Ideally, there is a simple mapping between `ClusterName` and the external ClusterID:
+    - sometimes they are the same string,
+    - often `ClusterName` is `<inventory-scope>/<cluster-id>`,
+    - or `<provider-prefix>#<cluster-id>`.
+
+Some example schemes:
+
+- **Inventory‑centric**
+  - Use `ClusterProfile` (or similar inventory) as the primary key:
+    - `ClusterName = "<namespace>/<name>"`,
+    - `ClusterID = cluster.clusterset.k8s.io` in `status.properties`.
+  - This is the pattern used by the Cluster Inventory API Provider.
+
+- **ClusterID‑centric**
+  - Use the ClusterID directly:
+    - `ClusterName = <cluster.clusterset.k8s.io>`,
+    - store ClusterSet membership separately (for example in `clusterset.k8s.io`).
+  - This can work well with static fleets or when your controller already depends on MCS DNS.
+
+- **Composed / multi‑source fleets**
+  - With the Multi Provider:
+    - `ClusterName = "<provider>#<inner-name>"`,
+    - where `inner-name` follows one of the patterns above.
+  - Example:
+    - `kind#dev-1`, `capi#capi-system/workload-us-1`, `inventory#prod-hub/cluster-eu`.
+
+The **Core Concepts — Providers** chapter already contains a high‑level checklist for choosing a naming scheme; this
+section complements it with a stronger emphasis on ClusterID and ClusterSet alignment.
+
+---
+
+### Using cluster identity inside your controllers
+
+Controllers typically need cluster identity for three main purposes:
+
+1. **Routing** – which `cluster.Cluster` should this reconcile act on?
+2. **Observability** – how do we tag logs, metrics, and events so we can attribute behaviour to the right cluster?
+3. **Business logic** – how do we join or filter data across clusters or ClusterSets?
+
+Some patterns:
+
+- **Always log with `ClusterName`**
+  - Include `req.ClusterName` as a structured log field:
+    - `log := log.WithValues("cluster", req.ClusterName)`.
+  - This makes it trivial to search logs for a specific cluster, no matter which Provider you use.
+
+- **Optionally log with ClusterID**
+  - When using ClusterProfile or ClusterProperty, fetch the ClusterID once per reconcile (or per work unit) and
+    add it as a separate field:
+    - `log = log.WithValues("clusterId", "<cluster.clusterset.k8s.io>")`.
+  - This allows correlation with systems that only know about ClusterIDs (for example, MCS DNS or external monitoring).
+
+- **Avoid parsing `ClusterName` in business logic**
+  - Instead of `strings.Split(req.ClusterName, "#")`, rely on:
+    - inventory APIs (e.g. `ClusterProfile`),
+    - Provider documentation,
+    - or helper functions in your own code that centralise the mapping.
+  - This keeps reconcilers portable across Providers and compositions.
+
+- **Use inventory APIs for fleet‑wide decisions**
+  - When deciding “which clusters should receive this workload?” or “which ClusterSet does this belong to?”:
+    - read from the hub‑side inventory (e.g. `ClusterProfile.Status.Properties`),
+    - use `cluster.clusterset.k8s.io` / `clusterset.k8s.io` and other properties
+      (location, version, labels) to filter and group,
+    - then feed the resulting `ClusterName`s into `mgr.GetCluster`.
+
+By separating **routing** (via `ClusterName`) from **semantics** (via ClusterID and properties), you keep your
+controllers adaptable even as fleet and inventory implementations change.
+
+---
+
+### Common pitfalls and migration notes
+
+Some issues to watch out for when evolving cluster identity:
+
+- **Reusing `ClusterName` for different physical clusters**
+  - If a new cluster is brought up under the same `ClusterName` while old data is still around
+    (for example metrics, CRDs in a hub, or external caches), you may accidentally attribute old
+    state to the new cluster.
+  - Prefer to treat `ClusterName` as stable for the lifetime of a “logical cluster”, and only recycle
+    it when you are sure all associated state has been cleaned up.
+
+- **Hard‑coding provider assumptions**
+  - Logic like “if `ClusterName` starts with `kind-` then …” makes it difficult to switch Providers,
+    or to combine them via the Multi Provider.
+  - Instead, model such differences explicitly (for example, via labels on `ClusterProfile` or a
+    small configuration file that maps cluster groups).
+
+- **Ignoring ClusterSet membership**
+  - For workloads that rely on Multi‑Cluster Services or namespace sameness, it is important to know
+    which clusters share a ClusterSet.
+  - Use `clusterset.k8s.io` (from ClusterProperty or ClusterProfile) to avoid accidentally stretching
+    an operation across unrelated sets.
+
+- **Tightly coupling to one inventory**
+  - If you plan to move from CAPI‑centric fleets to ClusterProfile, or vice versa, keep `ClusterName`
+    and ClusterID mappings in a small, focused layer instead of spreading assumptions across
+    reconcilers.
+
+When migrating an existing code base:
+
+- start by treating `ClusterName` as an opaque string and centralising any mappings to inventory
+  resources in a helper package,
+- gradually introduce ClusterProperty / ClusterProfile lookups to enrich logs and metrics with
+  canonical ClusterIDs,
+- only once those foundations are in place consider refactoring naming schemes or Providers.
+
+---
+
+### Summary
+
+Cluster identification in `multicluster-runtime` is a collaboration between:
+
+- **Providers**, which choose stable, unique `ClusterName`s for routing and lifecycle,
+- **SIG‑Multicluster standards** (KEP‑2149, KEP‑4322, KEP‑5339), which define ClusterIDs, ClusterSets, inventories, and
+  credential plugins,
+- and **your controllers**, which combine these to implement reliable, portable multi‑cluster logic.
+
+By keeping `ClusterName` as an opaque routing key, aligning your fleets with `ClusterProperty` / `ClusterProfile`
+where appropriate, and clearly documenting the mapping between the two, you can build controllers that remain robust as
+your cluster inventory, provisioning, and networking layers evolve over time.
+

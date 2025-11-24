@@ -1,0 +1,240 @@
+---
+title: Installation
+---
+
+This chapter explains how to add `multicluster-runtime` to a Go project and prepare it to build multi-cluster controllers.  
+You should already meet the requirements in **Prerequisites** before following the steps below.
+
+---
+
+### Step 1. Create or select a Go module
+
+- **New project**  
+  If you are starting from scratch, create a new module:
+
+```bash
+mkdir my-multicluster-controller
+cd my-multicluster-controller
+go mod init example.com/my-multicluster-controller
+```
+
+- **Existing controller-runtime project**  
+  If you already have a controller built with `sigs.k8s.io/controller-runtime`, you can keep your existing module and migrate it gradually; the next steps focus on adding dependencies and wiring a multi-cluster manager.
+
+---
+
+### Step 2. Add multicluster-runtime and controller-runtime
+
+Add `multicluster-runtime` and a compatible `controller-runtime` to your `go.mod`:
+
+```bash
+go get sigs.k8s.io/multicluster-runtime@v0.22.0-beta.0
+go get sigs.k8s.io/controller-runtime@v0.22.0
+```
+
+At the time of writing, the upstream project itself is built against:
+
+- `sigs.k8s.io/controller-runtime v0.22.0`
+- `k8s.io/client-go v0.34.0`
+
+Using these versions (or carefully tested compatible ones) helps avoid type mismatches between `controller-runtime` and `multicluster-runtime`.  
+You can inspect the upstream `go.mod` or pkg.go.dev to confirm the latest supported versions and update the commands above accordingly.
+
+---
+
+### Step 3. Choose and add a Provider module
+
+`multicluster-runtime` discovers and manages clusters via **Providers**.  
+Each built-in provider lives in its own Go module, so you add it explicitly to your project:
+
+- **Kind Provider** (local development with Kind clusters)
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kind@v0.22.0-beta.0
+```
+
+- **Kubeconfig Provider** (kubeconfig-bearing Secrets in a management cluster)
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/kubeconfig@v0.22.0-beta.0
+```
+
+- **File Provider** (kubeconfig files on disk)
+
+```bash
+go get sigs.k8s.io/multicluster-runtime/providers/file@v0.22.0-beta.0
+```
+
+The examples in the upstream repository currently use version `v0.22.0-beta.0` for the core library and all provider modules.  
+In your own project, you will typically:
+
+- Pin **one** `multicluster-runtime` version for the core module, and
+- Use the **same** version for provider modules (for example, `@v0.22.0-beta.0` everywhere).
+
+Other built-in providers (such as **Cluster API**, **Cluster Inventory API**, **Namespace**, or **Multi** providers) are added in the same way; see the Providers Reference for details.
+
+> **Tip**: Check the latest tags on pkg.go.dev or GitHub and update the version numbers here if newer releases are available.
+
+---
+
+### Step 4. Wire a Multi-Cluster Manager
+
+To enable multi-cluster behaviour, you replace the standard `manager.New` with `mcmanager.New` and pass a Provider.
+
+- **Imports (typical)**
+
+```go
+import (
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+```
+
+- **Single-cluster manager (before)**
+
+```go
+mgr, err := manager.New(ctrl.GetConfigOrDie(), manager.Options{})
+if err != nil {
+    // handle error
+}
+```
+
+- **Multi-cluster manager with Provider (after)**
+
+```go
+provider := kind.New() // or another provider with its Options
+
+mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, mcmanager.Options{})
+if err != nil {
+    // handle error
+}
+```
+
+From this point on, `mgr` is a **Multi-Cluster Manager**:
+
+- It still behaves like a normal `controller-runtime` manager for the host cluster.
+- It can discover additional member clusters through the Provider.
+- You can obtain per-cluster clients via `mgr.GetCluster(ctx, clusterName)` in reconcilers.
+
+For providers that implement `multicluster.ProviderRunnable` (such as the **Kind** and **File** providers), calling `mgr.Start(...)` is enough to start both the manager and the provider.  
+Some providers (such as **Kubeconfig** or **Cluster Inventory API**) also expose a `SetupWithManager` helper that you call before starting the manager so they can watch Secrets or `ClusterProfile` objects and engage clusters dynamically.
+
+The Quickstart chapter will build a complete `main.go` using the Kind provider.
+
+---
+
+### Step 5. Register a multi-cluster controller
+
+Controllers are registered with the multi-cluster builder `mcbuilder`.  
+The main differences from single-cluster code are:
+
+- You use `mcbuilder.ControllerManagedBy(mgr)` instead of the controller-runtime builder.
+- Your reconciler receives `mcreconcile.Request`, which contains both a `ClusterName` and an inner `reconcile.Request`.
+
+Example: a controller that logs `ConfigMap` names across all discovered clusters:
+
+```go
+err = mcbuilder.ControllerManagedBy(mgr).
+    Named("multicluster-configmaps").
+    For(&corev1.ConfigMap{}).
+    Complete(mcreconcile.Func(
+        func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+            // Resolve the target cluster
+            cl, err := mgr.GetCluster(ctx, req.ClusterName)
+            if err != nil {
+                return reconcile.Result{}, err
+            }
+
+            cm := &corev1.ConfigMap{}
+            if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                if apierrors.IsNotFound(err) {
+                    return ctrl.Result{}, nil
+                }
+                return ctrl.Result{}, err
+            }
+
+            // Your business logic here
+            return ctrl.Result{}, nil
+        },
+    ))
+if err != nil {
+    // handle error
+}
+```
+
+Once your controllers are registered, you start the manager as usual:
+
+```go
+if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+    // handle error
+}
+```
+
+The Provider will ensure that new clusters are engaged over time and that your controller receives `mcreconcile.Request`s for each member cluster.
+
+---
+
+### Step 6. Running locally
+
+How you run your manager depends on the Provider:
+
+- **Kind Provider**
+  - Create one or more Kind clusters (for example, `kind create cluster --name fleet-alpha`).
+  - Ensure they are reachable from your development environment.
+  - Run your controller with:
+
+    ```bash
+    go run ./...
+    ```
+
+- **File Provider**
+  - Ensure the kubeconfig files or directories you referenced exist and contain valid contexts.
+
+- **Kubeconfig Provider**
+  - Prepare kubeconfig-bearing Secrets in the management cluster, for example using the helper script in the upstream repo (`examples/kubeconfig/scripts/create-kubeconfig-secret.sh`).
+
+The **Quickstart** chapter will walk through a complete local setup using the Kind provider, including creating a small fleet and observing reconciles.
+
+---
+
+### Migrating an existing controller-runtime project (summary)
+
+For an existing single-cluster controller built with `controller-runtime`, the minimal migration to `multicluster-runtime` typically looks like:
+
+- **Imports**
+  - Replace selected `controller-runtime` imports with their multi-cluster equivalents:
+    - `sigs.k8s.io/multicluster-runtime/pkg/builder` as `mcbuilder`
+    - `sigs.k8s.io/multicluster-runtime/pkg/manager` as `mcmanager`
+    - `sigs.k8s.io/multicluster-runtime/pkg/reconcile` as `mcreconcile`
+  - Import one or more Providers from `sigs.k8s.io/multicluster-runtime/providers/...`.
+
+- **Manager creation**
+  - Replace `manager.New` with `mcmanager.New` and pass a Provider.
+
+- **Reconcile signature**
+  - Change `func(ctx context.Context, req reconcile.Request)` to `func(ctx context.Context, req mcreconcile.Request)`.
+  - Use `req.ClusterName` and `req.Request.NamespacedName` when resolving targets.
+  - Retrieve the correct per-cluster client with `mgr.GetCluster(ctx, req.ClusterName)`.
+
+These changes preserve most of your existing business logic while enabling it to run across a fleet of clusters.
+
+---
+
+### Next steps
+
+After installing `multicluster-runtime` and wiring a Multi-Cluster Manager:
+
+- Continue to **Quickstart** for a step-by-step walkthrough using the Kind provider:
+  - [02-getting-started--quickstart.md](02-getting-started--quickstart)
+- Then dive deeper into:
+  - The Multi-Cluster Manager: [03-core-concepts--the-multi-cluster-manager.md](03-core-concepts--the-multi-cluster-manager)
+  - Providers: [03-core-concepts--providers.md](03-core-concepts--providers)
+  - Provider-specific reference chapters under **Providers Reference**.
+
+

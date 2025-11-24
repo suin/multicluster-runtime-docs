@@ -1,0 +1,61 @@
+---
+title: multicluster-runtime Documentation
+---
+
+## Table of Contents
+
+### 1. Introduction
+- [**Overview**](docs/01-introduction--overview): What is multicluster-runtime?
+- [**Architecture**](docs/01-introduction--architecture): Understanding the "One Pod, Many Clusters" model.
+- [**Why multicluster-runtime?**](docs/01-introduction--why-multicluster-runtime): Comparison with single-cluster controllers and other multi-cluster solutions.
+- [**Key Concepts**](docs/01-introduction--key-concepts): Manager, Providers, Clusters, and Reconcilers.
+
+### 2. Getting Started
+- [**Prerequisites**](docs/02-getting-started--prerequisites): Go version, Kubernetes environment.
+- [**Installation**](docs/02-getting-started--installation): Adding the dependency to your project.
+- [**Quickstart**](docs/02-getting-started--quickstart): Building your first multi-cluster controller with the `kind` provider.
+    - Setting up the Manager.
+    - Writing a simple Reconciler.
+    - Running against a local Kind cluster fleet.
+
+### 3. Core Concepts
+- [**The Multi-Cluster Manager**](docs/03-core-concepts--the-multi-cluster-manager): 
+    - Differences from `controller-runtime` Manager.
+    - Initializing with a Provider.
+- [**Providers**](docs/03-core-concepts--providers): 
+    - The `Provider` interface.
+    - How providers discover and engage clusters.
+- [**The Cluster Object**](docs/03-core-concepts--the-cluster-object):
+    - Accessing Clients, Caches, and Event Recorders for specific clusters.
+- [**The Reconcile Loop**](docs/03-core-concepts--the-reconcile-loop):
+    - Handling `mcreconcile.Request`.
+    - Context and ClusterName.
+
+### 4. Controller Patterns
+- [**Uniform Reconcilers**](docs/04-controller-patterns--uniform-reconcilers): 
+    - Running the same logic across all clusters.
+    - Use cases: Compliance checks, standardizing resources.
+- [**Multi-Cluster Aware Reconcilers**](docs/04-controller-patterns--multi-cluster-aware-reconcilers): 
+    - Centralized logic managing resources in remote clusters.
+    - Use cases: Federated deployments, data aggregation.
+- [**Using the Builder**](docs/04-controller-patterns--using-the-builder): `mcbuilder` for configuring controllers.
+
+### 5. Providers Reference
+- [**Kind Provider**](docs/05-providers-reference--kind-provider): For local development and testing.
+- [**Kubeconfig Provider**](docs/05-providers-reference--kubeconfig-provider): For static or filesystem-based cluster lists.
+- [**Cluster API Provider**](docs/05-providers-reference--cluster-api-provider): Dynamic discovery via CAPI `Clusters`.
+- [**Cluster Inventory API Provider**](docs/05-providers-reference--cluster-inventory-api-provider): Using `ClusterProfile` (KEP-4322) for inventory management.
+- [**File Provider**](docs/05-providers-reference--file-provider): Simple file-based discovery.
+- [**Custom Providers**](docs/05-providers-reference--custom-providers): Implementing your own provider.
+
+### 6. Advanced Topics
+- [**Event Handling**](docs/06-advanced-topics--event-handling): 
+    - `EnqueueRequestForObject` in a multi-cluster context.
+    - Cross-cluster watches and mapping.
+- [**Authentication**](docs/06-advanced-topics--authentication): How credentials and identities are handled (KEP-5339).
+- [**Cluster Identification**](docs/06-advanced-topics--cluster-identification): Understanding ClusterIDs and ClusterSets (KEP-2149).
+- [**Testing**](docs/06-advanced-topics--testing): Writing unit and integration tests for multi-cluster logic.
+
+### 7. Contributing
+- [**Development Guide**](docs/07-contributing--development-guide): Setting up the dev environment.
+- [**Provider Ecosystem**](docs/07-contributing--provider-ecosystem): How to contribute new providers.

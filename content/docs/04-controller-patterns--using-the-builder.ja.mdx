@@ -1,0 +1,501 @@
+---
+title: Builder の活用
+---
+
+この章では、マルチクラスター対応コントローラーのための **Builder (`mcbuilder`)**
+を使って、Reconciler を `multicluster-runtime` の Manager に配線する方法を解説します。  
+controller-runtime の `builder.ControllerManagedBy` に慣れている場合、
+`mcbuilder` はその **マルチクラスター対応版** です。
+何を監視するか・どのクラスターを対象にするか・どのようなコントローラーを構築するかを、
+ひとつのチェーンで記述できます。
+
+この章では次のトピックを扱います。
+
+- `mcbuilder` が何をしているのか、controller-runtime の Builder との関係
+- `ControllerManagedBy` / `Complete` を使ったコントローラー登録
+- **EngageOptions** による「どのクラスターを監視するか」の制御
+- **ClusterNotFoundWrapper** によるエラーハンドリングの改善
+- `WithOptions` / `WithLogConstructor` / メタデータのみの Watch などの高度なオプション
+
+---
+
+### マルチクラスター Builder が担う役割
+
+`pkg/builder` は、他の `multicluster-runtime` ライブラリの上に載った薄いラッパーです。
+
+- **マルチクラスター Manager** (`mcmanager.Manager`) を受け取り、
+  単一クラスター用の `manager.Manager` の代わりに使います。
+- Reconciler には **クラスター情報を含むリクエスト**
+  （通常は `mcreconcile.Request`）を渡します。
+- `For` / `Owns` / `Watches` で指定された対象を、
+  **マルチクラスター対応の Source と Handler** に接続します。
+  - 内部的には `mcsource.Kind` を用いて、エンゲージされた各クラスターの
+    Kubernetes オブジェクトを監視します。
+  - `pkg/handler` のハンドラーを用いて、
+    各 Work Item に正しい `ClusterName` を付与します。
+- Reconciler を **`ClusterNotFoundWrapper`** などのヘルパーでラップし、
+  フリートの変化に対して安全になるようにします。
+
+イメージとしては、**controller-runtime の Builder をマルチクラスター対応にしたもの**
+と考えるとよいでしょう。
+
+- API は controller-runtime の Builder と非常に近い形を保ちつつ、
+- 実装は **エンゲージされたすべてのクラスター** に対して Watch を張り、
+- そこからのイベントを `mcreconcile.Request` の Workqueue に集約します。
+
+すでに controller-runtime の Builder に慣れていれば、
+`mcbuilder` の大部分は同じ感覚で使うことができます。
+この章では、その中でも **マルチクラスター固有の設定ポイント** に焦点を当てます。
+
+---
+
+### controller-runtime の Builder から `mcbuilder` への移行
+
+多くのプロジェクトは、まず単一クラスター向けの `main.go` を持っています。
+典型的には次のような形です。
+
+```go
+// シングルクラスター (controller-runtime)
+mgr, err := manager.New(ctrl.GetConfigOrDie(), manager.Options{})
+if err != nil {
+    // ...
+}
+
+if err := builder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    Complete(reconciler); err != nil {
+    // ...
+}
+```
+
+マルチクラスター版における全体的な構造はほぼ同じで、
+いくつかの import と型が変わるだけです。
+
+```go
+import (
+    "context"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+    "sigs.k8s.io/controller-runtime/pkg/manager/signals"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+    mcbuilder  "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager  "sigs.k8s.io/multicluster-runtime/pkg/manager"
+    mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+    "sigs.k8s.io/multicluster-runtime/providers/kind" // file/kubeconfig/cluster-api/... など
+)
+
+func main() {
+    ctx := signals.SetupSignalHandler()
+
+    // 1. Provider を選択・構築する。
+    provider := kind.New()
+
+    // 2. マルチクラスター Manager を作成する。
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, manager.Options{})
+    if err != nil {
+        // ...
+    }
+
+    // 3. mcbuilder を使ってマルチクラスターコントローラーを登録する。
+    if err := mcbuilder.ControllerManagedBy(mgr).
+        Named("multicluster-configmaps").
+        For(&corev1.ConfigMap{}).
+        Complete(mcreconcile.Func(
+            func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+                // req.ClusterName に基づいて適切なクラスターへルーティングする。
+                cl, err := mgr.GetCluster(ctx, req.ClusterName)
+                if err != nil {
+                    return reconcile.Result{}, err
+                }
+
+                cm := &corev1.ConfigMap{}
+                if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, cm); err != nil {
+                    if apierrors.IsNotFound(err) {
+                        // 既に削除済みなら何もしない。
+                        return reconcile.Result{}, nil
+                    }
+                    return reconcile.Result{}, err
+                }
+
+                // ビジネスロジックをここに記述する。
+                return ctrl.Result{}, nil
+            },
+        )); err != nil {
+        // ...
+    }
+
+    if err := mgr.Start(ctx); err != nil {
+        // ...
+    }
+}
+```
+
+主な違いは次の通りです。
+
+- Manager は `mcmanager.New` から生成し、**Provider** を渡します。
+- Reconciler には `mcreconcile.Request` が渡され、その中に:
+  - `ClusterName`（どのクラスターを対象にするか）
+  - `Request`（そのクラスター内での `reconcile.Request`）
+  が含まれます。
+- コントローラーの登録には upstream の Builder の代わりに
+  `mcbuilder.ControllerManagedBy(mgr)` を使います。
+
+より機械的な移行手順については、**Uniform Reconciler** の章で詳しく説明しています。  
+ここでは、特に **Builder 固有の設定** に絞って解説します。
+
+---
+
+### `ControllerManagedBy` によるコントローラー定義
+
+エントリーポイントは次の通りです。
+
+```go
+mcbuilder.ControllerManagedBy(mgr) // *builder.Builder を返す
+```
+
+あとは controller-runtime と同じようにメソッドチェーンで設定していきます。
+
+- **`Named(string)`**
+  - コントローラー名を明示的に指定します（ログやメトリクスに使用）。
+  - Manager 内で一意である必要があります。
+- **`For(object, ...ForOption)`**
+  - このコントローラーが Reconcile する **プライマリリソース** を宣言します。
+  - その型に対するデフォルトの Watch / Handler を設定します。
+- **`Owns(object, ...OwnsOption)`**
+  - プライマリリソースに所有される **セカンダリリソース** を宣言します。
+  - 内部的にはマルチクラスター対応の `EnqueueRequestForOwner` を使います。
+- **`Watches(object, handler, ...WatchesOption)`**
+  - 追加の Watch 関係を宣言し、明示的なハンドラーを指定します。
+  - マッピング関数やクロスリソースの関連付けに便利です。
+- **`Complete(reconciler)`**
+  - コントローラーを構築し、Manager に登録します。
+
+例えば、次のようなコントローラーを考えます。
+
+- `FleetConfig` CRD をプライマリとして Reconcile する
+- 各クラスターごとの `ClusterConfig` CRD を所有リソースとして扱う
+- `ClusterConfig` と同じクラスターの `ConfigMap` 変更をトリガーにしたい
+
+この場合の Builder チェーンは次のようになります。
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-config").
+    For(&fleetv1alpha1.FleetConfig{}).
+    Owns(&fleetv1alpha1.ClusterConfig{}).
+    Watches(
+        &corev1.ConfigMap{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[
+            *corev1.ConfigMap,
+            mcreconcile.Request,
+        ](mapConfigMapToClusterConfig),
+    ).
+    Complete(reconciler)
+```
+
+Builder は内部で次のような処理を行います。
+
+- 各 `For` / `Owns` / `Watches` に対して、適切な **マルチクラスター Source** を生成する
+- クラスター情報付きの `mcreconcile.Request` を生成するハンドラーを接続する
+- それらを **クラスター認識型コントローラー** として登録し、
+  新しいクラスターがエンゲージされるたびに自動的に Watch を張る
+
+一般的な `For` / `Owns` / `Watches` パターンだけを使う限り、
+ユーザーコード側で `pkg/source` や `pkg/handler` を直接触る必要はありません。
+より詳しい配線の仕組みは、**Advanced Topics — Event Handling** で解説しています。
+
+---
+
+### EngageOptions で「どのクラスターを見るか」を制御する
+
+マルチクラスター環境では、**何を監視するか** だけでなく、
+**どのクラスターを監視するか** も重要です。
+
+- コントローラーが動いている **ホスト（ローカル）クラスター** のみを見るのか
+- Provider が管理する **メンバークラスター群** のみを見るのか
+- その **両方** を組み合わせるのか
+
+`pkg/builder/multicluster_options.go` の `EngageOptions` は、
+各 `For` / `Owns` / `Watches` ごとにこれを制御します。
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - `true` の場合、コントローラーは **ホストクラスター**
+    （クラスター名 `""`）に対しても Source を接続します。
+  - デフォルト値は:
+    - Provider が **ない** 場合: `true`（シングルクラスター互換モード）
+    - Provider が **ある** 場合: `false`
+- **`WithEngageWithProviderClusters(bool)`**
+  - `true` の場合、Provider が管理する **すべてのクラスター** に対して
+    Source を接続します。
+  - Provider がない場合は効果がありません。
+  - デフォルト値は:
+    - Provider がある場合: `true`
+    - Provider がない場合: `false`
+
+これらは必要に応じて `For` / `Owns` / `Watches` のオプションとして指定します。
+
+#### ホストクラスター専用コントローラー
+
+管理クラスター上の CRD だけを扱い、メンバークラスターには触れないような
+コントローラーは次のように記述できます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("host-only-controller").
+    For(
+        &platformv1alpha1.PlatformConfig{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    Complete(reconciler)
+```
+
+たとえ Provider がメンバークラスターを管理していても、
+このコントローラーはそれらからのイベントを一切受け取りません。
+
+#### フリート全体を対象にしたコントローラー
+
+ホストクラスターを無視し、Provider 管理下のクラスターだけを対象にする
+**フリート全体向け** コントローラーは次のように書けます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-configmaps").
+    For(
+        &corev1.ConfigMap{},
+        mcbuilder.WithEngageWithLocalCluster(false),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(reconciler)
+```
+
+これは、「ホストクラスターはあくまでコントロールプレーンであり、
+実際のリソース調整はメンバークラスターでのみ行う」という構成に
+よく用いられるパターンです。
+
+#### ハイブリッドなコントローラー
+
+ホストクラスターとフリートを **同じコントローラーの中で組み合わせる**
+こともできます。例えば次のような、ハブ駆動のファンアウトコントローラーを考えます。
+
+- `FleetDeployment` CRD はホストクラスターだけで監視したい
+- 同時に、メンバークラスター上の `Deployment` の変化も監視したい
+
+この場合の Builder チェーンは次のようになります。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-deployer").
+    For(
+        &appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+        mcbuilder.WithEngageWithProviderClusters(false),
+    ).
+    Watches(
+        &appsv1.Deployment{},
+        mchandler.TypedEnqueueRequestsFromMapFunc[
+            *appsv1.Deployment,
+            mcreconcile.Request,
+        ](mapDeploymentToFleetDeployment),
+        mcbuilder.WithEngageWithProviderClusters(true),
+        mcbuilder.WithEngageWithLocalCluster(false),
+    ).
+    Complete(reconciler)
+```
+
+ここで:
+
+- **プライマリの CRD**（`FleetDeployment`）はホストクラスターのみに存在し、
+- 一方で、このコントローラーはすべてのメンバークラスター上の
+  `Deployment` イベントも受け取ります。
+
+`EngageOptions` は `For` / `Owns` / `Watches` ごとに保持されるため、
+各 Watch が「どのクラスターに対して張られるか」を細かく制御できます。
+
+---
+
+### `ClusterNotFoundWrapper` によるエラーハンドリング
+
+動的なフリートでは、イベントがキューに積まれてから実際に Reconcile が
+呼び出されるまでの間に、対象クラスターが削除されてしまうことがあります。  
+その場合、次のようなコードは `multicluster.ErrClusterNotFound` を返すことがあります。
+
+```go
+cl, err := mgr.GetCluster(ctx, req.ClusterName)
+```
+
+すでに存在しないクラスターに対して Work Item を無限にリトライし続けるのは
+無駄であり、ログノイズにもなります。
+
+これをデフォルトで安全に扱うため、`mcbuilder` は Reconciler を
+**ClusterNotFoundWrapper** でラップします（明示的にオフにしない限り有効）。
+
+- Reconciler が `errors.Is(err, multicluster.ErrClusterNotFound)` が
+  `true` となるエラーを返した場合、
+- ラッパーはその Reconcile を **成功扱い** とし、**再キューしません**。
+- それ以外の `Result` や `error` はそのまま呼び出し元に返されます。
+
+この挙動は次のように制御できます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    WithClusterNotFoundWrapper(false). // ラッパーを無効化
+    For(&corev1.ConfigMap{}).
+    Complete(reconciler)
+```
+
+多くのコントローラーではデフォルト（`true`）のままが望ましいです。
+
+- クラスターがフリートから恒久的に外れた場合、そのクラスター向け Work Item は
+  自然にキューから枯れていきます。
+- 決して成功しない処理をリトライし続けることによるログノイズや
+  リソース消費を避けられます。
+
+一方で、メトリクスを増やしたい、特別な Event を発行したいといった
+独自の扱いが必要な場合は、このラッパーを無効化し、
+Reconciler 内で `ErrClusterNotFound` を明示的に判定することもできます。  
+具体的なパターンは **Uniform Reconciler** の章でも紹介しています。
+
+---
+
+### コントローラーオプションとログ構成
+
+Builder は、controller-runtime の **Controller オプション** をそのまま
+渡すこともできます。
+
+```go
+opts := controller.TypedOptions[mcreconcile.Request]{
+    MaxConcurrentReconciles: 10,
+}
+
+_ = mcbuilder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    WithOptions(opts).
+    Complete(reconciler)
+```
+
+これらのオプションは、Manager 側の **GroupKind ごとの並列度設定** や
+キャッシュ同期タイムアウトと連携して動作します。
+詳細は「Architecture」章や controller-runtime のドキュメントも参照してください。
+
+ログについては、**LogConstructor** をカスタマイズすることもできます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    For(&corev1.ConfigMap{}).
+    WithLogConstructor(func(req *mcreconcile.Request) logr.Logger {
+        // Manager の Logger から開始し、コントローラー名とクラスター情報を付加する。
+        log := mgr.GetLogger().WithValues(
+            "controller", "multicluster-configmaps",
+        )
+        if req != nil {
+            nn := req.Request.NamespacedName
+            log = log.WithValues(
+                "cluster", req.ClusterName,
+                "namespace", nn.Namespace,
+                "name", nn.Name,
+            )
+        }
+        return log
+    }).
+    Complete(reconciler)
+```
+
+デフォルトでも、Builder はコントローラー名やプライマリリソースの Group / Kind を
+ログに付与しますが、`ClusterName` と `NamespacedName` を一貫して含めることで、
+マルチクラスター環境でのトラブルシュートが格段にやりやすくなります。
+
+---
+
+### メタデータのみの Watch と高度な Source
+
+オブジェクト数が多い場合や、1 オブジェクトあたりのサイズが大きい場合、
+フルオブジェクトを Cache する必要がないこともあります。
+そのような場面では、Builder が提供する **メタデータのみの Watch**
+を利用できます。
+
+```go
+_ = mcbuilder.ControllerManagedBy(mgr).
+    Named("metadata-only-pods").
+    WatchesMetadata(
+        &corev1.Pod{},
+        mchandler.TypedEnqueueRequestForObject[*metav1.PartialObjectMetadata](),
+    ).
+    Complete(reconciler)
+```
+
+`WatchesMetadata` を使うと:
+
+- 基盤となる Cache は `metav1.PartialObjectMetadata` のみを保持します。
+- Reconciler では、`GroupVersionKind` を明示した
+  `PartialObjectMetadata` で Get/List します。
+- これにより、メタデータ Cache の上に別のフル型 Cache が
+  追加で作られるのを防げます。
+
+より特殊なシナリオでは、`WatchesRawSource` を使って
+カスタムな `mcsource.TypedSource` を直接アタッチすることもできます。
+これは主にフレームワークや Provider 実装向けであり、
+アプリケーションのコントローラーでは `For` / `Owns` / `Watches` と
+**Advanced Topics — Event Handling** で紹介されているヘルパーを
+組み合わせるのがよいでしょう。
+
+---
+
+### 型付き Builder とカスタムリクエスト型
+
+デフォルトの Builder は `mcreconcile.Request` を前提としていますが、
+実装自体は **任意のクラスター認識型リクエスト** を扱えるように
+ジェネリクス化されています。
+
+```go
+type Builder = TypedBuilder[mcreconcile.Request]
+```
+
+および:
+
+```go
+func TypedControllerManagedBy[request mcreconcile.ClusterAware[request]](
+    m mcmanager.Manager,
+) *TypedBuilder[request]
+```
+
+つまり、より高度な使い方として:
+
+- `mcreconcile.ClusterAware` を実装した独自のリクエスト型を定義し、
+- `TypedControllerManagedBy[MyRequest](mgr)` を使って、
+  その型をキューキーとするコントローラーを構築する
+
+といったことも可能です。
+
+ただし、多くのユースケースではその必要はなく、
+`mcreconcile.Request` に統一しておく方が、
+他の章で紹介しているテストやイベントハンドリングのパターンとも整合し、
+コードベースも読みやすく保てます。
+
+---
+
+### まとめ
+
+`mcbuilder` パッケージは、controller-runtime におけるおなじみの
+**Builder パターン** をマルチクラスター環境に拡張したものです。
+
+- `ControllerManagedBy(mgr)` により、
+  `mcreconcile.Request` を扱い、`mcmanager.Manager` を通じて
+  多数のクラスターと対話するコントローラーを構築できます。
+- `For` / `Owns` / `Watches` は、マルチクラスター対応の Source と Handler を
+  自動的に配線してくれます。
+- `EngageOptions` によって、各 Watch が
+  ホストクラスター / Provider 管理クラスター / その両方 のどれを見るかを
+  柔軟に制御できます。
+- `ClusterNotFoundWrapper` や各種オプションにより、
+  安全なデフォルトと細かなチューニングの両立が可能です。
+
+これらの仕組みを活用することで、開発者は Reconciler 内の
+**ビジネスロジックに集中** でき、  
+`multicluster-runtime` 側がマルチクラスター特有の配線・イベントルーティング・
+エラーハンドリングを引き受けてくれます。

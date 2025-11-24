@@ -1,0 +1,349 @@
+---
+title: クラスターオブジェクト
+---
+
+この章では、`multicluster-runtime` が扱う **クラスターオブジェクト（Cluster object）** について詳しく説明します。  
+クラスターオブジェクトは次の 2 つを同時に表す概念です。
+
+- ある 1 つの Kubernetes クラスターに対して  
+  **Client / Cache / Field Indexer / Event Recorder** などをまとめた「アクセスハンドル」
+- マネージャーや Provider から見たときの  
+  **「この名前のクラスター」** という論理的な単位
+
+**Multi-Cluster Manager** と **Provider** が「どのクラスターが存在するか」「どうやって見つけるか」を担うのに対し、  
+クラスターオブジェクトは Reconciler から見た **「このクラスターに対して実際に Read/Write を行う窓口」** です。
+
+---
+
+### クラスターオブジェクトとは何か
+
+`multicluster-runtime` は、controller-runtime の `cluster.Cluster` インターフェースをそのまま流用して、  
+各メンバークラスターを表現します。
+
+クラスターオブジェクトは次の性質を持ちます。
+
+- 1 つの Kubernetes クラスターに対するアクセス手段をカプセル化している
+  - **Typed Client**（CRUD 用）
+  - **共有 Cache / Informer**
+  - **Field Indexer**
+  - **Event Recorder** など
+- `multicluster-runtime` 内では **クラスター名（文字列）** で識別される
+  - 例: `"fleet-alpha"`, `"prod-eu-1"`, `"kind#dev"` など
+- Provider によって **ライフサイクルが管理** される
+  - 生成時に `rest.Config` などから構築され、
+  - `Start(ctx)` が呼ばれて Cache / Informer ループが開始され、
+  - クラスター削除や切り離しのタイミングで関連する `context.Context` がキャンセルされる。
+
+Reconciler から見れば、クラスターオブジェクトは  
+「**シングルクラスターの controller-runtime で Manager から得ていたものを、クラスターごとに切り出したもの**」  
+であり、そこに `ClusterName` という次元が 1 つ増えたイメージです。
+
+> **ホストクラスターとメンバークラスター**
+>
+> - **ホスト（ローカル）クラスター** は、特別な名前である空文字列 `""` で表されます（`LocalCluster` 定数、マルチクラスターマネージャーの章を参照）。
+> - Provider によって検出される **メンバークラスター** は、空ではない名前を持ちます（例: `"kind#demo"`, `"clusterset-a-cluster-1"`）。
+
+---
+
+### クラスターオブジェクトはどこで / どうやって作られるか
+
+アプリケーションコード（Reconciler やコントローラー）で  
+`cluster.Cluster` を直接 new することはほとんどありません。代わりに、次のような役割分担になっています。
+
+- **Provider の責務**
+  - **どのクラスターが存在するかを発見** する
+  - 各クラスターに対して `rest.Config` などから `cluster.Cluster` を構築する
+  - `cluster.Start(ctx)` を実行して Cache / Informer ループを開始する
+  - クラスター削除時にコンテキストをキャンセルし、ライフサイクル全体を管理する
+
+- **Multi-Cluster Manager の責務**
+  - Provider が管理するクラスターを  
+    `GetCluster(ctx, clusterName)` 経由で外部に公開する
+  - 新しいクラスターが **Engage** されたタイミングで、  
+    マルチクラスタ対応コンポーネント（Source やコントローラー）に通知する
+
+多くの Provider 実装は、`pkg/clusters` にあるヘルパーを利用します。
+
+- `clusters.Clusters[T]` は `{clusterName → cluster.Cluster}` と Cancel 関数のマップを  
+  スレッドセーフに管理します。
+- `Add` / `AddOrReplace` / `Remove` により、クラスターの追加・置換・削除と `Start(ctx)` の実行を一元化します。
+- Manager 経由で登録された **Field Index** の情報を保持し、  
+  新しく追加されたクラスターにも同じインデックスを自動適用します。
+
+その結果、Reconciler から `mgr.GetCluster(ctx, "my-cluster")` を呼び出したときには、
+
+- 適切な認証情報で設定された Client
+- すでに同期済みの Cache / Informer
+- 必要な Field Index
+
+を持つクラスターオブジェクトが返ってきます。
+
+---
+
+### クラスターオブジェクトから Client / Cache / Event Recorder にアクセスする
+
+クラスターオブジェクトを手に入れたあとは、  
+シングルクラスターの controller-runtime とほぼ同じ感覚で利用できます。
+
+- **Client の取得**
+
+  ```go
+  cl, err := mgr.GetCluster(ctx, req.ClusterName)
+  if err != nil {
+      return ctrl.Result{}, err
+  }
+
+  obj := &myv1alpha1.MyResource{}
+  if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+      // NotFound などのハンドリング
+  }
+  ```
+
+  ここで使われる Client は、
+
+  - クラスターオブジェクトが表す **特定の Kubernetes API サーバー** に対して通信し、
+  - 可能な限りそのクラスター専用の Cache を経由して Read を行います。
+
+- **Cache の取得**
+
+  ```go
+  informerCache := cl.GetCache()
+  // 必要であれば、ここから Informer や Indexer を直接取得できます。
+  ```
+
+  通常のコントローラーでは Cache を直接触らずに  
+  Source 経由で利用するだけですが、より高度なユースケースでは Cache へ直接アクセスできます。
+
+- **Field Indexer**
+
+  一般的には `SetupWithManager` などから:
+
+  ```go
+  indexer := mgr.GetFieldIndexer()
+  err := indexer.IndexField(ctx, &myv1alpha1.MyResource{}, "spec.clusterRef", indexFunc)
+  ```
+
+  のように Manager 経由で登録しておけば、  
+  Multi-Cluster Manager と Provider がフリート全体へ自動的に反映してくれます。
+
+  もし、あるヘルパーがクラスターオブジェクトだけを受け取る設計になっている場合は、
+
+  ```go
+  idx := cl.GetFieldIndexer()
+  // idx.IndexField(ctx, obj, fieldName, indexerFunc)
+  ```
+
+  のようにクラスター単位の Indexer を利用することもできます。
+
+- **Event Recorder**
+
+  ```go
+  recorder := cl.GetEventRecorderFor("my-multicluster-controller")
+  recorder.Event(
+      obj,
+      corev1.EventTypeNormal,
+      "Reconciled",
+      "Reconciled object in cluster "+req.ClusterName,
+  )
+  ```
+
+  ここで生成される Event は、  
+  **ホストクラスターではなく、そのクラスターオブジェクトが表すメンバークラスター上** に記録されます。
+
+---
+
+### コードの中でクラスターオブジェクトを取得する方法
+
+どこから呼ぶかによって、クラスターオブジェクトの取得手段はいくつかあります。
+
+#### Reconciler から Multi-Cluster Manager 経由で取得する（もっとも一般的）
+
+マルチクラスター対応の Reconciler は、  
+`mcreconcile.Request` を受け取るシグネチャを持ちます。
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // cl.GetClient(), cl.GetCache(), cl.GetEventRecorderFor(...) などを利用して処理を書く
+    // ...
+
+    return ctrl.Result{}, nil
+}
+```
+
+このパターンでは:
+
+- Source が `req.ClusterName` を設定し、
+- Reconciler が `mgr.GetCluster` でクラスターオブジェクトを解決し、
+- 以降の処理は「そのクラスター専用の世界」で完結します。
+
+#### Scoped Manager から取得する（既存ライブラリとの連携）
+
+一部のライブラリやコンポーネントは、  
+Multi-Cluster Manager ではなく通常の `manager.Manager` を要求します。
+
+そのような場合、Multi-Cluster Manager から **スコープされた Manager** を取得できます。
+
+```go
+clusterMgr, err := mcMgr.GetManager(ctx, "prod-eu-1")
+if err != nil {
+    // エラー処理
+}
+
+// clusterMgr は manager.Manager を実装するが、
+// その Client / Cache / FieldIndexer は "prod-eu-1" クラスター専用。
+```
+
+内部的には、この scoped manager は:
+
+- ライフサイクル（`Start`, `Add` など）はホストマネージャーへ委譲しつつ、
+- データアクセス（Client / Cache / FieldIndexer）はクラスターオブジェクトを利用する
+
+ように実装されています。  
+これにより、controller-runtime ベースの既存コードを最小限の変更でマルチクラスタ環境に統合できます。
+
+#### context から取得する
+
+共通ライブラリなど、`context.Context` しか受け取れないコードからクラスターを解決したい場合は、  
+`pkg/context` のヘルパーを利用します。
+
+- `mccontext.WithCluster(ctx, clusterName)`  
+  - コンテキストにクラスター名を埋め込む。
+- `mccontext.ClusterFrom(ctx)`  
+  - コンテキストからクラスター名を取り出す。
+- `Manager.ClusterFromContext(ctx)`  
+  - コンテキストからクラスター名を取り出し、その上で `GetCluster` を呼び出す。
+
+また、既存の `reconcile.Reconciler` をマルチクラスタ対応させるためのアダプターもあります。
+
+- `context.ReconcilerWithClusterInContext(r reconcile.Reconciler)`  
+  - 返り値の `mcreconcile.Reconciler` は:
+    - `req.ClusterName` をコンテキストに注入し、
+    - 元の `r.Reconcile(ctx, reconcile.Request)` を呼び出す。
+
+これにより、「コンテキスト内のクラスター情報に依存している既存コード」を、  
+大きく書き換えずにマルチクラスタ対応へ移行できます。
+
+---
+
+### クラスター名・アイデンティティ・ClusterSet
+
+`multicluster-runtime` における `ClusterName` は、  
+クラスターオブジェクトを識別するための **論理的な名前** です。
+
+Provider は任意の命名規則を採用できますが、実運用では以下の点を意識することが重要です。
+
+- **安定性**
+  - 同一の実クラスターには、可能な限り同じ `ClusterName` を与え続けるべきです。
+  - これにより、ログ・メトリクス・外部ツールからの参照を一貫して扱えます。
+
+- **フリート内での一意性**
+  - Provider が返すクラスター名は、その Provider の管理するクラスター集合内で一意である必要があります。
+  - `providers/multi` のように Provider を合成する場合は、  
+    `"kind#dev"`, `"capi#prod-eu"` のようにプレフィックスを付けて衝突を避けます。
+
+- **SIG-Multicluster の標準との整合性**
+  - KEP‑2149（ClusterId for ClusterSet identification）は、`ClusterProperty` CRD に  
+    `cluster.clusterset.k8s.io` というプロパティ名でクラスター ID を保存する標準を定めています。
+  - 多くのマルチクラスタ環境では、この ClusterID をすでに持っているか、今後持つことになります。
+  - Provider は、この ClusterID をそのまま `ClusterName` として利用するか、  
+    あるいは ClusterID を使って一意な `ClusterName` を導出することができます。
+  - **Cluster Inventory API Provider** を利用する場合、`ClusterProfile.Status.Properties` に
+    - `cluster.clusterset.k8s.io`
+    - `clusterset.k8s.io`
+    などが含まれるため、アイデンティティや ClusterSet ごとのグルーピングに活用できます。
+
+Reconciler 側では、`ClusterName` の形式に依存しない設計（**不透明な文字列として扱う**）が推奨されます。  
+ログ出力やルーティングのキーとしては使ってもよいですが、  
+`strings.Split` 前提のロジックなどは Provider と強く結合してしまうため注意が必要です。
+
+---
+
+### ライフサイクルとエラーハンドリング
+
+フリートは動的に変化するため、次のような状況が起こり得ます。
+
+- Workqueue に乗ったリクエストを処理する時点で、  
+  対象クラスターがすでに削除されている
+- 一時的なネットワーク障害や資格情報の問題で、  
+  あるクラスターにだけアクセスできない
+
+こうした前提のもとで、次のようなパターンが推奨されます。
+
+- **「クラスターが見つからない」ことは非致命的として扱う**
+
+  Provider は、指定されたクラスター名が未知である場合、  
+  `multicluster.ErrClusterNotFound` を返すことになっています（Manager 経由でラップされます）。
+
+  Reconciler では、次のような扱い方が考えられます。
+
+  - このエラーを「クラスター削除済み」とみなし、  
+    ログだけ出して **再キューせずにリクエストを捨てる**
+  - `pkg/reconcile` に用意されている `ClusterNotFound` ラッパーを使い、  
+    `ErrClusterNotFound` を自動的に握りつぶして成功扱いにする
+
+- **クラスターオブジェクトを長期間キャッシュしない**
+
+  フィールドやグローバル変数に `cluster.Cluster` を保持するのではなく、  
+  **毎回の Reconcile ごとに** `GetCluster(ctx, req.ClusterName)` で解決することが推奨されます。
+
+  これにより:
+
+  - Provider が資格情報の更新などに伴ってクラスターオブジェクトを差し替えた場合でも、
+    Reconciler は常に最新のオブジェクトを利用でき、
+  - 削除済みクラスターに対する古い参照を誤って保持し続けることを避けられます。
+
+- **コンテキストを正しく扱う**
+
+  Provider が `Engage` 時に渡すコンテキスト、および `cluster.Start(ctx)` に渡されるコンテキストは、
+
+  - クラスター削除時、
+  - あるいは Provider 自身の停止時
+
+  にキャンセルされます。  
+  クラスターの Client / Cache を用いた長時間の処理は、  
+  必ず `ctx.Done()` を監視して適切に終了するようにしてください。
+
+---
+
+### テストとローカル開発におけるクラスターオブジェクト
+
+クラスターオブジェクトは本番フリートだけでなく、テストやローカル開発にも役立ちます。
+
+- **Namespace Provider / Single Provider**
+  - **Namespace Provider** は 1 つの物理クラスタ上で  
+    「Namespace を仮想クラスターとして扱う」ことで、  
+    複数クラスター相当の挙動を高速にシミュレートします。
+  - **Single Provider** は、あらかじめ構築した 1 つの `cluster.Cluster` を  
+    固定のクラスター名で公開する Provider で、ユニットテストなどに便利です。
+
+- **`providers/clusters` と `pkg/clusters`**
+  - `providers/clusters` パッケージは、`pkg/clusters` ヘルパーを用いて  
+    事前に構築した `cluster.Cluster` 群を Provider 経由で公開する例です。
+  - これを参考に、テスト用や特殊な環境向けの Provider を構築できます。
+
+これらを組み合わせることで、
+
+- 本番用の Provider（Cluster API, Cluster Inventory API, Kubeconfig など）とは別に
+- ローカルや CI に特化した Provider / クラスターオブジェクト群
+
+を用意し、ビジネスロジックをほぼそのままの形でテストすることができます。
+
+---
+
+### まとめ
+
+クラスターオブジェクトは、`multicluster-runtime` における  
+**「1 クラスター分のアクセス手段をまとめた最小単位」** です。
+
+- Provider がクラスターオブジェクトを生成・管理し、
+- Multi-Cluster Manager がそれらを公開し、
+- Reconciler は `GetCluster` / Scoped Manager / Context ヘルパーを通じてそれらを利用することで、
+
+単一のコントローラープロセスが、  
+**均一なロジック（Uniform）** と **マルチクラスター認識ロジック（Multi-Cluster-Aware）** の両方を、  
+動的なクラスターフリートに対して安全かつ効率的に実行できるようになります。

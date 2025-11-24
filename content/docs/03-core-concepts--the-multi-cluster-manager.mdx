@@ -1,0 +1,313 @@
+---
+title: The Multi-Cluster Manager
+---
+
+This chapter looks at `mcmanager.Manager`, the **Multi-Cluster Manager** in `multicluster-runtime`, in more detail.  
+If you are already familiar with controller-runtime, you can think of it as:
+
+- a normal `manager.Manager` for the **host cluster**, plus
+- multi-cluster–aware methods for discovering and working with a **fleet of member clusters** through a Provider.
+
+Where the earlier **Architecture** and **Key Concepts** chapters introduced the idea at a high level, this chapter is focused on:
+
+- how the Multi-Cluster Manager differs from the upstream Manager,
+- how it works with Providers to manage the fleet,
+- how your controllers should interact with it in practice.
+
+---
+
+### One Manager, Many Clusters
+
+In a single-cluster controller-runtime application you typically have:
+
+- one `manager.Manager`, created with `manager.New`,
+- one set of caches, webhooks, health checks, and Runnables,
+- and your controllers all talk to **one** Kubernetes API server.
+
+With `multicluster-runtime` you still have a single **host** Manager process, but that process can:
+
+- discover **many member clusters** via a `multicluster.Provider`,
+- maintain **per-cluster clients and caches**,
+- and surface all events into a shared controller pipeline.
+
+The Multi-Cluster Manager:
+
+- **embeds** a normal `manager.Manager` for the host cluster,
+- stores an optional `multicluster.Provider` responsible for the fleet,
+- implements `multicluster.Aware` so Providers can **engage** clusters at runtime,
+- exposes helper methods (`GetCluster`, `GetManager`, `ClusterFromContext`, `GetFieldIndexer`) that your controllers can use.
+
+If no Provider is configured (i.e. `provider == nil`), the Multi-Cluster Manager behaves **almost exactly like** a standard controller-runtime Manager, while still letting you write code that is ready to become multi-cluster later.
+
+---
+
+### How it Differs from controller-runtime’s Manager
+
+The interface in `pkg/manager/manager.go` wraps a standard Manager and adds multi-cluster behaviour:
+
+- **Local cluster constant**
+  - `const LocalCluster = ""`  
+    The **empty string** is reserved as the name of the local (host) cluster.
+
+- **Getting clusters**
+  - `GetCluster(ctx, clusterName) (cluster.Cluster, error)`  
+    - If `clusterName == LocalCluster`, returns the embedded host `manager.Manager` as a `cluster.Cluster`.
+    - If a Provider is configured, delegates to `provider.Get(ctx, clusterName)`.
+    - If no Provider is set and `clusterName` is non-empty, returns an error.
+
+- **Getting managers**
+  - `GetManager(ctx, clusterName) (manager.Manager, error)`  
+    Returns a **scoped manager** for that cluster:
+    - shares global behaviour (Runnables, leader election) with the host manager,
+    - uses that cluster’s own client, cache, and field indexer for data access.
+  - `GetLocalManager() manager.Manager`  
+    Returns the underlying host Manager (equivalent to `GetManager(ctx, LocalCluster)`).
+
+- **Cluster from context**
+  - `ClusterFromContext(ctx) (cluster.Cluster, error)`  
+    Looks up the cluster name from the `context.Context` (via `pkg/context`) and then calls `GetCluster`.  
+    This is useful when you use helpers that inject cluster identity into the context before calling your reconciler or other code.
+
+- **Provider and indexing**
+  - `GetProvider() multicluster.Provider`  
+    Returns the Provider (if configured), or `nil`.
+  - `GetFieldIndexer() client.FieldIndexer`  
+    Returns an indexer that:
+    - if a Provider is present, forwards `IndexField` calls to the Provider so that **all clusters** (present and future) get the index,
+    - otherwise, uses the local manager’s field indexer as in single-cluster setups.
+
+- **Multi-cluster aware Runnables**
+  - The Multi-Cluster Manager defines a `Runnable` type that embeds `manager.Runnable` and `multicluster.Aware`.
+  - When you call `Add(r Runnable)`, it:
+    - records `r` in an internal list of multi-cluster–aware components (`mcRunnables`),
+    - forwards `Add` to the underlying host manager so it will be started on `Start`.
+  - When new clusters are engaged (see below), the Manager calls `r.Engage(ctx, name, cluster)` for each registered Runnable.
+
+Apart from these extensions, the Multi-Cluster Manager still **looks and feels like** a normal controller-runtime Manager: it has the same lifecycle methods (`Start`, health/readiness checks, webhook server) and can be passed to other controller-runtime–compatible libraries.
+
+---
+
+### Initializing the Manager with a Provider
+
+The usual way to construct a Multi-Cluster Manager is through `mcmanager.New`:
+
+```go
+import (
+    ctrl "sigs.k8s.io/controller-runtime"
+    metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+    mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+    mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+
+    "sigs.k8s.io/multicluster-runtime/providers/kind"
+)
+
+func main() {
+    // 1. Create a Provider (here: discover local Kind clusters).
+    provider := kind.New(kind.Options{Prefix: "fleet-"})
+
+    // 2. Configure the host manager as usual.
+    opts := mcmanager.Options{
+        Metrics: metricsserver.Options{
+            BindAddress: ":8080",
+        },
+    }
+
+    // 3. Create the Multi-Cluster Manager with the Provider.
+    mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, opts)
+    if err != nil {
+        // handle error
+    }
+
+    // 4. Register controllers using mcbuilder and start the manager.
+    // ...
+    _ = mcbuilder.ControllerManagedBy(mgr)
+}
+```
+
+Key points:
+
+- **You still supply a normal `*rest.Config` and `manager.Options`**, just as you would for a single-cluster Manager.
+- The additional `provider` parameter decides where member clusters come from.
+- If the Provider implements `multicluster.ProviderRunnable`, the Multi-Cluster Manager will automatically start it as a Runnable when you call `mgr.Start(ctx)`.
+- If you pass `provider == nil`, `mcmanager.New` creates a wrapper around a standard Manager:
+  - `GetCluster(ctx, LocalCluster)` returns the host manager,
+  - `GetCluster(ctx, nonEmpty)` returns an error,
+  - `GetFieldIndexer()` delegates to the host manager’s indexer.
+
+This means you can:
+
+- start with a **pure single-cluster** application using `mcmanager.New` and no Provider, and
+- later introduce a Provider and multi-cluster controllers with a minimal diff in your `main.go` and reconciler signatures.
+
+If you already have an existing `manager.Manager`, you can also wrap it using `WithMultiCluster(mgr, provider, ...)` to get a Multi-Cluster Manager without recreating the host Manager.
+
+---
+
+### Cluster Lifecycle and `Engage`
+
+To keep the Multi-Cluster Manager generic, **Providers own the lifecycle of member clusters**:
+
+- each Provider implementation decides:
+  - how clusters are discovered (e.g. via CAPI `Cluster` objects, `ClusterProfile`, Secrets, files, Kind, Namespaces),
+  - when clusters are added, updated, or removed from the fleet,
+  - how to construct a `cluster.Cluster` (client, cache, indexers) for each member.
+
+The contract between Provider and Manager is:
+
+- The Provider **implements**:
+  - `Get(ctx, clusterName)` to look up clusters by name,
+  - optionally `Start(ctx, aware)` (the `multicluster.ProviderRunnable` interface) to run a watch loop and call `aware.Engage(...)` when clusters become active.
+
+- The Multi-Cluster Manager **implements**:
+  - `Engage(ctx, name, cl cluster.Cluster) error`, from the `multicluster.Aware` interface.
+
+When a Provider discovers or updates a cluster and calls `Engage`:
+
+- the Manager:
+  - iterates over all multi-cluster–aware Runnables it has registered (including multi-cluster Sources and controllers),
+  - calls `r.Engage(ctx, name, cl)` on each one,
+  - propagates errors so that a failure to engage a cluster can be reported.
+- the Provider is free to:
+  - start the cluster’s internal cache loop (`cl.Start(ctx)`),
+  - manage cancellation when the cluster is later removed from the fleet.
+
+Most concrete Providers reuse the `pkg/clusters.Clusters` helper:
+
+- it keeps a thread-safe map of `{clusterName → cluster.Cluster}` plus cancel functions,
+- starts each `cluster.Cluster` in its own goroutine and cleans up on failure,
+- records any field indexes that have been applied so they can be re-applied to new clusters.
+
+From a controller author’s perspective, you do not normally call `Engage` yourself; you just:
+
+- construct or configure a Provider,
+- pass it to `mcmanager.New`,
+- and rely on the Provider to drive cluster lifecycle over time.
+
+---
+
+### Using the Manager from Controllers and Reconcilers
+
+Most controllers interact with the Multi-Cluster Manager in two ways:
+
+- **when registering controllers**, via `mcbuilder.ControllerManagedBy(mgr)`, and
+- **inside reconcilers or other components**, by resolving per-cluster clients and managers.
+
+Typical usage inside a reconciler looks like this:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    // 1. Find the cluster for this request.
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 2. Use the per-cluster client and cache, just like in a single-cluster controller.
+    obj := &myv1alpha1.MyResource{}
+    if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+        // handle NotFound, etc.
+    }
+
+    // 3. Implement your business logic…
+    return ctrl.Result{}, nil
+}
+```
+
+Notes:
+
+- `req.ClusterName` is provided by multi-cluster Sources (see the Reconcile Loop chapter).
+- `req.Request` is the familiar `reconcile.Request` inside that cluster.
+- `GetCluster` may return `ErrClusterNotFound` if a cluster has been removed since the work item was enqueued; you can:
+  - treat that as a non-error and drop the request, or
+  - use the provided `ClusterNotFound` wrappers in `pkg/reconcile` to do this automatically.
+
+For components that expect a normal `manager.Manager` (e.g. webhooks or controllers from other libraries), you can use:
+
+- `GetManager(ctx, clusterName)` to obtain a **scoped manager** whose:
+  - `GetClient` / `GetCache` / `GetFieldIndexer` are backed by that cluster,
+  - `Add` and `Start` delegate to the host Manager so you do not start a second control loop.
+
+This makes it possible to plug existing controller-runtime–based code into a multi-cluster environment with minimal changes.
+
+---
+
+### Field Indexing Across the Fleet
+
+Field indexes are essential for efficient controllers, and multi-cluster controllers are no different.  
+The main complication is that, in a multi-cluster setting, new clusters may appear **after** you registered an index.
+
+To keep this simple:
+
+- the Multi-Cluster Manager’s `GetFieldIndexer()` returns an indexer that:
+  - if a Provider is configured:
+    - stores the index definition in memory,
+    - calls `provider.IndexField(...)` so that:
+      - all currently known clusters get the new index,
+      - any future clusters will also receive it when they are added,
+  - if no Provider is set:
+    - forwards the call to the host manager’s field indexer.
+
+- Providers that embed `pkg/clusters.Clusters` take care of:
+  - applying all previously registered indexes to any new cluster when it is added, and
+  - reporting any indexing errors in a consistent way.
+
+For controller authors this means:
+
+- you can continue to call `mgr.GetFieldIndexer().IndexField(...)` from your `SetupWithManager` code,
+- you do not need to manually iterate over clusters or re-apply indexes when the fleet changes.
+
+---
+
+### Choosing Which Clusters a Controller Watches
+
+By default, when you register controllers with `mcbuilder.ControllerManagedBy(mgr)`, they can be configured to:
+
+- watch **only the host cluster**,
+- watch **only provider-managed clusters**, or
+- watch **both**.
+
+This is controlled by `EngageOptions` from `pkg/builder/multicluster_options.go`:
+
+- **`WithEngageWithLocalCluster(bool)`**
+  - controls whether the controller should attach to the **local (host) cluster** (cluster name `""`),
+  - defaults to:
+    - `false` if a Provider is configured (focus on the fleet),
+    - `true` if no Provider is configured (single-cluster mode).
+
+- **`WithEngageWithProviderClusters(bool)`**
+  - controls whether the controller should attach to **all clusters managed by the Provider**,
+  - has effect only when a Provider is set.
+
+These options are applied consistently to:
+
+- the primary `For` resource,
+- any `Owns` relationships,
+- additional `Watches`.
+
+This allows you to build:
+
+- **fleet-only controllers** that ignore the host cluster,
+- **hybrid controllers** that read CRDs in the host cluster and act on member clusters,
+- or controllers that run in strict single-cluster mode while still using multi-cluster–aware types.
+
+For more details and patterns, see the **Using the Builder** chapter.
+
+---
+
+### Single-Cluster Compatibility and Migration
+
+One of the design goals of `multicluster-runtime` is to make migration from single-cluster controllers as smooth as possible:
+
+- You can start with:
+  - `mcmanager.New(config, nil, opts)` (no Provider),
+  - controllers registered with `mcbuilder.ControllerManagedBy(mgr)`,
+  - reconcilers that accept `mcreconcile.Request` but always see `ClusterName == ""`.
+- When you are ready to scale out:
+  - introduce a Provider (Kind, File, Kubeconfig, Cluster API, Cluster Inventory API, …),
+  - switch your manager construction to `mcmanager.New(config, provider, opts)`,
+  - keep your reconciliation logic largely unchanged.
+
+Because the Multi-Cluster Manager delegates to a normal controller-runtime Manager for the local cluster, your code remains compatible with existing tooling and patterns, while gaining the ability to operate across a dynamic fleet of clusters when needed.
+
+

@@ -1,0 +1,376 @@
+---
+title: Multi-Cluster Aware Reconciler（マルチクラスター認識型）
+---
+
+この章では、クラスターごとに独立したロジックを実行する **Uniform Reconciler** ではなく、
+クラスター間の関係性そのものを扱う **Multi-Cluster Aware Reconciler（マルチクラスター認識型リコンサイラー）**
+にフォーカスします。
+
+Uniform Reconciler は「クラスター A で読み書きし、クラスター A を整える」「クラスター B で読み書きし、
+クラスター B を整える」といったパターンでした。  
+一方で Multi-Cluster Aware Reconciler は、典型的に次のような役割を担います。
+
+- あるクラスター（多くの場合は **管理 / ハブクラスター**）から desired state やインベントリを読み取る
+- 多数のメンバークラスターから actual state を取得する
+- それらを踏まえて、**フリート全体にまたがる変更を調整する**
+
+この章は次のコンポーネントを前提にしています。
+
+- **Multi-Cluster Manager**（`mcmanager.Manager`）
+- クラスターを検出・接続する **Provider**
+- クラスター情報を含む **Reconcile ループ**（`mcreconcile.Request`）
+
+---
+
+### 「マルチクラスター認識型」であるとはどういうことか
+
+- **Uniform Reconciler（均一な Reconciler）**
+  - 常に **1 クラスターの中だけ** を対象に動作します。
+  - `req.ClusterName` は「どのクラスター用の Client を使うか」を決めるためだけに使われます。
+  - クラスター間の関係性（どのクラスターに何を置くべきか）は意識しません。
+
+- **Multi-Cluster Aware Reconciler（マルチクラスター認識型）**
+  - **複数のクラスターをまたいだ関係性** に基づいて意思決定を行います。
+  - 典型的な振る舞い:
+    - 管理クラスターやハブクラスターにある制御プレーン / インベントリを読む
+    - 多数のメンバークラスターにワークロードや設定を **ファンアウト（展開）** する
+    - メンバークラスターから状態を集約し、ハブクラスター側に **集約ステータス** を書き戻す
+    - クラスターのヘルスやリージョン、キャパシティに応じてワークロードの配置を調整する
+
+重要なのは、どちらのパターンでも利用する API 自体は同じという点です。
+
+- `mcmanager.Manager`、`mcreconcile.Request`、`cluster.Cluster` といった型は共通
+- 違いは **1 回の Reconcile が「何クラスター」を意識しているか**、
+  そして **どこに source of truth を置くか** です。
+
+---
+
+### 代表的なトポロジとユースケース
+
+- **ハブ駆動のファンアウト（Hub-Driven Fan-out）**
+  - コントローラーは **管理クラスター（ハブ）** で動作し、次のような CRD を監視します。
+    - どのクラスターにどのワークロードを展開するかを記述した「フリートデプロイメント」
+    - Cluster API の `Cluster` オブジェクト
+    - Cluster Inventory API の `ClusterProfile` オブジェクト など
+  - Reconciler は、各 CR を処理するたびに:
+    - 対象となる **クラスター名の一覧** を（`ClusterProfile` や ClusterID などから）決定し、
+    - `mgr.GetCluster(ctx, clusterName)` で `cluster.Cluster` を取得し、
+    - 必要な Kubernetes オブジェクトを各クラスターに作成 / 更新します。
+
+- **中央設定・分散適用（Central Config, Distributed Enforcement）**
+  - ポリシーや設定は 1 つのクラスターに集約されており、実際の適用は複数クラスターで行われます。
+  - Reconciler は:
+    - ハブクラスター上のポリシー CRD を監視し、
+    - 全クラスター（あるいは選択されたクラスター）に `ConfigMap` / RBAC / カスタムリソースなどを配布し、
+    - 必要に応じて、ハブ側のステータスにコンプライアンス状況を集約します。
+
+- **クロスクラスターの集約（Many Clusters → One Summary）**
+  - 多数のクラスターから状態を取得し、1 クラスターに集約結果を書き出すパターンです。
+  - 例:
+    - ClusterSet 全体の `Deployment` 状態を集約し、フリート全体のヘルスを 1 つの CRD にまとめる
+    - バージョンや機能サポート、キャパシティなどを集約してダッシュボード用のデータを生成する
+
+- **Namespace Provider による仮想マルチクラスター**
+  - **Namespace Provider** を用いると、1 つの Kubernetes クラスター上の Namespace を
+    **仮想的なクラスター** として扱うことができます。
+  - Multi-Cluster Aware Reconciler は:
+    - `ClusterName == Namespace 名` という形で仮想クラスターを扱い、
+    - 単一の API サーバーに対しても、他の Provider と同じパターンでファンアウトや集約のロジックを書けます。
+
+これらのパターンは、**Multi Provider**（`providers/multi`）を使うことで組み合わせることもできます。
+たとえば、Kind / Cluster API / Cluster Inventory API / Kubeconfig など複数の Provider から来るクラスターを
+1 つのフリートとして扱うといった構成です。
+
+---
+
+### multicluster-runtime 側が提供するビルディングブロック
+
+Multi-Cluster Aware Reconciler は、これまでの章で紹介したコンポーネントをそのまま利用します。
+
+- **リクエスト型:** `mcreconcile.Request`
+  - `ClusterName string`:
+    - どのクラスターを対象にするかを表すクラスター名（空文字列はローカルクラスター）。
+  - `Request reconcile.Request`:
+    - そのクラスター **内** の `NamespacedName` を表す通常のリクエスト。
+
+- **クラスターごとの Client / Cache:** `cluster.Cluster`
+  - `mgr.GetCluster(ctx, req.ClusterName)` から取得します。
+  - `GetClient()`, `GetCache()`, `GetFieldIndexer()`, `GetEventRecorderFor(...)` などを提供します。
+
+- **Multi-Cluster Manager:** `mcmanager.Manager`
+  - ホストクラスター用の `manager.Manager` を内包しつつ、
+  - `multicluster.Provider` を通じてメンバークラスターを管理し、
+  - 必要に応じて各クラスター向けの **スコープされた Manager**（`GetManager`）も返します。
+
+- **Provider**
+  - 「どのクラスターが存在し、どう接続するか？」に答えるコンポーネントです。
+  - `multicluster.Provider` / `ProviderRunnable` を実装します。
+  - このリポジトリには、Cluster API / Cluster Inventory API / File / Kind / Kubeconfig / Namespace / Multi などの実装例があります。
+
+パターンとしての違いは、**これらをどのように組み合わせ、どこにビジネスロジックを置くか** という設計に現れます。
+
+---
+
+### パターン 1 — ハブ駆動のファンアウト（Hub-Driven Fan-out）
+
+ハブ駆動パターンでは、次のような構成をとるのが一般的です。
+
+- コントローラーは **ハブクラスター** 上で動作する
+- ハブクラスター上の CRD が **マルチクラスターの desired state** を表す
+- Provider（Cluster API / Cluster Inventory API / File / Kind / Kubeconfig など）を通じて
+  メンバークラスターに接続する
+- Reconciler は、その情報をもとに各クラスターへワークロードや設定を展開する
+
+たとえば「FleetDeployment」という CRD を例にした疑似コードは次のようになります。
+
+```go
+func (r *FleetDeploymentReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
+    // 1. ハブクラスター上の desired state を取得する。
+    var fleet appv1alpha1.FleetDeployment
+    if err := r.HubClient.Get(ctx, req.NamespacedName, &fleet); err != nil {
+        // NotFound などのハンドリング
+    }
+
+    // 2. インベントリから対象クラスターの一覧を導出する。
+    targetClusters := r.selectClustersFromInventory(ctx, &fleet)
+
+    // 3. 対象クラスターごとにワークロードを調整する。
+    for _, clusterName := range targetClusters {
+        cl, err := r.Manager.GetCluster(ctx, clusterName)
+        if err != nil {
+            // クラスターが消えている / 一時的に取得不能など
+            continue
+        }
+
+        if err := r.ensureWorkloadInCluster(ctx, cl, &fleet); err != nil {
+            // エラーの集約やメトリクスへの反映など
+        }
+    }
+
+    return ctrl.Result{}, nil
+}
+```
+
+ここでのポイントは次の通りです。
+
+- **ハブ側が source of truth**
+  - ハブクラスター上の CRD（`FleetDeployment` / `ClusterProfile` / その他インベントリ）に
+    マルチクラスター構成が集約されます。
+  - それらの取得には、通常のシングルクラスター用 Client
+    （例: `manager.Manager.GetLocalManager().GetClient()`）を使えます。
+
+- **クラスター名とインベントリの対応付け**
+  - インベントリオブジェクトから `clusterName` へのマッピングは Provider ごとに異なります。
+    - Cluster API Provider は `namespace/name` のようなキーをクラスター名に使います。
+    - Cluster Inventory API Provider は `ClusterProfile` 名や
+      `cluster.clusterset.k8s.io`（KEP‑2149）などのプロパティに基づいて決定します。
+  - Reconciler 側は `clusterName` を **不透明な文字列** として扱い、
+    フォーマットの前提を埋め込まないことが推奨されます。
+
+- **クラスターごとの処理の分割**
+  - 例のように 1 回の Reconcile の中でループしても構いませんし、
+  - ハブ側に状態を保持しつつ「クラスター単位の Work Item」に分割する設計も可能です。
+
+このパターンは、「**制御プレーンは 1 箇所、ワークロードは多数のクラスター**」という構成に非常に適しています。
+
+---
+
+### パターン 2 — クロスクラスター集約（Many Clusters → One Summary）
+
+逆向きのパターンが **集約（Aggregation）** です。  
+多数のクラスターから状態を取得し、それらを 1 つのクラスターにまとめて書き出します。
+
+multicluster-runtime では、しばしば次のような分担になります。
+
+- 各クラスターで動作する **Uniform Reconciler** が、クラスターごとのステータスを生成する
+- ハブクラスター上の **Multi-Cluster Aware Reconciler** が、それらを集約する
+
+例として:
+
+- 各クラスターで動く ConfigMap 管理用の Uniform Reconciler が:
+  - 規定の ConfigMap が存在することを確認し、
+  - クラスターごとの状態をそのクラスター内の特定 Namespace に記録する
+- ハブクラスター上の Multi-Cluster Aware Reconciler が:
+  - Namespace Provider などを通じてそれらステータスを「仮想クラスター」として監視し、
+  - `FleetConfigMapStatus` のような CRD にフリート全体の集約結果を書き出す
+
+すべての `mcreconcile.Request` は `ClusterName` を持つため、
+どのクラスターから来た情報かを簡単にタグ付けでき、集約のロジックをシンプルに保てます。
+
+---
+
+### パターン 3 — Multi Provider による複数 Provider の統合
+
+**Multi Provider**（`providers/multi`）を利用すると、複数の Provider を
+1 つの `multicluster.Provider` としてまとめて扱うことができます。
+
+- それぞれの Provider は **provider 名** で登録されます。
+- クラスター名は `provider 名 + セパレーター（デフォルトは `#`） + 内側のクラスター名`
+  という形式になります。
+  - 例: `"kind#dev-cluster"`, `"capi#prod/cluster-1"` など
+- `Get(ctx, "kind#dev-cluster")` は Kind Provider に、
+  `Get(ctx, "capi#prod/cluster-1")` は Cluster API Provider にルーティングされます。
+
+Multi-Cluster Aware Reconciler から見たときの利点:
+
+- **異なるインベントリシステムのクラスターを 1 つのフリートとして扱える**
+  - 例: Kind（ローカル開発）と Cluster API / Cluster Inventory API（本番環境）を混在させる
+- コード側は常に:
+  - `req.ClusterName` をそのまま文字列として受け取り、
+  - `mgr.GetCluster(ctx, req.ClusterName)` を呼び出すだけでよい
+  - Provider の組み合わせやルーティングは Multi Provider 内部に隠蔽されます。
+
+---
+
+### パターン 4 — Namespace Provider による仮想クラスター
+
+**Namespace Provider**（`providers/namespace`）は、単一クラスター上の Namespace を
+**仮想的なクラスター** として公開します。
+
+- 1 つの `cluster.Cluster` を使って全 Namespace を監視し、
+- 各 Namespace に対して `NamespacedCluster` を生成して `Engage` します。
+  - すべての API 操作は、その Namespace にスコープされます。
+  - クラスター名は Namespace 名と一致します（`clusterName == namespace.Name`）。
+
+このパターンは次のような場面で有用です。
+
+- **ローカル開発・テスト**
+  - 本物のフリートを用意しなくても、マルチクラスター認識型ロジックを検証できます。
+- **マルチテナント環境**
+  - テナントごとに Namespace を割り当てている場合でも、
+    コントローラー側からは「テナントごとの仮想クラスター」として扱えます。
+
+Reconciler のコードから見ると:
+
+- `ClusterName` は単に Namespace 名（例: `"zoo"`, `"jungle"` など）です。
+- `mgr.GetCluster(ctx, req.ClusterName)` → `cl.GetClient().Get(...)` という呼び方は
+  他の Provider と全く同じです。
+
+---
+
+### Builder を使ったコントローラーの配線
+
+Multi-Cluster Aware Reconciler は、通常 `mcbuilder` パッケージを使って登録します。
+これは controller-runtime の Builder をマルチクラスター対応にしたものです。
+
+- **どのクラスターを監視するかを選ぶ**
+  - `EngageOptions` を使って、コントローラーが次のどれに接続するかを制御できます。
+    - **ローカルクラスター**（ホストクラスター）
+    - **Provider が管理するクラスター群**
+    - その両方
+  - `WithEngageWithLocalCluster(bool)`:
+    - デフォルト:
+      - Provider が設定されている場合は `false`
+      - Provider がない場合は `true`
+  - `WithEngageWithProviderClusters(bool)`:
+    - Provider が設定されている場合に意味を持ち、デフォルトは `true`
+
+たとえば、次のような「ハブ側の CRD を見つつ、メンバークラスターの状態も監視する」コントローラーを考えます。
+
+- プライマリな CRD は **ハブクラスターのみ** で監視したい
+- 一方で、メンバークラスターの `Deployment` 変化にも反応したい
+
+疑似コードは次のようになります。
+
+```go
+err := mcbuilder.ControllerManagedBy(mgr).
+    Named("fleet-deployer").
+    // プライマリ CRD はローカル（ハブ）クラスターのみを監視する。
+    For(&appv1alpha1.FleetDeployment{},
+        mcbuilder.WithEngageWithLocalCluster(true),
+    ).
+    // メンバークラスター上の Deployment も監視対象とする。
+    Watches(
+        &corev1.Deployment{},
+        handler.EnqueueRequestForOwner(&appv1alpha1.FleetDeployment{}),
+        mcbuilder.WithEngageWithProviderClusters(true),
+    ).
+    Complete(r)
+```
+
+`EngageOptions` は次の 3 箇所に一貫して適用されます。
+
+- **`For`**: プライマリリソース
+- **`Owns`**: プライマリに所有されるセカンダリリソース
+- **`Watches`**: 追加の Watch 関係
+
+これにより、次のような構成を柔軟に選べます。
+
+- ハブクラスターのみを見るコントローラー
+- Provider 管理のクラスターのみを見るコントローラー
+- その両方を組み合わせたハイブリッドなコントローラー
+
+しかも、Reconciler のシグネチャやビジネスロジックを大きく変えずに、
+これらのモードを行き来できるのがポイントです。
+
+---
+
+### エラーハンドリングとクラスター消滅
+
+マルチクラスター環境では、フリートが動的に変化することを前提とする必要があります。
+
+- クラスターが削除されたあとにも、そのクラスター向けの Work Item がキューに残っている
+- 資格情報の更新やネットワーク障害により、一時的にクラスターへ接続できない
+
+推奨されるパターンは次の通りです。
+
+- **`ErrClusterNotFound` を終端条件として扱う**
+  - Builder はデフォルトで Reconciler を **`ClusterNotFoundWrapper`** でラップします。
+    - Reconciler が `multicluster.ErrClusterNotFound`（またはそれを内包するエラー）を返した場合、
+    - ラッパーはその Reconcile を **成功** とみなし、**再キューしません**。
+  - これにより、既にフリートから外れたクラスター向けの Work Item を
+    無限に再試行し続けることを防げます。
+
+- **クラスターの解決は毎回の Reconcile で行う**
+  - `cluster.Cluster` の値を長期間キャッシュせず、
+    毎回 `mgr.GetCluster(ctx, req.ClusterName)` を呼び出すようにします。
+  - Provider がクラスターオブジェクトを差し替えた場合（資格情報の更新など）にも、
+    Reconciler が常に最新の接続設定を使えるようにするためです。
+
+- **Context によるキャンセルを尊重する**
+  - 多数のクラスターにファンアウトする処理など、時間のかかる Reconcile では
+    `ctx.Done()` を監視し、Manager の停止やクラスターコンテキストのキャンセルに
+    すばやく応答できるようにします。
+
+---
+
+### パフォーマンス上の考慮事項
+
+Multi-Cluster Aware Reconciler は、1 回の Reconcile で多数のクラスターに触れることが多いため、
+キューや API への負荷が高くなりがちです。
+
+設計時には次の点を意識すると良いでしょう。
+
+- **クラスターごとの処理は小さく・べき等に**
+  - 1 回の Reconcile で、1 クラスターあたりが行う処理量には上限を設けるのが望ましいです。
+  - 何百ものクラスターに新しいリソースを展開するようなケースでは、
+    複数回の Reconcile あるいはバックグラウンドジョブに分割する方が安全です。
+
+- **クラスターまたぎのグローバルロックを避ける**
+  - ネットワーク I/O を伴う処理中にグローバルな Mutex を保持し続けるのは避けてください。
+  - 調停に必要な情報は、ハブ側の CRD やクラスターごとの状態として表現し、
+    Reconciler はそれらを読み書きする形にするとスケールしやすくなります。
+
+- **クラスター間の公平性を意識する**
+  - あるクラスターが大量のイベントを発生させても、他のクラスターが飢餓状態にならないようにします。
+  - controller-runtime の Workqueue は共通のキューであるため、
+    1 回の Reconcile を短く・安価・べき等に保つことが重要です。
+  - 将来的には **フェアキューイング** のような高度な機構も検討されていますが、
+    基本的な設計指針は変わりません。
+
+---
+
+### まとめ
+
+Multi-Cluster Aware Reconciler は、**Kubernetes ネイティブな形でフリート全体を自動化する**
+ための中心的な仕組みです。
+
+- controller-runtime のおなじみの Reconcile モデルに **クラスターという次元** を追加し、
+- Provider と Multi-Cluster Manager を使って多数のクラスターに安全にアクセスし、
+- **ハブ駆動のファンアウト**、**クロスクラスター集約**、
+  **複数 Provider の統合**、**仮想マルチクラスター** といったパターンを実現します。
+
+これらのパターンに沿って Reconciler を設計することで、
+既存のシングルクラスターコントローラーから、段階的に高度なマルチクラスター自動化へと
+進化させることができます。その際も、controller-runtime の慣れ親しんだスタイルを保ち続けられる点が
+`multicluster-runtime` の大きな利点です。

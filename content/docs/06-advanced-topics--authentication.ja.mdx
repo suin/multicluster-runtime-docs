@@ -1,0 +1,274 @@
+---
+title: 認証
+---
+
+この章では、`multicluster-runtime` における **認証 (Authentication)** と **クレデンシャル管理** について解説します。  
+ここで扱うのは、あくまで **コントローラープロセスが「どのクラスターとして」「どの権限で」API サーバーに接続するか** という観点であり、エンドユーザーの認証やアプリケーションレベルの認可は範囲外です。
+
+マルチクラスターコントローラーには少なくとも次の 2 層の認証が存在します。
+
+- **ホストクラスターへの認証**:  
+  - `mcmanager.Manager` 自体が動作するクラスター（管理クラスター／ハブクラスター）への接続。
+  - 通常の `controller-runtime` と同様に、in-cluster config や kubeconfig に従います。
+- **メンバークラスターへの認証**:  
+  - **Provider** が各クラスター用の `*rest.Config` を構築し、`cluster.Cluster` を生成します。
+  - ここでどのようにクレデンシャルを取得・更新するかが、本章の主なテーマです。
+
+---
+
+### 認証レイヤーの全体像
+
+`multicluster-runtime` は、「**どうやって `rest.Config` を手に入れるか**」を Provider に委譲し、Reconciler からは隠蔽します。
+
+- **ホストクラスター**
+  - `mcmanager.New(cfg, provider, opts)` の `cfg` が、ホストクラスターへの認証情報です。
+  - これは `ctrl.GetConfigOrDie()`、`KUBECONFIG`、in-cluster config など、標準の手段で取得します。
+  - この認証は:
+    - Provider が管理クラスター上の CR（`Cluster` / `ClusterProfile` / `Secret` など）を読むため、
+    - マルチクラスターコントローラー自身がホストクラスター上のオブジェクトを読む・書くため、
+    に使われます。
+
+- **メンバークラスター**
+  - 各 Provider がメンバークラスターごとに `*rest.Config` を用意し、`cluster.Cluster` を作ります。
+  - クレデンシャルのソースは Provider によって異なります（kubeconfig ファイル、Secret、Kind、ClusterProfile + プラグインなど）。
+  - Reconciler 側は `mgr.GetCluster(ctx, req.ClusterName)` でクライアントを取得するだけで、具体的な認証方式は知る必要がありません。
+
+- **エンドユーザー / Pod の認証**
+  - 各クラスター内で動くアプリケーションやユーザーの認証・認可は、通常どおりそのクラスターの RBAC / OIDC / IAM などが扱います。
+  - `multicluster-runtime` はここを変更・拡張しません。
+
+---
+
+### kubeconfig ベースの Provider と認証
+
+多くの Provider は **kubeconfig から `*rest.Config` を生成**することでクレデンシャルを扱います。  
+これは Kubernetes の標準的な認証メカニズム（トークン / クライアント証明書 / OIDC / exec プラグイン など）をそのまま再利用する、もっともシンプルな形です。
+
+代表的なものは次のとおりです。
+
+- **File Provider (`providers/file`)**
+- **Kind Provider (`providers/kind`)**
+- **Kubeconfig Provider (`providers/kubeconfig`)**
+- **Cluster API Provider (`providers/cluster-api`)**
+
+それぞれについて、認証まわりの特徴を整理します。
+
+#### File Provider — ローカルファイルからの kubeconfig
+
+File Provider は、ローカルの kubeconfig ファイル群からクラスターを検出します。
+
+- **クレデンシャルのソース**
+  - `KUBECONFIG` 環境変数や `~/.kube/config`、あるいは指定ディレクトリ内のファイルを読み込みます。
+  - 各ファイル内の context ごとに `cluster.Cluster` を構築し、その context に埋め込まれた認証方式（トークン、証明書、exec プラグインなど）を利用します。
+- **セキュリティ上の注意**
+  - ローカルファイルに保存された kubeconfig の権限が、そのままコントローラーの権限となります。
+  - AI 用途・デモ・開発環境向けとしては便利ですが、本番用にはより管理されたクレデンシャルストア（Secret、外部 KMS、ClusterProfile など）を検討してください。
+
+#### Kind Provider — Kind クラスターへのローカル接続
+
+Kind Provider は、ローカルの Kind クラスターを自動検出し、それぞれに対する kubeconfig を Kind ライブラリから取得します。
+
+- **クレデンシャルのソース**
+  - `"sigs.k8s.io/kind/pkg/cluster"` の `provider.KubeConfig(clusterName, false)` で kubeconfig 文字列を取得し、
+  - `clientcmd.RESTConfigFromKubeConfig` で `*rest.Config` に変換します。
+  - kubeconfig 内には Kind が生成したクライアント証明書・鍵が含まれます。
+- **RESTOptions による調整**
+  - `kind.Options.RESTOptions` 経由で QPS / Burst / TLS などの微調整ができますが、認証方式そのものは kubeconfig に依存します。
+- **用途**
+  - 認証の厳密な設計よりも、**マルチクラスター制御ロジックの動作確認**が主目的のため、本番環境での利用は想定されていません。
+
+#### Kubeconfig Provider — Secret に格納された kubeconfig
+
+Kubeconfig Provider は、**ホストクラスター上の Secret に埋め込まれた kubeconfig** を監視します。
+
+- **ディスカバリ**
+  - `Namespace` と `KubeconfigSecretLabel`（デフォルト: `sigs.k8s.io/multicluster-runtime-kubeconfig`）で絞り込んだ Secret を `corev1.Secret` コントローラーとして監視します。
+- **クレデンシャルのソース**
+  - 対象 Secret の `data[KubeconfigSecretKey]`（デフォルト: `"kubeconfig"`）を取り出し、
+  - `clientcmd.RESTConfigFromKubeConfig` で `*rest.Config` を生成します。
+  - `Options.RESTOptions` によって追加の REST 設定（例: QPS、Impersonation、Proxy）を適用できます。
+- **更新とローテーション**
+  - kubeconfig の SHA256 ハッシュを記録しておき、値が変わった場合は:
+    - 既存の `cluster.Cluster` を停止・破棄し、
+    - 新しい `rest.Config` から `cluster.Cluster` を再構築し、
+    - 再度 `Engage` します。
+  - これにより、**Secret を更新するだけでクレデンシャルローテーション**が行えます。
+- **セキュリティ上の注意**
+  - Secret 内の kubeconfig は、しばしば「管理者レベル」の権限を持ちます。  
+    可能な限り、コントローラーに必要な最小限の RBAC に絞り込んだ kubeconfig を用意してください。
+  - Secret が存在するネームスペースへのアクセス権を、コントローラーの ServiceAccount に対して厳密に制限することが重要です。
+
+#### Cluster API Provider — CAPI `Cluster` からの kubeconfig
+
+Cluster API Provider は、管理クラスター上の CAPI `Cluster` リソースをソース・オブ・トゥルースとし、そこから kubeconfig を取得します。
+
+- **クレデンシャルのソース**
+  - デフォルトの `GetSecret` 実装では:
+    - `utilkubeconfig.FromSecret` を用いて、CAPI の標準的な kubeconfig Secret からバイト列を取得し、
+    - `clientcmd.RESTConfigFromKubeConfig` で `*rest.Config` を生成します。
+  - この Secret も、通常はかなり強い権限を持つ「admin kubeconfig」であるため、RBAC の縮小とローテーション戦略が重要です。
+- **更新とローテーション**
+  - 現状の実装では、**すでにエンゲージ済みのクラスターに対して kubeconfig の差し替えは行いません**。  
+    kubeconfig を変更した場合は、コントローラーデプロイメントの再起動などで再接続させる必要があります。
+- **ホストクラスター側 RBAC**
+  - コントローラープロセスには少なくとも:
+    - `clusters.cluster.x-k8s.io` の `get/list/watch`、
+    - kubeconfig Secret の `get`（Secret 名の命名規則に応じて）  
+    が必要です。
+
+---
+
+### Cluster Inventory API Provider と認証プラグイン (KEP‑5339)
+
+Cluster Inventory API Provider は、[ClusterProfile API (KEP‑4322)](https://github.com/kubernetes-sigs/cluster-inventory-api) を用いる環境向けに設計されており、認証面では **KEP‑5339「Plugin for Credentials in ClusterProfile」** と密接に連携します。
+
+#### 基本アイデア
+
+- 各メンバークラスターは、ハブクラスター上の `ClusterProfile` オブジェクトで表現されます。
+- `ClusterProfile.status.credentialProviders` には、そのクラスターが受け付けるクレデンシャルタイプ（例: `"google"`）と接続先情報（`server`、CA、プロキシ設定など）が記述されます。
+- Provider は `kubeconfigstrategy` ライブラリを通じて:
+  - 外部プラグインバイナリ（exec プラグイン）を起動し、
+  - ClusterProfile から渡された接続情報を使ってトークン／証明書を取得し、
+  - それをもとに `*rest.Config` を構築します。
+
+#### Credentials Provider Strategy（推奨）
+
+`examples/cluster-inventory-api` では、次のようにクレデンシャルプラグインを設定しています。
+
+```go
+credentialsProviderFile := credentials.SetupProviderFileFlag()
+// ...
+credentialsProvider, err := credentials.NewFromFile(*credentialsProviderFile)
+// ...
+provider, err := clusterinventoryapi.New(clusterinventoryapi.Options{
+    KubeconfigStrategyOption: kubeconfigstrategy.Option{
+        CredentialsProvider: &kubeconfigstrategy.CredentialsProviderOption{
+            Provider: credentialsProvider,
+        },
+    },
+})
+```
+
+- プラグインのパスや引数は、`clusterprofile-creds-provider` のようなフラグで外部設定できます。
+- プラグインは、`client-go` の exec プロバイダーと同様のプロトコルで呼び出されます。
+
+**利点:**
+
+- クレデンシャルは kubeconfig や Secret に長期保存されず、外部 IdP（Workload Identity Federation など）からオンデマンドで取得できます。
+- コントローラーバイナリを再ビルドすることなく、新しい認証方式に対応できます。
+
+#### Secret Strategy（シンプルだが本番非推奨）
+
+代替として、ClusterProfile KEP が示す「Secret に kubeconfig を格納する」方式も利用できます。
+
+- 特定のラベル:
+  - `x-k8s.io/cluster-inventory-consumer: <consumerName>`
+  - `x-k8s.io/cluster-profile: <clusterProfileName>`
+  を持つ Secret を、ハブクラスター上に作成します。
+- Provider は該当 Secret を見つけて kubeconfig を読み取り、`*rest.Config` に変換します。
+
+**注意点:**
+
+- 認証情報が Secret に長期保存されるため、管理負担と漏洩リスクが高まります。
+- 実運用では、**Credentials Provider Strategy を推奨**します。
+
+#### ローテーション
+
+Cluster Inventory API Provider は、`rest.Config` の内容をキャッシュし、変更があった場合には:
+
+- 既存の `cluster.Cluster` を停止・破棄し、
+- 新しい `rest.Config` を用いて再構築し、
+- すべてのインデックスを再適用してから再度 `Engage` します。
+
+そのため、プラグイン側でトークン有効期限やローテーションポリシーを柔軟に設計できます。
+
+---
+
+### Namespace Provider と「仮想クラスター」の認証
+
+Namespace Provider (`providers/namespace`) は、単一の物理クラスター上で **ネームスペースを「仮想クラスター」として扱う** Provider です。
+
+- **クレデンシャルのソース**
+  - 1 つのベースとなる `cluster.Cluster` があらかじめ与えられ、その `*rest.Config` がすべての仮想クラスターで共有されます。
+  - 各仮想クラスター（`ClusterName == Namespace 名`）は、`NamespacedCluster` ラッパーを通じて「`default` → 該当 Namespace」への名前空間マッピングだけを変えます。
+- **意味するところ**
+  - 追加のクレデンシャルは不要で、ベースクラスターへの RBAC がすべての仮想クラスターに適用されます。
+  - マルチクラスターの論理設計を検証するには便利ですが、**物理的なアイソレーション（認証・認可レベルでの分離）が必要なシナリオには適しません。**
+
+---
+
+### クラスター ID と認証の関係 (KEP‑2149)
+
+認証と混同されがちですが、**クラスター ID（アイデンティティ）** は別の概念です。
+
+- [KEP‑2149](./../refs/KEP-2149%20ClusterId%20for%20ClusterSet%20identification.md) は:
+  - `cluster.clusterset.k8s.io`: クラスタセット内で一意なクラスター ID、
+  - `clusterset.k8s.io`: そのクラスターが所属する ClusterSet の ID、
+  を `ClusterProperty` CRD によって定義します。
+- `multicluster-runtime` の `ClusterName` は:
+  - Provider ごとに定義される「ルーティングキー」であり（例: `"namespace/name"`、`"kind#dev-a"` など）、
+  - 認証情報そのものではありません。
+
+ベストプラクティス:
+
+- Reconciler では `ClusterName` を:
+  - ログ・メトリクス・トレースのタグとして利用しつつ、
+  - その構造に依存しない「不透明な文字列」として扱うことが推奨されます。
+- ClusterProfile や ClusterProperty から取得できる cluster ID を併用することで:
+  - 外部システム（メトリクス基盤、ログ集約、ダッシュボード）と一貫した「クラスター識別子」を共有できます。
+
+---
+
+### セキュリティと RBAC のベストプラクティス
+
+`multicluster-runtime` 自体は認証方式を強制しませんが、安全に運用するための指針は重要です。
+
+- **ホストクラスターの RBAC**
+  - Provider が参照するリソースだけに `get/list/watch` を付与します。
+    - Cluster API Provider: CAPI `Cluster`、kubeconfig Secret。
+    - Cluster Inventory API Provider: `ClusterProfile`、必要に応じて Secret。
+    - Kubeconfig Provider: kubeconfig Secret が置かれた Namespace。
+  - 管理クラスターの ServiceAccount に対し、不要な `update/patch/delete` 権限を与えないようにします。
+
+- **メンバークラスターの RBAC**
+  - kubeconfig / プラグインが返すクレデンシャルには、Reconcilerが本当に必要とする権限だけを付与します。
+  - 可能ならクラスター管理者用の kubeconfig ではなく:
+    - 名前空間やリソース種別を限定した ServiceAccount ベースの kubeconfig、
+    - クラスター管理者ロールから切り出した専用ロール
+    を用意することが望ましいです。
+
+- **クレデンシャルのローテーション**
+  - Kubeconfig Provider や Cluster Inventory API Provider のように、「kubeconfig の変更を検出してクラスターを差し替える」実装を活用し、Secret 更新やプラグインの出力更新でローテーションできるようにします。
+  - Cluster API Provider のようにローテーションを自動検出しない実装では、運用手順として Controller の再起動などを組み込みます。
+
+- **プラグインバイナリの管理 (KEP‑5339)**
+  - プラグインはコントローラープロセスと同じ権限で実行されるため、
+    - 信頼できるビルド元・署名付きイメージで提供し、
+    - Pod ファイルシステムやマウントパスを他プロセスから隔離することが重要です。
+
+---
+
+### Reconciler から見た認証エラーの扱い
+
+認証・接続まわりのトラブルは、多くの場合 Reconciler のコードからは次のように見えます。
+
+- **`GetCluster` のエラー**
+  - `multicluster.ErrClusterNotFound`:  
+    - クラスターが削除された、あるいはまだエンゲージされていないことを意味します。
+    - 既定の `ClusterNotFoundWrapper` では、これは**再キュー不要の成功**として扱われます。
+  - それ以外のエラー（`context.DeadlineExceeded`、ネットワークエラーなど）は、インフラ障害としてロギング・メトリクス送信しつつ、短いリトライポリシーを検討してください。
+
+- **メンバークラスターへの API 呼び出しエラー**
+  - `IsUnauthorized` / `IsForbidden`: RBAC 設定やトークンのスコープが不足している可能性があります。
+  - TLS エラーや接続エラー: endpoint / 証明書の更新ミス、プラグインの出力不整合などが考えられます。
+
+一般的には、**Reconciler 内では「できるだけビジネスロジックに集中」し、認証やクレデンシャルの詳細は Provider 設計と運用手順でカバーする**のが望ましいスタイルです。
+
+---
+
+### まとめ
+
+- `multicluster-runtime` は、認証とクレデンシャル管理を **Provider と `rest.Config` の構築**に集約し、Reconciler からは隠蔽します。
+- File / Kind / Kubeconfig / Cluster API Provider は kubeconfig ベース、Cluster Inventory API Provider は ClusterProfile + 認証プラグイン (KEP‑5339) を用いて動的にクレデンシャルを取得します。
+- Namespace Provider は 1 つの物理クラスターの認証情報を共有し、Namespace を仮想クラスターとして見せます。
+- KEP‑2149 / 4322 / 5339 によって、クラスター ID・インベントリ・クレデンシャル取得方式が標準化されており、`multicluster-runtime` はそれらを土台に安全で拡張性のあるマルチクラスター認証モデルを提供します。

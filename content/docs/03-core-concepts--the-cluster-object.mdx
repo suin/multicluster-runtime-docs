@@ -1,0 +1,276 @@
+---
+title: The Cluster Object
+---
+
+This chapter explains the **Cluster object** used by `multicluster-runtime`: what it represents, how it is created, and how you use it from your controllers.  
+If you already know controller-runtime, you can think of a Cluster object as:
+
+- a **per-cluster view** that bundles a client, cache, field indexer, and other helpers, and
+- an abstraction that lets a single controller process talk to **many Kubernetes clusters** in a uniform way.
+
+Where the **Multi-Cluster Manager** and **Providers** describe *how* clusters are discovered and managed, the Cluster object is what your reconciler actually uses to read and write Kubernetes resources in a specific cluster.
+
+---
+
+### What is a Cluster object?
+
+`multicluster-runtime` reuses controller-runtime’s `cluster.Cluster` interface to represent each member cluster in the fleet.
+
+A Cluster object:
+
+- encapsulates everything needed to talk to a single Kubernetes cluster:
+  - a **typed client** for CRUD operations,
+  - a **shared informer cache**,
+  - a **field indexer**,
+  - and helpers such as **event recorders**;
+- is identified inside `multicluster-runtime` by a **cluster name string** (for example, `"fleet-alpha"` or `"prod-eu-1"`);
+- has its own lifecycle:
+  - it is created and started by a Provider,
+  - it runs its own cache/informer loops under a context that is cancelled when the cluster is removed.
+
+From your reconciler’s point of view, a Cluster object makes a remote cluster **look like** the local cluster in a single-cluster controller-runtime application—just with an extra `ClusterName` dimension.
+
+> **Host vs member cluster**
+>
+> - The **host (local) cluster** is represented by a special name: the empty string `""` (see `LocalCluster` in the Multi-Cluster Manager chapter).
+> - All **member clusters** discovered by a Provider use non-empty names such as `"kind#dev"` or `"clusterset-a-cluster-1"`.
+
+---
+
+### How Cluster objects are created and managed
+
+You almost never construct Cluster objects directly in application code. Instead:
+
+- **Providers** are responsible for:
+  - discovering which clusters exist,
+  - creating a `cluster.Cluster` for each one (typically from a `rest.Config`),
+  - starting each cluster’s cache and background loops, and
+  - managing their lifecycle (add, update, remove).
+- **The Multi-Cluster Manager** is responsible for:
+  - exposing these clusters via `GetCluster(ctx, clusterName)`,
+  - notifying multi-cluster–aware components (sources, controllers) when clusters are engaged.
+
+Most concrete Providers use the helper in `pkg/clusters`:
+
+- `clusters.Clusters[T]` maintains a thread-safe map `{clusterName → cluster.Cluster}` plus per-cluster cancel functions.
+- `Add` / `AddOrReplace` / `Remove` manage cluster lifecycles and ensure `cluster.Start(ctx)` is run.
+- Field indexers registered via the Manager are tracked and **applied to new clusters automatically**.
+
+The end result is that, when you call `mgr.GetCluster(ctx, "my-cluster")` in a reconciler, you always get a ready-to-use object with:
+
+- a running cache,
+- a client configured with the right credentials,
+- and any global field indexes already in place.
+
+---
+
+### Accessing clients, caches, and event recorders
+
+Once you have a Cluster object, you use it much like the local manager in controller-runtime.
+
+- **Client**
+
+  ```go
+  cl, err := mgr.GetCluster(ctx, req.ClusterName)
+  if err != nil {
+      return ctrl.Result{}, err
+  }
+
+  obj := &myv1alpha1.MyResource{}
+  if err := cl.GetClient().Get(ctx, req.Request.NamespacedName, obj); err != nil {
+      // handle NotFound, etc.
+  }
+  ```
+
+  The client:
+
+  - talks to the API server of the cluster represented by this Cluster object,
+  - is usually backed by the Cluster’s cache for reads where possible.
+
+- **Cache**
+
+  ```go
+  informerCache := cl.GetCache()
+  // For advanced scenarios you can obtain informers or indexers directly from the cache.
+  ```
+
+  Most controllers rely on the cache only indirectly through the client and sources, but you can use it directly when needed.
+
+- **Field indexer**
+
+  Normally you call `mgr.GetFieldIndexer().IndexField(...)` from your setup code, and the Multi-Cluster Manager plus Provider ensure the index exists on all clusters.
+  If you need a cluster-local indexer (for example in a helper that only knows about a Cluster), you can use:
+
+  ```go
+  indexer := cl.GetFieldIndexer()
+  // indexer.IndexField(ctx, obj, fieldName, indexerFunc)
+  ```
+
+- **Event recorder**
+
+  ```go
+  recorder := cl.GetEventRecorderFor("my-multicluster-controller")
+  recorder.Event(
+      obj,
+      corev1.EventTypeNormal,
+      "Reconciled",
+      "Reconciled object in cluster "+req.ClusterName,
+  )
+  ```
+
+  Events are created **in the member cluster** represented by the Cluster object, not in the host cluster.
+
+---
+
+### Getting a Cluster in your code
+
+There are several ways to obtain a Cluster object, depending on where you are in your code.
+
+#### From the Multi-Cluster Manager (typical)
+
+Inside a multi-cluster reconciler that receives `mcreconcile.Request`:
+
+```go
+func (r *MyReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+    cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // Use cl.GetClient(), cl.GetCache(), cl.GetEventRecorderFor(...), etc.
+    // ...
+
+    return ctrl.Result{}, nil
+}
+```
+
+This is the most common pattern:
+
+- the Source fills `req.ClusterName`,
+- you resolve the Cluster from the Manager,
+- and then you work entirely in that cluster’s context.
+
+#### From a scoped Manager
+
+Some libraries and components expect a plain `manager.Manager` and do not know about Cluster objects.
+
+For those, the Multi-Cluster Manager can expose a **scoped manager**:
+
+```go
+clusterMgr, err := mcMgr.GetManager(ctx, "prod-eu-1")
+if err != nil {
+    // handle error
+}
+
+// clusterMgr implements manager.Manager, but its client/cache are scoped to "prod-eu-1".
+```
+
+Internally, this scoped manager:
+
+- delegates lifecycle methods (`Start`, `Add`) back to the host Manager,
+- but uses the Cluster’s cache, client, and field indexer for data access.
+
+This makes it possible to reuse off-the-shelf controller-runtime–based components in a multi-cluster environment without rewriting them.
+
+#### From context
+
+For code that only receives a `context.Context` (for example, shared libraries), you can use the context helpers:
+
+- `mccontext.WithCluster(ctx, clusterName)` stores the name.
+- `mccontext.ClusterFrom(ctx)` retrieves it later.
+- `Manager.ClusterFromContext(ctx)` resolves the actual Cluster from the stored name.
+
+There is also an adapter that wraps a standard reconciler and sets the cluster name in the context before calling it:
+
+- `context.ReconcilerWithClusterInContext(r reconcile.Reconciler)` returns an `mcreconcile.Reconciler` that:
+  - reads `req.ClusterName`,
+  - injects it into the context,
+  - and then calls your original reconciler that works with `reconcile.Request`.
+
+This is useful when introducing multi-cluster awareness into existing code that already expects to find the target cluster in the context.
+
+---
+
+### Cluster names, identity, and ClusterSets
+
+The `ClusterName` used by `multicluster-runtime` is a **logical identifier** for a Cluster object.  
+Providers are free to choose naming schemes, but there are some best practices:
+
+- **Stability**
+  - A given real-world cluster should keep the same `ClusterName` for as long as possible.
+  - This lets you correlate logs, metrics, and external references over time.
+- **Uniqueness within the fleet**
+  - Cluster names must be unique among all clusters exposed by a Provider (and, for composed providers such as `multi`, after any prefixes are applied).
+- **Alignment with SIG-Multicluster standards**
+  - KEP‑2149 (ClusterId for ClusterSet identification) standardises how to store a cluster’s identity in the `ClusterProperty` CRD as `cluster.clusterset.k8s.io`.
+  - Many environments already assign such a ClusterID; Providers can reuse it as, or map it to, `ClusterName` for `multicluster-runtime`.
+  - When using the **Cluster Inventory API Provider**, `ClusterProfile.Status.Properties` often include both `cluster.clusterset.k8s.io` and `clusterset.k8s.io`, which can guide naming and partitioning.
+
+In practice:
+
+- a Provider that reads `ClusterProfile` objects might:
+  - use the `ClusterProfile`’s `metadata.name` as `ClusterName`, or
+  - derive `ClusterName` directly from the `cluster.clusterset.k8s.io` property when it is guaranteed to be unique within a ClusterSet.
+- a composed Provider (`providers/multi`) can prefix names with a provider key (for example, `"kind#dev"`, `"capi#prod-eu"`) to avoid collisions.
+
+Your reconcilers should treat `ClusterName` as an opaque string and avoid embedding assumptions about its format, beyond using it for logging and routing.
+
+---
+
+### Handling lifecycle and errors
+
+Because fleets are dynamic, your code must expect that:
+
+- a reconcile request is processed **after** the corresponding cluster has been removed, or
+- credentials or connectivity for a cluster may temporarily fail.
+
+Some recommended patterns:
+
+- **Handle “cluster not found” as a non-fatal condition**
+
+  Providers are expected to return `multicluster.ErrClusterNotFound` when a cluster name is unknown.  
+  The Multi-Cluster Manager wraps this with a clearer error message.
+
+  In reconcilers, you can:
+
+  - treat this error as a signal to drop the work item (do not requeue), or
+  - use the helper wrapper in `pkg/reconcile` that automatically swallows `ErrClusterNotFound` and returns success.
+
+- **Avoid caching Cluster objects in long-lived fields**
+
+  Always resolve the Cluster from the Manager *per reconcile* using `GetCluster(ctx, req.ClusterName)` rather than storing `cluster.Cluster` references in shared state.  
+  This ensures that:
+
+  - you see updates when Providers replace Cluster objects (for example, when credentials change), and
+  - you do not accidentally hold references to stale Clusters after they have been removed.
+
+- **Use contexts correctly**
+
+  The context passed to `Engage` and to `cluster.Start(ctx)` is cancelled when the cluster is disengaged.  
+  Long-running operations that use the Cluster’s client or cache should respect `ctx.Done()` to terminate promptly.
+
+---
+
+### Testing and local development with Cluster objects
+
+Cluster objects are also useful in tests and local simulations:
+
+- **Namespace and Single providers**
+  - The **Namespace provider** treats each namespace as a “virtual cluster” backed by the same API server.
+  - The **Single provider** exposes a single pre-built `cluster.Cluster` under a fixed name, which can be convenient in unit tests.
+- **In-memory Clusters helper**
+  - The `providers/clusters` example shows how to wire pre-constructed `cluster.Cluster` instances into a Provider using the shared `pkg/clusters` helper.
+
+These patterns let you:
+
+- exercise your multi-cluster reconcilers using fake or local environments,
+- keep your production Providers (Cluster API, Cluster Inventory API, kubeconfig, etc.) separate from test-only wiring.
+
+---
+
+### Summary
+
+The Cluster object is the **unit of work** for `multicluster-runtime`: a per-cluster bundle of client, cache, and helpers that makes each member cluster look like a familiar controller-runtime target.  
+Providers create and manage Cluster objects; the Multi-Cluster Manager exposes them; and your reconcilers use them—via `GetCluster`, scoped managers, or context helpers—to implement both uniform and multi-cluster-aware logic across a dynamic fleet.
+
+

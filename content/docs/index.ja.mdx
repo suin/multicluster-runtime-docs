@@ -1,0 +1,61 @@
+---
+title: multicluster-runtime ドキュメント
+---
+
+## 目次
+
+### 1. はじめに (Introduction)
+- [**概要**](docs/01-introduction--overview): multicluster-runtimeとは？
+- [**アーキテクチャ**](docs/01-introduction--architecture): 「One Pod, Many Clusters（1つのポッドで多数のクラスターを管理）」モデルの理解。
+- [**なぜ multicluster-runtime なのか？**](docs/01-introduction--why-multicluster-runtime): シングルクラスターコントローラーや他のマルチクラスターソリューションとの比較。
+- [**主要な概念**](docs/01-introduction--key-concepts): Manager（マネージャー）、Provider（プロバイダー）、Cluster（クラスター）、Reconciler（リコンサイラー）。
+
+### 2. クイックスタート (Getting Started)
+- [**前提条件**](docs/02-getting-started--prerequisites): Goのバージョン、Kubernetes環境。
+- [**インストール**](docs/02-getting-started--installation): プロジェクトへの依存関係の追加。
+- [**クイックスタート**](docs/02-getting-started--quickstart): `kind` プロバイダーを使った最初のマルチクラスターコントローラーの構築。
+    - Managerのセットアップ。
+    - シンプルなReconcilerの記述。
+    - ローカルのKindクラスター群（フリート）に対する実行。
+
+### 3. コアコンセプト (Core Concepts)
+- [**マルチクラスターマネージャー (The Multi-Cluster Manager)**](docs/03-core-concepts--the-multi-cluster-manager): 
+    - `controller-runtime` のManagerとの違い。
+    - Providerを使った初期化。
+- [**プロバイダー (Providers)**](docs/03-core-concepts--providers): 
+    - `Provider` インターフェース。
+    - プロバイダーがどのようにクラスターを検出し、エンゲージ（Engage）するか。
+- [**クラスターオブジェクト (The Cluster Object)**](docs/03-core-concepts--the-cluster-object):
+    - 特定のクラスターに対するClient、Cache、Event Recorderへのアクセス。
+- [**リコンサイルループ (The Reconcile Loop)**](docs/03-core-concepts--the-reconcile-loop):
+    - `mcreconcile.Request` の処理。
+    - Context（コンテキスト）とClusterName（クラスター名）。
+
+### 4. コントローラーパターン (Controller Patterns)
+- [**Uniform Reconcilers（均一なリコンサイラー）**](docs/04-controller-patterns--uniform-reconcilers): 
+    - 全てのクラスターで同じロジックを実行する。
+    - ユースケース: コンプライアンスチェック、リソースの標準化。
+- [**Multi-Cluster Aware Reconcilers（マルチクラスター認識型リコンサイラー）**](docs/04-controller-patterns--multi-cluster-aware-reconcilers): 
+    - リモートクラスター内のリソースを管理する集中型ロジック。
+    - ユースケース: フェデレーテッドデプロイメント、データの集約。
+- [**Builderの使用**](docs/04-controller-patterns--using-the-builder): コントローラーを設定するための `mcbuilder`。
+
+### 5. プロバイダーリファレンス (Providers Reference)
+- [**Kind Provider**](docs/05-providers-reference--kind-provider): ローカル開発およびテスト用。
+- [**Kubeconfig Provider**](docs/05-providers-reference--kubeconfig-provider): 静的またはファイルシステムベースのクラスターリスト用。
+- [**Cluster API Provider**](docs/05-providers-reference--cluster-api-provider): CAPI `Clusters` を介した動的検出。
+- [**Cluster Inventory API Provider**](docs/05-providers-reference--cluster-inventory-api-provider): インベントリ管理に `ClusterProfile` (KEP-4322) を使用。
+- [**File Provider**](docs/05-providers-reference--file-provider): シンプルなファイルベースの検出。
+- [**Custom Providers**](docs/05-providers-reference--custom-providers): 独自のプロバイダーの実装。
+
+### 6. 高度なトピック (Advanced Topics)
+- [**イベントハンドリング**](docs/06-advanced-topics--event-handling): 
+    - マルチクラスターコンテキストにおける `EnqueueRequestForObject`。
+    - クロスクラスターのWatchとマッピング。
+- [**認証 (Authentication)**](docs/06-advanced-topics--authentication): 認証情報とアイデンティティの処理方法 (KEP-5339)。
+- [**クラスター識別 (Cluster Identification)**](docs/06-advanced-topics--cluster-identification): ClusterIDとClusterSetsの理解 (KEP-2149)。
+- [**テスト**](docs/06-advanced-topics--testing): マルチクラスターロジックの単体テストと統合テストの記述。
+
+### 7. コントリビューション (Contributing)
+- [**開発ガイド**](docs/07-contributing--development-guide): 開発環境のセットアップ。
+- [**プロバイダーエコシステム**](docs/07-contributing--provider-ecosystem): 新しいプロバイダーの提供方法。
